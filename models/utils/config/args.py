@@ -28,9 +28,9 @@ method_name = "Mine"
 
 model_name = "best_loss_joint"
 
-dataname = "8i"
+# dataname = "8i"
 # dataname = "MVUB"
-# dataname = "UVG"
+dataname = "UVG"
 
 dataset_name = "longdress"
 # dataset_name = "loot"
@@ -363,6 +363,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--point_transformer_node_feature_scale', default=0.25, type=float, help='正規化済みPoint Transformer特徴の初期スケール')
     parser.add_argument('--point_transformer_feature_gate_max', default=0.10, type=float, help='構造特徴へ加えるPoint Transformer residual gateの上限。既存のOctree方策特徴を上書きしない範囲に保つ')
     parser.add_argument('--point_transformer_feature_warmup_steps', default=0, type=int, help='Point Transformer residualのwarmup Step数。0なら探索schedule全体へ自動追従する')
+    parser.add_argument('--sparsepcgc_feature_auto_warmup_cap', default=100, type=int, help='SparsePCGC ana_den6のみauto feature warmupの上限Step数。明示warmupは変更しない')
     parser.add_argument('--point_transformer_feature_lr_scale', default=0.1, type=float, help='Point Transformer Adapter/Gate専用LRのmain LRに対する倍率')
     parser.add_argument('--point_transformer_feature_cache', default=True, type=str2bool, help='固定Point Transformerのcoarse特徴とVoxel対応をCPUへキャッシュする')
     parser.add_argument('--point_transformer_feature_cache_max_entries', default=16, type=int, help='固定Point Transformer特徴RAM cacheの最大frame数。全件保持はせず共有RAMを圧迫しない')
@@ -3602,6 +3603,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--checkpoint_full_cloud_min_count', default=1, type=int, help='full_cloud actualをcheckpoint主指標に使う最低件数')
     parser.add_argument('--checkpoint_min_optimizer_step_ratio', default=0.20, type=float, help='この割合未満しかoptimizer更新できないepisodeはbest/guard対象外')
     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
+    parser.add_argument('--sparsepcgc_matched_frame_repeats', default=2, type=int, choices=[1, 2], help='SparsePCGC ana_den6学習だけで同一frameのanchor/比較を連続処理する。1は従来順、2は1回ずつencodeする2-view。評価・他codecは変更しない')
     parser.add_argument('--save_good_bad_cases', default=False, type=str2bool, help='actual deltaが大きく改善/悪化したstepのdebug summaryをCSV保存する')
     parser.add_argument('--save_proxy_actual_bad_cases', default=True, type=str2bool, help='proxy/cause scoreとactual bitの符号が逆のcaseをCSV保存する')
     parser.add_argument('--proxy_actual_bad_case_threshold', default=0.0, type=float, help='proxy-actual逆方向caseを保存する最小絶対値しきい値')

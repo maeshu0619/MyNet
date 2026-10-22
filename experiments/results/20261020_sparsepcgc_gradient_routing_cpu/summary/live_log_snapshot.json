@@ -1,0 +1,120 @@
+{
+  "path": "/data/maejima/log/20261020/MyNetwork_train/SparsePCGC/043722.txt",
+  "prefix_bytes": 273991775,
+  "prefix_sha256": "5f49c267b765c966b8f8475394e6218b4eff273f3bfc7ebb5353d3d6e1d6e343",
+  "counts": {
+    "steps": 12600,
+    "anchor_reused": 3558,
+    "group_pair_available": 914,
+    "global_credit_available": 12550,
+    "actual_set_credit_pairs_nonzero": 444,
+    "actual_actor_replay_pairs_nonzero": 1110,
+    "candidate_critic_direct_nonzero": 1110
+  },
+  "groups": {
+    "WhereAll": 4435,
+    "Fine": 2309,
+    "Amount": 1816,
+    "Gate": 990,
+    "none": 3050
+  },
+  "by_group": {
+    "WhereAll": {
+      "steps": 4435,
+      "anchor_reused": 1610,
+      "group_pair_available": 427,
+      "global_credit_available": 4425,
+      "actual_set_credit_pairs_nonzero": 444,
+      "actual_actor_replay_pairs_nonzero": 1110,
+      "candidate_critic_direct_nonzero": 1110
+    },
+    "Fine": {
+      "steps": 2309,
+      "anchor_reused": 870,
+      "group_pair_available": 239,
+      "global_credit_available": 2299,
+      "actual_set_credit_pairs_nonzero": 0,
+      "actual_actor_replay_pairs_nonzero": 0,
+      "candidate_critic_direct_nonzero": 0
+    },
+    "Amount": {
+      "steps": 1816,
+      "anchor_reused": 666,
+      "group_pair_available": 157,
+      "global_credit_available": 1806,
+      "actual_set_credit_pairs_nonzero": 0,
+      "actual_actor_replay_pairs_nonzero": 0,
+      "candidate_critic_direct_nonzero": 0
+    },
+    "Gate": {
+      "steps": 990,
+      "anchor_reused": 412,
+      "group_pair_available": 91,
+      "global_credit_available": 980,
+      "actual_set_credit_pairs_nonzero": 0,
+      "actual_actor_replay_pairs_nonzero": 0,
+      "candidate_critic_direct_nonzero": 0
+    },
+    "none": {
+      "steps": 3050,
+      "anchor_reused": 0,
+      "group_pair_available": 0,
+      "global_credit_available": 3040,
+      "actual_set_credit_pairs_nonzero": 0,
+      "actual_actor_replay_pairs_nonzero": 0,
+      "candidate_critic_direct_nonzero": 0
+    }
+  },
+  "first_six": [
+    {
+      "group": "WhereAll",
+      "anchor_reused": false,
+      "group_pair_available": false,
+      "global_credit_available": false
+    },
+    {
+      "group": "Fine",
+      "anchor_reused": false,
+      "group_pair_available": false,
+      "global_credit_available": false
+    },
+    {
+      "group": "Amount",
+      "anchor_reused": false,
+      "group_pair_available": false,
+      "global_credit_available": false
+    },
+    {
+      "group": "Gate",
+      "anchor_reused": false,
+      "group_pair_available": false,
+      "global_credit_available": false
+    },
+    {
+      "group": "WhereAll",
+      "anchor_reused": false,
+      "group_pair_available": false,
+      "global_credit_available": true
+    },
+    {
+      "group": "WhereAll",
+      "anchor_reused": false,
+      "group_pair_available": false,
+      "global_credit_available": true
+    }
+  ],
+  "last_fields": {
+    "actual_set_credit": "raw=0, weighted=0, ops=0, pairs=0, evidence=0.0000, incumbent_update=True",
+    "actual_actor_replay": "raw=0, actual_group_pair=(available=False, delta=0, weighted=0, actor_correct=0.000, critic_correct=0.000), weighted=0, pairs=0, exact=0, accuracy=0.0000, stored=512)",
+    "actual_candidate_critic_replay": "raw=0, weighted=0, accuracy=0.0000"
+  },
+  "last_source_grad_probes": [
+    "Den6SourceGradProbe: step=12550, norms={'actual_compression_policy_actor': 0.00277848, 'actual_compression_policy_proposal': 0.0, 'actual_compression_policy_candidate_critic': 1.81897802, 'actual_compression_policy_proxy_critic': 0.0, 'actual_compression_policy_plan_critic': 8.56944378, 'proxy_actor': 0.00420233, 'proxy_proposal': 0.0, 'proxy_candidate_critic': 0.0, 'proxy_proxy_critic': 0.03660256, 'proxy_plan_critic': 0.0, 'entropy_actor': 6.267e-05, 'entropy_proposal': 0.0, 'entropy_candidate_critic': 0.0, 'entropy_proxy_critic': 0.0, 'entropy_plan_critic': 0.0, 'geometry_actor': 0.0, 'geometry_proposal': 0.0, 'geometry_candidate_critic': 0.0, 'geometry_proxy_critic': 0.0, 'geometry_plan_critic': 0.0, 'efficiency_actor': 0.0, 'efficiency_proposal': 0.0, 'efficiency_candidate_critic': 0.0, 'efficiency_proxy_critic': 0.0, 'efficiency_plan_critic': 0.0, 'surrogate_compression_actor': 0.0, 'surrogate_compression_proposal': 0.0, 'surrogate_compression_candidate_critic': 0.0, 'surrogate_compression_proxy_critic': 0.0, 'surrogate_compression_plan_critic': 0.0}",
+    "Den6SourceGradProbe: step=12560, norms={'actual_compression_policy_actor': 0.00196835, 'actual_compression_policy_proposal': 0.0, 'actual_compression_policy_candidate_critic': 1.87521959, 'actual_compression_policy_proxy_critic': 0.0, 'actual_compression_policy_plan_critic': 13.33313523, 'proxy_actor': 0.00436792, 'proxy_proposal': 0.0, 'proxy_candidate_critic': 0.0, 'proxy_proxy_critic': 0.01447656, 'proxy_plan_critic': 0.0, 'entropy_actor': 5.45e-05, 'entropy_proposal': 0.0, 'entropy_candidate_critic': 0.0, 'entropy_proxy_critic': 0.0, 'entropy_plan_critic': 0.0, 'geometry_actor': 0.0, 'geometry_proposal': 0.0, 'geometry_candidate_critic': 0.0, 'geometry_proxy_critic': 0.0, 'geometry_plan_critic': 0.0, 'efficiency_actor': 0.0002964, 'efficiency_proposal': 0.0, 'efficiency_candidate_critic': 0.0, 'efficiency_proxy_critic': 0.0, 'efficiency_plan_critic': 0.0, 'surrogate_compression_actor': 0.0, 'surrogate_compression_proposal': 0.0, 'surrogate_compression_candidate_critic': 0.0, 'surrogate_compression_proxy_critic': 0.0, 'surrogate_compression_plan_critic': 0.0}",
+    "Den6SourceGradProbe: step=12570, norms={'actual_compression_policy_actor': 0.00233881, 'actual_compression_policy_proposal': 0.0, 'actual_compression_policy_candidate_critic': 1.08603005, 'actual_compression_policy_proxy_critic': 0.0, 'actual_compression_policy_plan_critic': 9.57659229, 'proxy_actor': 0.00456012, 'proxy_proposal': 0.0, 'proxy_candidate_critic': 0.0, 'proxy_proxy_critic': 0.02985597, 'proxy_plan_critic': 0.0, 'entropy_actor': 5.691e-05, 'entropy_proposal': 0.0, 'entropy_candidate_critic': 0.0, 'entropy_proxy_critic': 0.0, 'entropy_plan_critic': 0.0, 'geometry_actor': 0.0, 'geometry_proposal': 0.0, 'geometry_candidate_critic': 0.0, 'geometry_proxy_critic': 0.0, 'geometry_plan_critic': 0.0, 'efficiency_actor': 0.0, 'efficiency_proposal': 0.0, 'efficiency_candidate_critic': 0.0, 'efficiency_proxy_critic': 0.0, 'efficiency_plan_critic': 0.0, 'surrogate_compression_actor': 0.0, 'surrogate_compression_proposal': 0.0, 'surrogate_compression_candidate_critic': 0.0, 'surrogate_compression_proxy_critic': 0.0, 'surrogate_compression_plan_critic': 0.0}",
+    "Den6SourceGradProbe: step=12580, norms={'actual_compression_policy_actor': 0.00216905, 'actual_compression_policy_proposal': 0.0, 'actual_compression_policy_candidate_critic': 1.99106019, 'actual_compression_policy_proxy_critic': 0.0, 'actual_compression_policy_plan_critic': 4.54781945, 'proxy_actor': 0.00341633, 'proxy_proposal': 0.0, 'proxy_candidate_critic': 0.0, 'proxy_proxy_critic': 0.01737581, 'proxy_plan_critic': 0.0, 'entropy_actor': 5.557e-05, 'entropy_proposal': 0.0, 'entropy_candidate_critic': 0.0, 'entropy_proxy_critic': 0.0, 'entropy_plan_critic': 0.0, 'geometry_actor': 0.0, 'geometry_proposal': 0.0, 'geometry_candidate_critic': 0.0, 'geometry_proxy_critic': 0.0, 'geometry_plan_critic': 0.0, 'efficiency_actor': 0.00050992, 'efficiency_proposal': 0.0, 'efficiency_candidate_critic': 0.0, 'efficiency_proxy_critic': 0.0, 'efficiency_plan_critic': 0.0, 'surrogate_compression_actor': 0.0, 'surrogate_compression_proposal': 0.0, 'surrogate_compression_candidate_critic': 0.0, 'surrogate_compression_proxy_critic': 0.0, 'surrogate_compression_plan_critic': 0.0}",
+    "Den6SourceGradProbe: step=12590, norms={'actual_compression_policy_actor': 0.00107613, 'actual_compression_policy_proposal': 0.0, 'actual_compression_policy_candidate_critic': 1.86235949, 'actual_compression_policy_proxy_critic': 0.0, 'actual_compression_policy_plan_critic': 6.50586653, 'proxy_actor': 0.00277408, 'proxy_proposal': 0.0, 'proxy_candidate_critic': 0.0, 'proxy_proxy_critic': 0.03242305, 'proxy_plan_critic': 0.0, 'entropy_actor': 7.117e-05, 'entropy_proposal': 0.0, 'entropy_candidate_critic': 0.0, 'entropy_proxy_critic': 0.0, 'entropy_plan_critic': 0.0, 'geometry_actor': 0.0, 'geometry_proposal': 0.0, 'geometry_candidate_critic': 0.0, 'geometry_proxy_critic': 0.0, 'geometry_plan_critic': 0.0, 'efficiency_actor': 1e-08, 'efficiency_proposal': 0.0, 'efficiency_candidate_critic': 0.0, 'efficiency_proxy_critic': 0.0, 'efficiency_plan_critic': 0.0, 'surrogate_compression_actor': 0.0, 'surrogate_compression_proposal': 0.0, 'surrogate_compression_candidate_critic': 0.0, 'surrogate_compression_proxy_critic': 0.0, 'surrogate_compression_plan_critic': 0.0}",
+    "Den6SourceGradProbe: step=12600, norms={'actual_compression_policy_actor': 0.00192873, 'actual_compression_policy_proposal': 0.0, 'actual_compression_policy_candidate_critic': 0.62780035, 'actual_compression_policy_proxy_critic': 0.0, 'actual_compression_policy_plan_critic': 6.04405833, 'proxy_actor': 0.00501327, 'proxy_proposal': 0.0, 'proxy_candidate_critic': 0.0, 'proxy_proxy_critic': 0.01831566, 'proxy_plan_critic': 0.0, 'entropy_actor': 5.4e-05, 'entropy_proposal': 0.0, 'entropy_candidate_critic': 0.0, 'entropy_proxy_critic': 0.0, 'entropy_plan_critic': 0.0, 'geometry_actor': 0.0, 'geometry_proposal': 0.0, 'geometry_candidate_critic': 0.0, 'geometry_proxy_critic': 0.0, 'geometry_plan_critic': 0.0, 'efficiency_actor': 0.00021282, 'efficiency_proposal': 0.0, 'efficiency_candidate_critic': 0.0, 'efficiency_proxy_critic': 0.0, 'efficiency_plan_critic': 0.0, 'surrogate_compression_actor': 0.0, 'surrogate_compression_proposal': 0.0, 'surrogate_compression_candidate_critic': 0.0, 'surrogate_compression_proxy_critic': 0.0, 'surrogate_compression_plan_critic': 0.0}"
+  ],
+  "caveat": "Counters/logged flags, not a fresh gradient audit of the live model."
+}

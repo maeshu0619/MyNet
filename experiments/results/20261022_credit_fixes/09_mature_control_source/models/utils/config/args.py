@@ -1,0 +1,8074 @@
+import argparse
+import math
+import os
+import sys
+from pathlib import Path
+from cfgs.utils import str2bool
+
+# sparsepcgc_move_existing_target_only
+
+pretrained_date = ""
+pretrained_time = ""
+
+surrogate_date = "20260729"
+surrogate_time = "001750"
+
+# model_date = "20260729"
+# model_time = "001750"
+# model_date = "20260731"
+# model_time = "023726"
+model_date = "20260801"
+model_time = "072958"
+
+
+# method_com = "OctAttention"
+method_com = "SparsePCGC"
+# method_com = "G-PCC"
+method_name = "Mine"
+
+model_name = "best_loss_joint"
+
+# dataname = "8i"
+# dataname = "MVUB"
+dataname = "UVG"
+
+dataset_name = "longdress"
+# dataset_name = "loot"
+# dataset_name = "redandblack"
+# dataset_name = "soldier"
+
+# dataset_name = "andrew"
+# dataset_name = "david"
+# dataset_name = "phil"
+# dataset_name = "ricardo"
+# dataset_name = "sarah"
+
+# dataset_name = "BlueBackpack"
+# dataset_name = "CasualSquat"
+# dataset_name = "ElegantDance"
+# dataset_name = "Gymnast"
+# dataset_name = "ReadyForWinter"
+
+_MASTER_ROOT = Path(__file__).resolve().parents[4]
+_DATA_STORAGE_ROOT = (_MASTER_ROOT / "../../../data/maejima").resolve()
+_DATA_ROOT = (_DATA_STORAGE_ROOT / "data").resolve()
+_PRETRAINED_ROOT = (_DATA_ROOT / "pretrained").resolve()
+_LOG_ROOT = (_DATA_STORAGE_ROOT / "log").resolve()
+_LEGACY_PRETRAINED_ROOT = (_MASTER_ROOT / "pretrained").resolve()
+_DEFAULT_OCTATTENTION_CKPT = (
+    _MASTER_ROOT / "compress" / "octree" / "OctAttention" / "modelsave" / "obj" / "encoder_epoch_00800093.pth"
+).resolve()
+_DEFAULT_SPARSEPCGC_ROOT = (_MASTER_ROOT / "compress" / "octree" / "SparsePCGC").resolve()
+_DEFAULT_SPARSEPCGC_CKPT_DENSE = (_DEFAULT_SPARSEPCGC_ROOT / "ckpts" / "dense" / "epoch_last.pth").resolve()
+_DEFAULT_SPARSEPCGC_CKPT_DENSE_SR = (_DEFAULT_SPARSEPCGC_ROOT / "ckpts" / "dense_1stage" / "epoch_last.pth").resolve()
+_DEFAULT_SPARSEPCGC_CKPT_DENSE_AE = (_DEFAULT_SPARSEPCGC_ROOT / "ckpts" / "dense_slne" / "epoch_last.pth").resolve()
+_DEFAULT_SPARSEPCGC_CKPT_SPARSE_LOW = (_DEFAULT_SPARSEPCGC_ROOT / "ckpts" / "sparse_low" / "epoch_last.pth").resolve()
+_DEFAULT_SPARSEPCGC_CKPT_SPARSE_HIGH = (_DEFAULT_SPARSEPCGC_ROOT / "ckpts" / "sparse_high" / "epoch_last.pth").resolve()
+_DEFAULT_SPARSEPCGC_CKPT_SPARSE_OFFSET = (_DEFAULT_SPARSEPCGC_ROOT / "ckpts" / "sparse_offset" / "epoch_last.pth").resolve()
+_DEFAULT_GPCC_ROOT = (_MASTER_ROOT / "compress" / "octree" / "G-PCC").resolve()
+_DEFAULT_GPCC_ENCODER = (_DEFAULT_GPCC_ROOT / "build" / "tmc3" / "tmc3").resolve()
+_DEFAULT_GPCC_CFG_DIR = (
+    _DEFAULT_GPCC_ROOT
+    / "cfg"
+    / "octree-predlift"
+    / "lossless-geom-lossless-attrs"
+    / "longdress_vox10_1300"
+).resolve()
+_DEFAULT_DRACO_ROOT = (_MASTER_ROOT / "compress" / "octree" / "Draco").resolve()
+_DEFAULT_DRACO_ENCODER = (_DEFAULT_DRACO_ROOT / "build" / "draco_encoder").resolve()
+_DEFAULT_DRACO_DECODER = (_DEFAULT_DRACO_ROOT / "build" / "draco_decoder").resolve()
+
+
+def _data_subset_dir(split: str, data_name: str = dataname, subset_name: str = dataset_name) -> Path:
+    return _DATA_ROOT / split / str(data_name) / str(subset_name)
+
+
+def _cli_option_was_provided(option_name: str) -> bool:
+    prefix = f"{option_name}="
+    return any(arg == option_name or arg.startswith(prefix) for arg in sys.argv[1:])
+
+
+def _parse_csv_float_list(raw_value, default_values):
+    try:
+        if isinstance(raw_value, str):
+            tokens = [token.strip() for token in raw_value.split(",")]
+        elif isinstance(raw_value, (list, tuple)):
+            tokens = list(raw_value)
+        else:
+            tokens = []
+        values = []
+        for token in tokens:
+            if token in ("", None):
+                continue
+            values.append(float(token))
+        if values:
+            return values
+    except Exception:
+        pass
+    return [float(value) for value in default_values]
+
+
+def _default_checkpoint_path() -> str:
+    preferred = _LOG_ROOT / pretrained_date / "MyNetwork_train" / "pretrained" / f"{pretrained_time}_{method_com}" / f"{model_name}.pth"
+    if preferred.is_file():
+        return str(preferred.resolve())
+
+    lower_method_preferred = _LOG_ROOT / pretrained_date / "MyNetwork_train" / "pretrained" / f"{pretrained_time}_{method_com.lower()}" / f"{model_name}.pth"
+    if lower_method_preferred.is_file():
+        return str(lower_method_preferred.resolve())
+
+    sparsepcgc_case_preferred = _LOG_ROOT / pretrained_date / "MyNetwork_train" / "pretrained" / f"{pretrained_time}_sparsePCGC" / f"{model_name}.pth"
+    if sparsepcgc_case_preferred.is_file():
+        return str(sparsepcgc_case_preferred.resolve())
+
+    return str(sparsepcgc_case_preferred.resolve())
+
+
+
+def _resolve_repo_or_cwd_path(raw_path: str) -> str:
+    raw = Path(os.path.expanduser(str(raw_path)))
+    candidates = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append((Path.cwd() / raw).resolve())
+        candidates.append((_MASTER_ROOT / raw).resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[-1] if candidates else raw)
+
+
+def _resolve_from_base_path(raw_path: str, base_dir: str) -> str:
+    raw = Path(os.path.expanduser(str(raw_path)))
+    base = Path(base_dir).expanduser()
+    if raw.is_absolute():
+        return str(raw.resolve())
+
+    candidates = [
+        (Path.cwd() / raw).resolve(),
+        (base / raw).resolve(),
+        (_MASTER_ROOT / raw).resolve(),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str((base / raw).resolve())
+
+
+def _parse_csv_ints(raw_value):
+    if isinstance(raw_value, (list, tuple)):
+        return [int(value) for value in raw_value]
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    return [int(item.strip()) for item in text.split(",") if item.strip()]
+
+
+def _parse_csv_floats(raw_value):
+    if isinstance(raw_value, (list, tuple)):
+        return [float(value) for value in raw_value]
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    return [float(item.strip()) for item in text.split(",") if item.strip()]
+
+
+def _clamp_float(raw_value, lower, upper):
+    return min(max(float(raw_value), float(lower)), float(upper))
+
+
+def _compress_key(raw_value: str) -> str:
+    return str(raw_value).strip().lower().replace("_", "").replace("-", "")
+
+
+def _compress_display_name(raw_value: str) -> str:
+    key = _compress_key(raw_value)
+    if key == "sparsepcgc":
+        return "SparsePCGC"
+    if key == "gpcc":
+        return "G-PCC"
+    if key == "draco":
+        return "Draco"
+    if key == "octattention":
+        return "OctAttention"
+    text = str(raw_value).strip()
+    return text if text else "OctAttention"
+
+
+def _pretrained_checkpoint_path(date_value: str, time_value: str, compress_value: str, model_stem: str = model_name) -> str:
+    display = _compress_display_name(compress_value)
+    raw = str(compress_value).strip()
+    run_names = []
+    for name in (
+        f"{time_value}_{display}",
+        f"{time_value}_{raw}",
+        f"{time_value}_{raw.lower()}",
+        f"{time_value}_sparsePCGC" if _compress_key(compress_value) == "sparsepcgc" else "",
+    ):
+        if name and name not in run_names:
+            run_names.append(name)
+
+    roots = []
+    for train_dir in ("Mynetwork_train", "MyNetwork_train"):
+        roots.append(_LOG_ROOT / str(date_value) / train_dir)
+        roots.append(_LOG_ROOT / str(date_value) / train_dir / "pretrained")
+
+    candidates = [
+        root / run_name / f"{model_stem}.pth"
+        for root in roots
+        for run_name in run_names
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return str(candidates[0].resolve())
+
+
+def parse_pugan_args(parser, file_day, file_time):
+    """基本情報"""
+    parser.add_argument('--date', default=f'{file_day}', type=str, help='日付')
+    parser.add_argument('--time', default=f'{file_time}', type=str, help='時刻')
+    parser.add_argument('--input_dir', default=str(_DATA_ROOT / "ground"), type=str, help='入力点群データのフォルダパス')
+    parser.add_argument('--cpu', action='store_true', help='GPUを使わずCPUで学習するかどうか')
+    parser.add_argument('--print_actuator_hard_soft_compare', action='store_true', help='Actuatorのhard/soft出力の統計を取る比較モード')
+    parser.add_argument('--print_rate', default=1, type=int, help='ログ出力頻度（1なら毎ステップ、0なら最初と最後のみ）')
+    parser.add_argument('--dataname', default=dataname, type=str, help='データセットの名称')
+    parser.add_argument('--train_all_datasets', default=False, type=str2bool, help='Trueなら共通のSparsePCGC設定のまま、1 Episode内で8i/MVUB/UVGを順番にすべて学習する')
+    parser.add_argument('--train_all_dataset_names', default='8i,MVUB,UVG', type=str, help='train_all_datasetsで巡回するデータセット名（カンマ区切り）')
+    parser.add_argument(
+        '--dataset_name', '--datasetname',
+        dest='dataset_name',
+        default=dataset_name,
+        type=str,
+        help='データセット内シーケンスの名称',
+    )
+    parser.add_argument(
+        '--train_8i_sequence_mode',
+        default='all4',
+        choices=['first3', 'all4'],
+        type=str,
+        help='8i学習時に使うsequence数。first3は従来どおり先頭3つ、all4は4つ全部を使う',
+    )
+    parser.add_argument('--more_training', default=True, type=str2bool, help='学習済みモデルの途中から訓練を再開するか否か')
+
+    parser.add_argument(
+        '--sparsepcgc_exact_teacher_loss_weight',
+        default=0.2,
+        type=float,
+        help='SparsePCGC exact occupancy teacherを圧縮lossへ混ぜる重み。forwardはhard exact値、backwardはproxy/fallbackへ流す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_exact_teacher_grad_weight',
+        default=1.0,
+        type=float,
+        help='SparsePCGC exact teacher STEでfallback proxyへ流す勾配倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_exact_fallback_weight',
+        default=0.2,
+        type=float,
+        help='SparsePCGC exact candidateが無効なstepで使うfallback teacherの重み',
+    )
+    parser.add_argument(
+        '--repair_operation_amount_logit_weight',
+        default=0.0,
+        type=float,
+        help='amount head の raw logit を目標操作割合のlogitへ寄せる補助損失重み',
+    )
+    parser.add_argument(
+        '--repair_operation_amount_logit_scale',
+        default=6.0,
+        type=float,
+        help='amount ratio計算時のlogit制限スケール。sigmoid飽和を抑える',
+    )
+    parser.add_argument(
+        '--repair_operation_amount_target_prob_max',
+        default=0.98,
+        type=float,
+        help='amount logit補助教師でtarget/maxが1.0になるときの上限確率。logit目標の過大化を防ぐ',
+    )
+    parser.add_argument(
+        '--repair_amount_target_mode',
+        default='none',
+        choices=['none', 'target'],
+        type=str,
+        help='Amount headを固定targetへ寄せるか。noneならtarget_add/drop/move_ratioをAmount教師に使わない',
+    )
+    parser.add_argument(
+        '--repair_init_drop_ratio',
+        default=0.05,
+        type=float,
+        help='targetなし学習時のPrune Amount初期値。学習目標ではなく初期化だけに使う',
+    )
+    parser.add_argument(
+        '--repair_init_add_ratio',
+        default=0.03,
+        type=float,
+        help='targetなし学習時のAdd Amount初期値。学習目標ではなく初期化だけに使う',
+    )
+    parser.add_argument(
+        '--repair_prune_where_ste_grad_scale',
+        default=0.3,
+        type=float,
+        help='PruneのHard/Soft STEで、clamp済みsoft値のforwardを保ったままdrop_headへ戻す勾配倍率',
+    )
+    parser.add_argument(
+        '--repair_prune_where_direct_grad_scale',
+        default=0.00003,
+        type=float,
+        help='Prune Whereで候補maskによりdrop_head勾配が0化されるのを防ぐため、drop_prob_proxyへ直接戻す微小勾配倍率。forwardのhard削除候補は変えない',
+    )
+    parser.add_argument(
+        '--repair_drop_where_proxy_raw_grad_eps',
+        default=0.00005,
+        type=float,
+        help='Prune Whereのdrop_prob_proxyにforward値0差分でraw drop logitへの直通勾配を足す倍率。sigmoid/tanh飽和時のdrop_head勾配0を防ぐ',
+    )
+    
+    parser.add_argument(
+        '--repair_amount_pool_std_weight',
+        default=0.50,
+        type=float,
+        help='Amount headへ入れる特徴集約でstd特徴をどれだけ混ぜるか。操作割合の固定化を抑える',
+    )
+    parser.add_argument(
+        '--repair_amount_pool_max_weight',
+        default=0.25,
+        type=float,
+        help='Amount headへ入れる特徴集約でmax特徴をどれだけ混ぜるか。局所的に強い修復候補を操作量へ反映する',
+    )
+
+    """ネットワーク条件"""
+    # Network
+    parser.add_argument('--encoder_0grad', default=True, type=str2bool, help='Encoderを学習対象にするかどうか')
+    parser.add_argument('--prune', default=True, type=str2bool, help='Pruning Moduleを使用するか')
+    parser.add_argument('--add', default=True, type=str2bool, help='Adding Moduleを使用するか')
+    parser.add_argument('--disp', default=True, type=str2bool, help='Displacement Moduleを使用するか')
+    # Encoder, FP Module
+    parser.add_argument('--encoder_dim', default=64, type=int, help='各dense blockにおける特徴次元数（入力/出力）')
+    parser.add_argument('--out_dim', default=64, type=int, help='各dense blockにおける特徴次元数（入力/出力）')
+    parser.add_argument('--fused_feat_dim', default=64, type=int, help='Encoderで統合された特徴の次元')
+    parser.add_argument('--encoder_pre_downsample', default=True, type=str2bool, help='Encoder入力の前だけcoarse化するか')
+    parser.add_argument('--encoder_pre_downsample_mode', default='voxel', type=str, help='Encoder前downsample方法(voxel)')
+    parser.add_argument('--encoder_sparse_tensor', default=True, type=str2bool, help='入力点群を点数維持のSparse Tensor表現(量子化座標+occupancy feature)へ変換するか')
+    parser.add_argument('--sparse_tensor_keep_after_encoder', default=True, type=str2bool, help='Encoder後も診断/方策決定まではUpsampling後のSparse Tensor経路を維持するか')
+    parser.add_argument('--network_voxel_node_input', default=True, type=str2bool, help='Network入力を点群中心ではなくVoxel/Node中心にする')
+    parser.add_argument('--network_voxel_node_fallback_point', default=False, type=str2bool, help='Node/Voxel入力情報が不足した場合に点群経路へfallbackする')
+    parser.add_argument('--network_voxel_node_debug', default=False, type=str2bool, help='Node/Voxel入力経路のdebug情報を出す。通常学習ではGPU同期を避けるため既定False')
+    parser.add_argument('--point_transformer_node_features', default=True, type=str2bool, help='固定Point Transformerの形状特徴をVoxel/Nodeへ写像し、操作決定特徴へ追加する')
+    parser.add_argument('--point_transformer_node_feature_dim', default=8, type=int, help='操作決定へ渡す固定Point Transformer特徴のbottleneck次元')
+    parser.add_argument('--point_transformer_node_adapter_hidden', default=32, type=int, help='固定Point Transformer特徴を圧縮する学習可能Adapterの隠れ次元')
+    parser.add_argument('--point_transformer_node_feature_scale', default=0.25, type=float, help='正規化済みPoint Transformer特徴の初期スケール')
+    parser.add_argument('--point_transformer_feature_gate_max', default=0.10, type=float, help='構造特徴へ加えるPoint Transformer residual gateの上限。既存のOctree方策特徴を上書きしない範囲に保つ')
+    parser.add_argument('--point_transformer_feature_warmup_steps', default=0, type=int, help='Point Transformer residualのwarmup Step数。0なら探索schedule全体へ自動追従する')
+    parser.add_argument('--sparsepcgc_feature_auto_warmup_cap', default=100, type=int, help='SparsePCGC ana_den6のみauto feature warmupの上限Step数。明示warmupは変更しない')
+    parser.add_argument('--point_transformer_feature_lr_scale', default=0.1, type=float, help='Point Transformer Adapter/Gate専用LRのmain LRに対する倍率')
+    parser.add_argument('--point_transformer_feature_cache', default=True, type=str2bool, help='固定Point Transformerのcoarse特徴とVoxel対応をCPUへキャッシュする')
+    parser.add_argument('--point_transformer_feature_cache_max_entries', default=16, type=int, help='固定Point Transformer特徴RAM cacheの最大frame数。全件保持はせず共有RAMを圧迫しない')
+    parser.add_argument('--point_transformer_feature_cache_max_memory_mb', default=128, type=int, help='固定Point Transformer特徴RAM cacheの上限MB。元dtypeを保持してcache hit時も同一数値を返す')
+    parser.add_argument('--point_transformer_feature_disk_cache', default=True, type=str2bool, help='固定Point Transformer特徴を重みfingerprint付きで永続化し、次Episode以降のGPU Encoder再計算を省く')
+    parser.add_argument('--point_transformer_feature_disk_cache_dir', default=str((_DATA_ROOT / 'cache' / 'point_transformer_features').resolve()), type=str, help='固定Point Transformer特徴disk cacheの保存先')
+    parser.add_argument(
+        '--full_cloud_anchor_allow_grad',
+        default=False,
+        type=str2bool,
+        help='FullCloud anchorで学習graphを作ることを許可するか。Falseなら常にno-grad校正/teacher更新用にする',
+    )
+    parser.add_argument(
+        '--full_cloud_anchor_grad_node_limit',
+        default=50000,
+        type=int,
+        help='FullCloud anchorで学習graph作成を許可する最大node/voxel数。超過時はno-grad anchorへ落とす。0以下なら常にno-grad扱いにする',
+    )
+    parser.add_argument(
+        '--full_cloud_anchor_node_count_key',
+        default='global_voxel_coords',
+        type=str,
+        choices=['global_voxel_coords', 'full_global_voxel_coords', 'full_occupied_voxel_coords'],
+        help='FullCloud anchorのnode数上限判定に使うfull_octree_context内の座標key',
+    )
+    # Phase5 structure safety guard
+    parser.add_argument(
+        '--phase5_structure_guard',
+        default=True,
+        type=str2bool,
+        help='Phase5でNode/Voxel canonical経路の異常を検出する',
+    )
+    parser.add_argument(
+        '--phase5_structure_guard_raise',
+        default=True,
+        type=str2bool,
+        help='Phase5構造監査で異常があった場合にRuntimeErrorで停止する',
+    )
+    parser.add_argument(
+        '--phase5_forbid_local_recompute',
+        default=True,
+        type=str2bool,
+        help='Phase5でlocal recompute混入を異常扱いにする',
+    )
+    parser.add_argument(
+        '--phase5_warn_unit_collapse',
+        default=True,
+        type=str2bool,
+        help='aggregation unit_count=1などunit collapse疑いを警告として記録する',
+    )
+    parser.add_argument(
+        '--phase5_guard_unit_collapse_as_error',
+        default=False,
+        type=str2bool,
+        help='aggregation unit_count=1をPhase5 guardの停止対象にする',
+    )
+    # Phase7-3 debug / metric
+    parser.add_argument('--phase7_debug', default=False, type=str2bool, help='Phase7接続修正後の経路・loss・actual入力debugを出す。通常学習では既定False')
+    parser.add_argument('--phase7_grad_debug', default=False, type=str2bool, help='Phase7でActuator/Policy/CostAttributorのgrad normを出す')
+    parser.add_argument('--phase7_debug_every', default=10, type=int, help='Phase7 debugを何stepごとに出すか')
+    parser.add_argument('--phase7_debug_print', default=False, type=str2bool, help='Phase7 debugを標準出力にも出す。通常学習ではGPU同期を避けるため既定False')
+    # Phase7-4 ablation / sanity check
+    parser.add_argument(
+        '--phase7_ablation_mode',
+        default='none',
+        type=str,
+        choices=[
+            'none',
+            'baseline',
+            'voxel_actual_only',
+            'full_context_only',
+            'correction_only',
+            'voxel_actual_full_context',
+            'full_phase7',
+            'debug_only',
+        ],
+        help='Phase7のablation設定を一括適用する',
+    )
+    parser.add_argument(
+        '--phase7_ablation_log',
+        default=True,
+        type=str2bool,
+        help='Phase7 ablationで実際に有効化された設定をログ出力する',
+    )
+    parser.add_argument(
+        '--phase7_grad_sanity_check',
+        default=False,
+        type=str2bool,
+        help='Phase7で主要moduleのgrad sanity checkを行う。全parameter走査を避けるため通常学習では既定False',
+    )
+    parser.add_argument(
+        '--phase7_grad_sanity_every',
+        default=10,
+        type=int,
+        help='grad sanity checkを何stepごとに出すか',
+    )
+    parser.add_argument(
+        '--phase7_grad_zero_eps',
+        default=1e-12,
+        type=float,
+        help='gradが実質ゼロか判定する閾値',
+    )
+    parser.add_argument(
+        '--phase7_param_update_check',
+        default=False,
+        type=str2bool,
+        help='optimizer.step前後で主要moduleのparam更新量を確認する',
+    )
+    parser.add_argument(
+        '--phase7_param_update_every',
+        default=20,
+        type=int,
+        help='param update checkを何stepごとに出すか',
+    )
+    parser.add_argument('--phase7_metric_columns', default=True, type=str2bool, help='Phase7 debug項目をmetric列へ追加する')
+        # Phase7-5 evaluation / inference
+    parser.add_argument('--phase7_eval_summary', default=True, type=str2bool, help='Phase7最終評価summaryを保存する')
+    parser.add_argument('--phase7_eval_summary_every', default=1, type=int, help='Phase7評価summaryを何stepごとに保存するか')
+    parser.add_argument('--phase7_eval_summary_name', default='phase7_eval_summary.csv', type=str, help='Phase7評価summaryの保存ファイル名')
+
+    parser.add_argument('--save_voxel_restored_output', default=False, type=str2bool, help='inference/test時にfinal_voxel_coordsから復元した点群も保存する')
+    parser.add_argument('--voxel_restored_output_suffix', default='_voxel_restored', type=str, help='voxel restored出力点群のsuffix')
+    parser.add_argument('--voxel_restored_output_require_state', default=False, type=str2bool, help='final_voxel_coordsが無い場合にエラーにするか')
+
+    parser.add_argument('--print_phase7_recommended_commands', default=False, type=str2bool, help='Phase7確認用の推奨軽量実験コマンドを表示して終了する')
+    parser.add_argument('--octree_structure_node_descriptor', default=True, type=str2bool, help='OctreeStructureAnalysisでnode/voxel descriptorを返す')
+    parser.add_argument(
+        '--leaf_pattern_diagnosis',
+        default=True,
+        type=str2bool,
+        help='full cloud canonical voxel coordsからparent/child slot/8-child occupancy pattern診断を作る',
+    )
+    parser.add_argument(
+        '--leaf_pattern_diagnosis_debug',
+        default=False,
+        type=str2bool,
+        help='leaf pattern診断の集計値をstructure debugへ出す。候補Tensor自体は維持し、CPU同期を伴う集計だけを既定で止める',
+    )
+    parser.add_argument(
+        '--leaf_pattern_candidate_diagnosis',
+        default=True,
+        type=str2bool,
+        help='leaf pattern診断からDelete/Add/Move候補ごとの頻度gainとNLL gainを作る',
+    )
+    parser.add_argument(
+        '--leaf_pattern_candidate_smoothing',
+        default=1.0,
+        type=float,
+        help='未出現occupancy codeにも確率を与えるためのLaplace smoothing',
+    )
+    parser.add_argument(
+        '--leaf_pattern_candidate_gain_threshold',
+        default=0.05,
+        type=float,
+        help='高gain候補とみなすpattern NLL改善量の閾値',
+    )
+    parser.add_argument(
+        '--leaf_pattern_delete_min_children_after',
+        default=1,
+        type=int,
+        help='Delete後にparent内へ残す最小child数。1ならsingle child化までは許すが空parent化は避ける',
+    )
+    parser.add_argument(
+        '--leaf_pattern_feature_integration',
+        default=True,
+        type=str2bool,
+        help='leaf pattern候補gainをOctreeStructureAnalysisの既存proxy特徴へ混ぜる',
+    )
+    parser.add_argument(
+        '--leaf_pattern_feature_gain_scale',
+        default=2.0,
+        type=float,
+        help='leaf pattern gainを0から1の特徴へ写すときのtanhスケール',
+    )
+    parser.add_argument(
+        '--leaf_pattern_feature_blend_weight',
+        default=0.35,
+        type=float,
+        help='既存proxyへleaf pattern特徴を混ぜる強さ。0なら無効、1なら強く反映',
+    )
+    parser.add_argument(
+        '--leaf_pattern_actuator_prior',
+        default=True,
+        type=str2bool,
+        help='leaf pattern候補gainをActuatorのPrune/Add/Move source scoreへbiasとして入れる',
+    )
+    parser.add_argument(
+        '--leaf_pattern_actuator_prior_scale',
+        default=2.0,
+        type=float,
+        help='leaf pattern候補gainをActuator logit biasへ変換するtanhスケール',
+    )
+    parser.add_argument(
+        '--leaf_pattern_actuator_drop_weight',
+        default=0.75,
+        type=float,
+        help='delete_nll_gainをPrune source scoreへ反映する重み',
+    )
+    parser.add_argument(
+        '--leaf_pattern_actuator_add_weight',
+        default=0.50,
+        type=float,
+        help='add_nll_gainをAdd source scoreへ反映する重み',
+    )
+    parser.add_argument(
+        '--leaf_pattern_actuator_move_weight',
+        default=0.75,
+        type=float,
+        help='move_nll_gainをMove source scoreへ反映する重み',
+    )
+    parser.add_argument(
+        '--leaf_pattern_target_direction_prior',
+        default=True,
+        type=str2bool,
+        help='best_add_child_slot / best_move_target_child_slotをAdd/Moveのtarget方向logitへ反映する',
+    )
+    parser.add_argument(
+        '--leaf_pattern_add_target_direction_weight',
+        default=1.25,
+        type=float,
+        help='best_add_child_slotと一致するAdd target方向へ加えるlogit biasの重み',
+    )
+    parser.add_argument(
+        '--leaf_pattern_move_target_direction_weight',
+        default=1.25,
+        type=float,
+        help='best_move_target_child_slotと一致するMove target方向へ加えるlogit biasの重み',
+    )
+    parser.add_argument('--voxel_node_use_full_context', default=True, type=str2bool, help='Node/Voxel入力でfull_octree_contextを使う')
+    parser.add_argument('--voxel_node_use_subtree_context', default=True, type=str2bool, help='Node/Voxel入力でsubtree_treeを使う')
+    parser.add_argument('--voxel_node_restore_output_debug', default=False, type=str2bool, help='Voxel/Node経路のfinal_voxel_coordsから点群復元debugを行う')
+    parser.add_argument('--encoder_raw_downsample_factor', default=10.0, type=float, help='Sparse Tensor化後にEncoderへ入れるため何倍ダウンサンプリングするか（10なら点数を約1/10にする）')
+    parser.add_argument('--encoder_pre_downsample_max_points', default=8192, type=int, help='Encoderへ入れる最大点数')
+    parser.add_argument('--encoder_cdist_max_points', default=4096, type=int, help='pointops CUDAが使えずtorch.cdist KNNへ落ちた時のEncoder最大点数（0なら無効）')
+    parser.add_argument(
+        '--leaf_pattern_operation_mask',
+        default=False,
+        type=str2bool,
+        help='leaf pattern best_operation_hintでDelete/Add/Moveのsource候補をhard maskするか。圧縮損失最適化ではFalse推奨',
+    )
+    parser.add_argument(
+        '--leaf_pattern_operation_mask_gain_threshold',
+        default=0.02,
+        type=float,
+        help='leaf pattern operation maskで候補として残す最小NLL改善量',
+    )
+    parser.add_argument(
+        '--leaf_pattern_target_direction_mask',
+        default=False,
+        type=str2bool,
+        help='best_add_child_slot / best_move_target_child_slotでAdd/Move target候補をhard maskするか。通常はprior/biasだけ使うためFalse推奨',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_max_selected_voxels',
+        default=4,
+        type=int,
+        help='actual oracleで改善した候補をActuatorへ同時に渡す最大Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_candidate_where_weight',
+        default=1.0,
+        type=float,
+        help='actual oracleのgood/bad候補をWhere補助損失へ入れる内部倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_direction_weight',
+        default=1.0,
+        type=float,
+        help='actual oracleのAdd/Move方向ranking損失に掛ける倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_direction_loss_weight',
+        default=0.01,
+        type=float,
+        help='actual Add/Move方向教師をActuator総損失へ直接加える重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_candidate_logit_clip',
+        default=20.0,
+        type=float,
+        help='actual oracle where logits BCEのforward clip幅。勾配はstraight-throughで保持する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_amount_weight',
+        default=0.05,
+        type=float,
+        help='actual oracleが採択したPrune/Add voxel数をAmount headへ教師付けする補助損失重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_amount_logit_weight',
+        default=0.25,
+        type=float,
+        help='actual oracle採択量をAmount head raw logitへ直接教師付けする内部重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_group_voxels',
+        default=16,
+        type=int,
+        help='group候補で同時に編集する最大Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_group_size_list',
+        default='4,16',
+        type=str,
+        help='group候補で実SparsePCGC検証する同時編集Voxel数。例: 4,16',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_macro_prune_min_voxels',
+        default=8,
+        type=int,
+        help='macro density prune候補の最小削除Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_apply_full_override',
+        default=False,
+        type=str2bool,
+        help='actual候補を最終出力へ強制適用するか。正しいpolicy学習ではFalse',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_apply_teacher_actions',
+        default=False,
+        type=str2bool,
+        help='Oracle maskをActuatorのhard操作として使うか。Falseでは教師損失にだけ使用する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_local_max_drop_ratio',
+        default=0.05,
+        type=float,
+        help='oracle Prune教師をshadow subtreeへ適用するときのhard削除率上限',
+    )
+    parser.add_argument(
+        '--repair_balance_operation_head_grads',
+        default=True,
+        type=str2bool,
+        help='actual教師がある操作のWhere/Amount head勾配を同一目標normへ整える',
+    )
+    parser.add_argument('--repair_operation_head_grad_target', default=1.0, type=float)
+    parser.add_argument('--repair_operation_head_grad_min_scale', default=1e-4, type=float)
+    parser.add_argument('--repair_operation_head_grad_max_scale', default=100000.0, type=float)
+    parser.add_argument(
+        '--repair_online_decision_grad_max_norm',
+        default=1.0,
+        type=float,
+        help='ana_den6_onlineのWhere/Amount/Action別grad上限。小さい勾配は増幅せず、大きい決定headだけclipする',
+    )
+    parser.add_argument('--sparsepcgc_codec_prune_prior', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_codec_prune_prior_block_size',
+        default=0,
+        type=int,
+        help='0ならfull-cloud actual probe結果に基づき8i=64、それ以外=32を使う',
+    )
+    parser.add_argument('--sparsepcgc_codec_prune_prior_ratio', default=0.05, type=float)
+    parser.add_argument('--sparsepcgc_codec_prune_prior_logit_weight', default=6.0, type=float)
+    parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=0, type=int)
+    parser.add_argument(
+        '--sparsepcgc_training_mode',
+        default='full_cloud_amount',
+        choices=['subtree_selector', 'full_cloud_amount', 'legacy'],
+        type=str,
+        help='SparsePCGC訓練branch。subtree_selectorは既存提案器、full_cloud_amountは全点群Amount-only、legacyは旧direct actuator',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_proposal_selector',
+        default=True,
+        type=str2bool,
+        help='TrueならAlgorithmic Prune Proposal + Learned Subtree/Amount Selectorを使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_legacy_direct_actuator_train',
+        default=False,
+        type=str2bool,
+        help='Trueなら旧来のActuator直接Where/Amount訓練を使う。ablation用',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_amount_bins',
+        default='0.015,0.021,0.026,0.031,0.038,0.044,0.05',
+        type=str,
+        help='Algorithmic proposal selectorが選ぶAmount bin。no-opは暗黙のclass 0として別に持つ',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_amount_residual_scale',
+        default=0.0025,
+        type=float,
+        help='Amount binに足すNetwork residualの最大絶対値。0ならbinのみ',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_amount_selector_teacher_weight',
+        default=0.08,
+        type=float,
+        help='explore候補またはactual成功memoryをAmount selector class/residualへ蒸留する重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_amount_init_ratio',
+        default=0.03,
+        type=float,
+        help='Amount selectorの初期biasで優先するbin。warmup後の初期no-op固定を避ける',
+    )
+    parser.add_argument(
+        '--sparsepcgc_proposal_amount_bins',
+        default='0.0,0.015,0.021,0.026,0.031,0.038,0.044,0.05',
+        type=str,
+        help='Algorithmic proposal selector用Amount bin。0.0は明示no-op class',
+    )
+    parser.add_argument(
+        '--sparsepcgc_proposal_inference_mode',
+        default='fast',
+        choices=['fast', 'verified'],
+        type=str,
+        help='Algorithmic proposal推論。fastは予測のみ、verifiedは選択候補をactual確認して悪化ならno-op',
+    )
+    parser.add_argument('--sparsepcgc_proposal_accept_threshold', default=0.0, type=float)
+    parser.add_argument('--sparsepcgc_proposal_selector_hidden_dim', default=64, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_bins', default='0.0,0.015,0.021,0.026,0.031,0.038,0.044,0.05', type=str)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_hidden_dim', default=64, type=int)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_init_bias_mode',
+        default='weak_center',
+        choices=['center', 'uniform', 'weak_center'],
+        type=str,
+        help='full_cloud_amount_selector の amount bin bias 初期化。weak_center は 0.031 近傍への固定化を弱める',
+    )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_reset_heads_on_more_training',
+        default=True,
+        type=str2bool,
+        help='network_selected_bandit で MoreTraining resume する際、collapsed な full_cloud_amount heads を引き継がず再初期化する',
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_enable', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_max', default=0.0025, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_loss_weight', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_probe_enable', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_residual_probe_offsets',
+        default='-1.0,0.0,1.0',
+        type=str,
+        help='selected bin周辺で試すresidual probe。selected_bin + offset * residual_max',
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_fine_ratio_probe_enable', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_fine_ratios',
+        default='0.028,0.030,0.032,0.034',
+        type=str,
+        help='3.1%%近傍のfine ratio actual probe候補',
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_fine_ratio_warmup_steps', default=200, type=int)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_residual_teacher_mode',
+        default='candidate_ratio',
+        choices=['candidate_ratio', 'nearest_bin'],
+        type=str,
+        help='actual best ratioからteacher_bin/teacher_residualを作る方法',
+    )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_fresh_actual_every_step',
+        default=True,
+        type=str2bool,
+        help='Trueならfull_cloud_amount modeで毎Step fresh actual SparsePCGC評価を行う。GT baselineはhash cacheを再利用し、編集後hard voxelだけを毎Step評価する',
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_actual_interval', default=1, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_actual_interval', default=1, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_steps', default=20, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_max_actual_candidates_per_step', default=1, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_enable', default=False, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_actual_candidate_policy',
+        default='selected_only',
+        choices=[
+            'selected_only',
+            'selected_plus_neighbors',
+            'selected_plus_surrogate_topk',
+            'selected_neighbors_memory_surrogate',
+            'all_bins',
+        ],
+        type=str,
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_actual_topk', default=0, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step', default=1, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_warmup_steps', default=100, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_oracle_sweep_interval', default=0, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_oracle_sweep_max_bins', default=8, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_wide_probe_enable', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_wide_probe_ratios',
+        default='0.005,0.010,0.015,0.020,0.025,0.030,0.035,0.040,0.045,0.050',
+        type=str,
+        help='interval または sequence 先頭で teacher 校正用に候補へ追加する広域 Amount',
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_wide_probe_interval', default=50, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_wide_probe_sequence_head_steps', default=2, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_wide_probe_max_actual', default=3, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_sequence_memory_enable', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_sequence_memory_topk', default=3, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_sequence_memory_momentum', default=0.7, type=float)
+    parser.add_argument('--sparsepcgc_reuse_where_ranking_for_amounts', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_actual_parallel_mode', default='single', choices=['single', 'worker_pool'], type=str)
+    parser.add_argument('--sparsepcgc_actual_parallel_candidates', default=1, type=int)
+    parser.add_argument('--sparsepcgc_actual_parallel_fallback_to_single', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_teacher_actual_priority', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_entropy_weight', default=0.01, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_entropy_decay_steps', default=2000, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_min_entropy_weight', default=0.001, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_noop_margin', default=0.0, type=float)
+    parser.add_argument(
+        '--sparsepcgc_actual_bit_objective',
+        default='raw',
+        choices=['raw', 'billed'],
+        type=str,
+        help='actual codec teacher/compression objectiveでraw bitsを使うか、edit_record_bits込みbilled bitsを使うか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_where_mode',
+        default='block_only',
+        choices=['block_only', 'macro_micro_heuristic', 'macro_micro_hybrid'],
+        type=str,
+        help='full_cloud_amount hard Where。block_onlyは旧codec block丸ごと削除、macro_micro_heuristicはmacro block制限+micro voxel分散削除',
+    )
+    parser.add_argument('--sparsepcgc_where_macro_max_ratio', default=0.01, type=float)
+    parser.add_argument('--sparsepcgc_where_macro_share', default=0.25, type=float)
+    parser.add_argument('--sparsepcgc_where_macro_max_blocks', default=1, type=int)
+    parser.add_argument('--sparsepcgc_where_macro_min_total_ratio', default=0.015, type=float)
+    parser.add_argument('--sparsepcgc_where_micro_exclude_macro_blocks', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_where_micro_block_quota_fraction', default=0.10, type=float)
+    parser.add_argument('--sparsepcgc_where_micro_min_selected_blocks', default=8, type=int)
+    parser.add_argument('--sparsepcgc_where_micro_round_robin', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_where_micro_use_delete_prior', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_learning_mode',
+        default='network_selected_bandit',
+        choices=['multi_actual_teacher', 'network_selected_bandit'],
+        type=str,
+    )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_bandit_aux_actual_teacher',
+        default=True,
+        type=str2bool,
+        help='network_selected_bandit で diagnostic/wide actual により selected 以外の候補が良かった場合、補助teacherとして class/value/residual へ返す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_action_sample_mode',
+        default='categorical',
+        choices=['argmax', 'categorical', 'gumbel'],
+        type=str,
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_exploration_temperature', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_temperature_decay_steps', default=3000, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_min_temperature', default=0.3, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_diagnostic_sweep_interval', default=0, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geom_cost_weight', default=0.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_ratio_cost_weight', default=0.05, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_sequence_baseline_momentum', default=0.9, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geometry_mode', default='sampled', choices=['off', 'sampled', 'interval_full'], type=str)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geom_sample_points', default=20000, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geom_interval', default=20, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_cls_loss_weight', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_policy_loss_weight', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_value_loss_weight', default=0.5, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_rank_loss_weight', default=0.2, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geom_penalty_weight', default=0.1, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_ratio_reg_weight', default=0.05, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_noop_guard_weight', default=0.5, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_ratio_reg_target', default=0.05, type=float)
+    parser.add_argument(
+        '--sparsepcgc_warmup_force_codec_prior_amount',
+        default=True,
+        type=str2bool,
+        help='Trueならcodec prior warmup中だけhard Prune個数をcodec_prune_prior_active_ratioで決める。Phase0以降はNetwork Amountを使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_prune_after_prior_mode',
+        default='network',
+        type=str,
+        help='warmup後のPrune hard実行モード。oracleは既存挙動、network/direct_networkはNetwork出力を優先',
+    )
+    parser.add_argument(
+        '--sparsepcgc_network_prune_ratio_floor',
+        default=0.001,
+        type=float,
+        help='Network Pruneの最低割合。Amountを固定しないため、通常は0.1%%程度の0個回避用にする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_network_prune_min_hard_count',
+        default=1,
+        type=int,
+        help='network modeでwarmup後も保証するhard Prune最小個数(train時のみ)',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_prior_warmup_min_hard_count',
+        default=1,
+        type=int,
+        help='codec prior warmup中にtarget ratioが正で候補もあるのにhard dropが0になる場合の最低削除数。0なら無効',
+    )
+    parser.add_argument(
+        '--sparsepcgc_network_prune_floor_steps',
+        default=20,
+        type=int,
+        help='Network prune floorを一定割合で維持するstep数。Amount固定を避けるため短くする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_network_prune_floor_decay_steps',
+        default=100,
+        type=int,
+        help='Network prune floorを0へ線形減衰させるstep数。Amount固定を避けるため短くする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_prune_prior',
+        default=True,
+        type=str2bool,
+        help='Trueならwarmup後もcodec priorをNetwork scoreへ弱く混ぜる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_prior_tail_alpha',
+        default=0.35,
+        type=float,
+        help='warmup終了直後に残すcodec prior混合率。0.35なら35%%だけpriorを残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_prior_tail_steps',
+        default=1200,
+        type=int,
+        help='warmup終了後にcodec prior混合率を0へ減衰させるstep数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_prior_amount_blend',
+        default=False,
+        type=str2bool,
+        help='Trueならwarmup後もPrune量計算にcodec prior ratioを弱く混ぜる。AmountをNetworkに任せる通常訓練ではFalse',
+    )
+
+    parser.add_argument(
+        '--sparsepcgc_prune_monotonic_floor',
+        default=False,
+        type=str2bool,
+        help='Trueなら前StepのPrune ratioをfloorとして使う。Hybrid訓練ではFalse推奨',
+    )
+    parser.add_argument(
+        '--sparsepcgc_prune_gate_monotonic_floor',
+        default=False,
+        type=str2bool,
+        help='Trueなら前StepのPrune operation gateをfloorとして使う。Hybrid訓練ではFalse推奨',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_amount_mode',
+        default='network',
+        choices=['max', 'blend', 'network'],
+        type=str,
+        help='codec prior ratioとNetwork Amountの混ぜ方。networkならwarmup後のPrune量はNetwork出力を使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_amount_min_network_keep',
+        default=0.50,
+        type=float,
+        help='Amount blend時に最低限残すNetwork比率。0.15ならpriorが強くてもNetworkを15%%残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_hard_action',
+        default=True,
+        type=str2bool,
+        help='Trueならwarmup後もcodec block hard actionとNetwork hard actionを混ぜる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_hard_action_tail_alpha',
+        default=0.85,
+        type=float,
+        help='warmup終了直後にcodec block hard actionを残す割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_hard_action_tail_steps',
+        default=2000,
+        type=int,
+        help='warmup終了後にcodec block hard action割合を0へ減衰させるstep数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_hard_action_period',
+        default=20,
+        type=int,
+        help='hard action hybridの決定周期。20なら20step中alpha割合だけcodec block actionを使う',
+    )
+    # ============================================================
+    # Post-warmup Amount Hybrid
+    # ============================================================
+    # 目的:
+    #   warmup終了後にPrune AmountがNetwork出力だけへ移行し、
+    #   0.2%付近へ潰れる問題を防ぐ。
+    #
+    # 方針:
+    #   Network Amountを完全には消さず、
+    #   codec prior由来のAmount proposalをtailとして混ぜる。
+    #
+    # 注意:
+    #   5%固定・2%固定へ戻す設定ではない。
+    #   Networkを最低限残しながら、post-warmup直後だけ
+    #   warmup中の探索的Amountを下支えする。
+    # ============================================================
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_hybrid',
+        default=True,
+        type=str2bool,
+        help='Trueならwarmup終了後もAmountにcodec prior由来proposalをtailとして混ぜる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_mode',
+        default='blend',
+        choices=['blend', 'max'],
+        type=str,
+        help='post-warmup Amountの混ぜ方。blendはNetworkとproposalを混ぜ、maxは弱い下限として使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_start_ratio',
+        default=0.04,
+        type=float,
+        help='warmup終了直後のAmount proposal。0.04なら4%%から開始する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_end_ratio',
+        default=0.006,
+        type=float,
+        help='tail終了直前のAmount proposal。0.006なら0.6%%まで緩やかに下げる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_tail_steps',
+        default=5000,
+        type=int,
+        help='post-warmup Amount proposalをstartからendへ減衰させるstep数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_max_alpha',
+        default=0.65,
+        type=float,
+        help='post-warmup Amount proposalを混ぜる最大割合。0.65なら最低35%%はNetwork Amountを残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_min_network_keep',
+        default=0.30,
+        type=float,
+        help='Amount hybrid時に最低限残すNetwork比率。0.30ならproposalが強くても30%%はNetworkを残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_teacher_weight',
+        default=0.08,
+        type=float,
+        help='post-warmup Amount targetをdrop_amount_headへ蒸留する補助loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_strategy',
+        default='outcome_explore',
+        choices=['fixed_blend', 'outcome_explore', 'network'],
+        type=str,
+        help='warmup後のAmount制御。fixed_blendは旧固定tail、outcome_exploreはAmount候補探索+actual成功memory、networkは完全Network',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_ratios',
+        default='0.005,0.01,0.02,0.03,0.04,0.05',
+        type=str,
+        help='post-warmupで探索するPrune Amount候補。0.05は5%%',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_start_prob',
+        default=0.60,
+        type=float,
+        help='post-warmup直後にAmount探索Stepを入れる割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_end_prob',
+        default=0.20,
+        type=float,
+        help='長期訓練で残すAmount探索割合。0にしないことで探索を維持する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_decay_steps',
+        default=5000,
+        type=int,
+        help='Amount探索割合をstart_probからend_probへ減衰させるstep数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_period',
+        default=10,
+        type=int,
+        help='deterministic探索判定の周期。stepとsubtree keyから再現可能にする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_prefer_high_until_success',
+        default=True,
+        type=str2bool,
+        help='成功memoryが少ない間は4〜5%%など高めAmountも一定頻度で試す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_outcome_memory',
+        default=True,
+        type=str2bool,
+        help='actual結果に基づきAmount候補ごとの成功/失敗EMAを保存する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_outcome_memory_ema',
+        default=0.20,
+        type=float,
+        help='Amount outcome memoryのEMA更新率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_outcome_good_margin',
+        default=0.25,
+        type=float,
+        help='actual percentがこの値より負ならAmount成功として扱う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_outcome_bad_margin',
+        default=0.25,
+        type=float,
+        help='actual percentがこの値より正ならAmount失敗として扱う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_memory_min_count_for_exploit',
+        default=1,
+        type=int,
+        help='success memoryをexploitに使うための最小成功回数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_success_teacher_weight',
+        default=0.08,
+        type=float,
+        help='actualで成功したAmount memoryへraw_learned_drop_ratioを寄せる補助loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_success_teacher_max_alpha',
+        default=0.50,
+        type=float,
+        help='成功Amount memoryをhard targetへ混ぜる最大割合。固定化を避けるため1.0にしない',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_prior_distill_weight',
+        default=0.05,
+        type=float,
+        help='codec prior scoreをNetwork drop logitへ模倣させるWhere蒸留loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_prior_amount_distill_weight',
+        default=0.05,
+        type=float,
+        help='codec prior ratioをNetwork Prune Amountへ模倣させるAmount蒸留loss重み。Amount自由学習では0推奨',
+    )
+    # ============================================================
+    # Multi-Subtree training
+    # ============================================================
+    # 目的:
+    #   1Stepで1つのSubtreeだけではなく、診断score上位K個のSubtreeを学習する。
+    #   まずはK=3で固定し、将来的にNetworkがKを決める設計へ拡張する。
+    # ============================================================
+    parser.add_argument(
+        '--sparsepcgc_multi_subtree_train',
+        default=True,
+        type=str2bool,
+        help='Trueなら診断score上位の複数Subtreeを1Stepで学習する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_multi_subtree_topk',
+        default=3,
+        type=int,
+        help='1Stepで学習する上位Subtree数。まずは3推奨',
+    )
+
+    # ============================================================
+    # Outcome Weighted Imitation
+    # ============================================================
+    # 目的:
+    #   actual圧縮損失が下がった行動を強く模倣し、
+    #   悪化した行動を避ける。
+    #   Amountが0へ逃げる問題に対して、成功Amount memoryで下支えする。
+    # ============================================================
+    parser.add_argument(
+        '--sparsepcgc_outcome_imitation',
+        default=True,
+        type=str2bool,
+        help='Trueならactual結果に基づくWhere/Amount imitationを追加する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_actual_filter',
+        default=True,
+        type=str2bool,
+        help='Trueならsubtree actualが悪化したstepをcompression教師として強く使わず、anti-imitation中心にする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_anchor_success_teacher',
+        default=True,
+        type=str2bool,
+        help='Trueならanchor/full-cloud actualで改善した行動統計をNetwork/Subtree側の教師memoryへ反映する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_anchor_success_margin',
+        default=1.0,
+        type=float,
+        help='anchor/full-cloud actual percentがこの値より負なら成功teacherとして保存する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_anchor_success_ema',
+        default=0.20,
+        type=float,
+        help='anchor success teacher memoryのEMA更新率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_stage_switch_guard',
+        default=True,
+        type=str2bool,
+        help='TrueならSparsePCGC圧縮訓練でEpisode 61以降のstage切替によりcompression weightが弱くなりすぎないように保護する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_min_compression_loss_factor',
+        default=1.0,
+        type=float,
+        help='SparsePCGC圧縮訓練で最低限維持するcompression loss factor',
+    )
+    parser.add_argument(
+        '--sparsepcgc_max_policy_loss_factor_in_compression',
+        default=0.25,
+        type=float,
+        help='SparsePCGC圧縮訓練でpolicy lossがcompressionを支配しないようにする上限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_surrogate_trust_gate',
+        default=True,
+        type=str2bool,
+        help='Trueならsurrogate_bit_errorが大きいときにsurrogate由来のcompression勾配を弱め、actual teacherを優先する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_surrogate_error_threshold',
+        default=10.0,
+        type=float,
+        help='このsurrogate_bit_errorを超えたらsurrogate信頼度を下げる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_surrogate_error_disable_threshold',
+        default=13.0,
+        type=float,
+        help='このsurrogate_bit_errorを超えたらsurrogate勾配をほぼ使わない',
+    )
+    parser.add_argument(
+        '--sparsepcgc_surrogate_min_trust',
+        default=0.0,
+        type=float,
+        help='surrogate trust gateの最小信頼度',
+    )
+    parser.add_argument(
+        '--network_only_surrogate_trust_error',
+        default=0.05,
+        type=float,
+        help='Network-only planでSurrogate勾配を全面的に信頼するActual差[%%]の誤差上限',
+    )
+    parser.add_argument(
+        '--network_only_surrogate_disable_error',
+        default=0.50,
+        type=float,
+        help='Network-only planでSurrogateのpolicy向け勾配を0にするActual差[%%]の誤差',
+    )
+    parser.add_argument(
+        '--network_only_adaptive_entropy_weight',
+        default=0.15,
+        type=float,
+        help='raw総量またはshareが境界へ近づいた時だけ有効になるNetwork-only entropy係数',
+    )
+    parser.add_argument(
+        '--prune_amount_soft_anchor_enable',
+        default=False,
+        type=str2bool,
+        help='Trueならlearned_drop_ratio等をtarget_drop_ratioへ寄せる診断用soft anchorを使う',
+    )
+    parser.add_argument(
+        '--prune_amount_soft_anchor_weight',
+        default=0.0,
+        type=float,
+        help='Prune Amount soft anchorの重み。通常訓練では0',
+    )
+    parser.add_argument(
+        '--prune_amount_bias_anchor_enable',
+        default=False,
+        type=str2bool,
+        help='Trueならdrop_amount_head.biasへ直接gradient-only anchorを入れる診断用設定',
+    )
+    parser.add_argument(
+        '--direct_network_prune',
+        default=False,
+        type=str2bool,
+        help='TrueならPhase/oracle/no-op guardを通さず、NetworkのPruneとraw圧縮損失で直接学習する',
+    )
+    parser.add_argument(
+        '--direct_prune_ratio_floor',
+        default=0.05,
+        type=float,
+        help='direct_network_prune時に保証するPrune割合の下限',
+    )
+    parser.add_argument(
+        '--direct_prune_min_hard_count',
+        default=1,
+        type=int,
+        help='direct_network_prune時に候補がある限り保証する最小hard Prune数',
+    )
+    parser.add_argument(
+        '--direct_prune_use_raw_compression_loss',
+        default=True,
+        type=str2bool,
+        help='direct_network_prune時にno-op置換後ではなくraw actual compression lossを使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_gate_non_prune',
+        default=True,
+        type=str2bool,
+        help='Add/Adjustはfull-cloud actualで改善したteacherがある場合だけhard実行する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_gate_prune',
+        default=True,
+        type=str2bool,
+        help='Pruneもactual改善teacherがある場合だけhard実行する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_policy_actual_noop_guard',
+        default=False,
+        type=str2bool,
+        help='互換用のno-op候補診断を有効にする。actualのraw圧縮値と学習教師は置換しない',
+    )
+    parser.add_argument(
+        '--sparsepcgc_policy_actual_noop_guard_margin',
+        default=0.0,
+        type=float,
+        help='actual percentがこの値より悪い場合にno-op guardを発火する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels',
+        default=128,
+        type=int,
+        help='full-cloud macro prune候補の最小削除Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_parent_prune_min_voxels',
+        default=2,
+        type=int,
+        help='parent prune候補に必要な親node内の最小occupied leaf voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_subtree_move_level_shifts',
+        default='1',
+        type=str,
+        help='Subtree移動候補のleaf voxel単位ブロックshift。1なら2^1 voxel幅のchild subtreeを移す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_subtree_move_min_voxels',
+        default=4,
+        type=int,
+        help='Subtree移動候補に必要な最小occupied voxel数',
+    )
+    parser.add_argument(
+        '--repair_subtree_move_source_init_prob',
+        default=0.02,
+        type=float,
+        help='大規模Subtree Move専用source headの初期選択確率',
+    )
+    parser.add_argument(
+        '--repair_subtree_move_source_prior_weight',
+        default=1.0,
+        type=float,
+        help='大規模Subtree Move専用source headをMove source scoreへ混ぜる重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_bits_enabled',
+        default=True,
+        type=str2bool,
+        help='編集後点群を元形状へ戻すための編集記録bitを圧縮目的関数に含める',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_bit_scale',
+        default=1.0,
+        type=float,
+        help='推定編集記録bitの目的関数反映倍率。1.0で全量を加算する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_train_curriculum',
+        default=True,
+        type=str2bool,
+        help='train.py中だけ編集記録bitの反映倍率を段階的に上げ、初期no-op崩壊を防ぐ',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_train_start_scale',
+        default=0.0,
+        type=float,
+        help='編集記録bitカリキュラム開始時のsparsepcgc_edit_record_bit_scaleに対する倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_train_end_scale',
+        default=1.0,
+        type=float,
+        help='編集記録bitカリキュラム終了時のsparsepcgc_edit_record_bit_scaleに対する倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_train_warmup_steps',
+        default=3000,
+        type=int,
+        help='編集記録bitカリキュラムを満額へ到達させるまでのtrain step数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_base_bits',
+        default=8.0,
+        type=float,
+        help='各編集記録パケットの固定ヘッダbit見積もり',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_count_bits_min',
+        default=4,
+        type=int,
+        help='編集個数を記録するための最小bit数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_leaf_address_bits_min',
+        default=10,
+        type=int,
+        help='葉Voxel編集1個の位置指定に使う最小bit数。node index + child slot相当の下限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_subtree_move_bits_min',
+        default=16,
+        type=int,
+        help='Subtree Move 1個の移動指定に使う最小bit数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_actual_primary',
+        default=True,
+        type=str2bool,
+        help='Subtree shadow train中もfull-cloud actual bit差分を圧縮主損失のforward値とログ主値に使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_require_full_cloud_actual_teacher',
+        default=True,
+        type=str2bool,
+        help='actual oracle教師採択をfull-cloud splice actual検証済み候補だけに制限する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_geometry_lambda',
+        default=0.05,
+        type=float,
+        help='Greedy teacher採択時のgeometry edit量ペナルティ係数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_force_no_edit',
+        default=False,
+        type=str2bool,
+        help='actual oracle有効時に改善候補が見つからない場合、Add/Prune/Moveを全て止める',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_prune_mode',
+        default='axis_threshold',
+        type=str,
+        help='高速Prune教師の生成方法(axis_threshold/density_ratio/hybrid)',
+    )
+    parser.add_argument('--allow_slow_knn_fallback', default=False, type=str2bool, help='pointops CUDAが使えない時に低速なtorch.cdist fallbackで継続するか')
+    parser.add_argument('--encoder_pre_downsample_voxel_scale', default=1.0, type=float, help='qs由来のvoxelサイズの倍率')
+    parser.add_argument('--encoder_pre_downsample_growth', default=1.5, type=float, help='voxel数が多すぎるときにvoxelサイズを拡大する倍率')
+    parser.add_argument('--encoder_pre_downsample_max_iters', default=8, type=int, help='voxelサイズ調整の最大反復回数')
+    parser.add_argument('--encoder_feature_propagation', default='knn_inverse_distance', type=str, help='coarse encoder特徴のfull点群への戻し方')
+    parser.add_argument('--encoder_feature_propagation_k', default=3, type=int, help='coarse encoder特徴伝播のkNN数')
+    # Pruning Module
+    # Adding Module
+    parser.add_argument('--target_add_ratio', default=0.0, type=float, help='目標とする追加割合')
+    parser.add_argument('--max_add_ratio', default=0.30, type=float, help='追加割合の最大値')
+    # Displacement Module
+    parser.add_argument('--max_disp_offset', default=0.002, type=float, help='最大移動距離（メートル）')
+    parser.add_argument('--target_disp_ratio', default=0.25, type=float, help='移動する点の目標割合')
+    parser.add_argument('--disp_snap_strength', default=0.35, type=float, help='Octreeグリッドへのスナップ強度')
+
+
+    # Analyzer
+    parser.add_argument('--octree_ctx_level', type=int, default=5,help='Octreeコンテキストの深さ')
+    parser.add_argument('--octree_ctx_dim', type=int, default=8,help='Octreeコンテキスト特徴次元')
+    # Cause-decomposed octree structure repair network
+    parser.add_argument('--structure_hidden_dim', default=96, type=int, help='原因分解・修復ポリシーMLPの隠れ次元')
+    parser.add_argument('--repair_actuator_hidden_dim', default=64, type=int, help='構造修復アクチュエータの隠れ次元')
+    parser.add_argument('--repair_policy_temperature', default=1.0, type=float, help='修復プリミティブsoftmax温度')
+    parser.add_argument('--repair_policy_entropy_weight', default=1e-3, type=float, help='修復ポリシーのエントロピー正則化')
+    parser.add_argument('--max_repair_offset', default=0.002, type=float, help='構造修復で許す最大移動距離')
+    parser.add_argument('--max_repair_qstep', default=0.20, type=float, help='構造修復で許す最大移動距離を量子化step比で指定する下限')
+    parser.add_argument('--repair_snap_strength', default=0.20, type=float, help='Octree格子中心へ寄せる強さ')
+    parser.add_argument('--target_repair_ratio', default=0.15, type=float, help='修復対象点の目標割合')
+    parser.add_argument('--max_repair_ratio', default=1.00, type=float, help='操作量学習時に候補として残す修復対象点の最大割合')
+    parser.add_argument('--repair_ratio_weight', default=8.0, type=float, help='修復割合制御損失の重み')
+    parser.add_argument('--repair_shape_guard_weight', default=0.5, type=float, help='形状保持原因が強い点を動かしすぎない正則化')
+    parser.add_argument('--target_drop_ratio', default=0.0, type=float, help='点削除ゲートの目標割合')
+    parser.add_argument('--max_drop_ratio', default=0.30, type=float, help='点削除ゲートの上限割合')
+    parser.add_argument('--repair_delete_max_points_per_voxel', default=8, type=int, help='削除候補にするleaf voxel内の最大点数(0なら無制限)')
+    parser.add_argument('--repair_move_max_points_per_voxel', default=8, type=int, help='move source候補にするleaf voxel内の最大点数(0なら無制限)')
+    parser.add_argument(
+        '--repair_move_relax_voxel_count_when_starved',
+        default=False,
+        type=str2bool,
+        help='Adjust候補が少なすぎる場合だけrepair_move_max_points_per_voxel制限を緩める',
+    )
+    parser.add_argument(
+        '--repair_move_candidate_min_ratio',
+        default=0.05,
+        type=float,
+        help='Adjust候補不足とみなす最小候補割合',
+    )
+    parser.add_argument(
+        '--repair_move_min_hard_expected_voxels',
+        default=1.0,
+        type=float,
+        help='Moveの期待hard voxel数がこの値未満ならhard Moveを0にする。小Subtreeで最低1 voxel強制になるのを防ぐ',
+    )
+    parser.add_argument('--repair_drop_ratio_weight', default=4.0, type=float, help='点削除割合制御損失の重み')
+    parser.add_argument('--repair_drop_shape_guard_weight', default=1.0, type=float, help='形状保持点を削除しすぎない正則化')
+    parser.add_argument('--repair_drop_soft_proxy_tau', default=3.0, type=float, help='Prune soft proxyでdrop logit飽和を避けるための温度')
+    parser.add_argument('--repair_drop_direct_target_weight', default=5.0, type=float, help='drop soft proxyを目標削除率へ近づける正則化重み')
+    parser.add_argument('--repair_drop_entropy_weight', default=0.01, type=float, help='drop soft proxyのエントロピー正則化重み')
+    parser.add_argument('--repair_operation_entropy_weight', default=0.02, type=float, help='初期stepでoperation分布のentropyを最大化しno-op早期飽和を抑える重み')
+    parser.add_argument('--repair_operation_entropy_warmup_steps', default=500, type=int, help='operation entropy lossを0へ減衰させるstep数')
+    parser.add_argument('--repair_add_ratio_weight', default=4.0, type=float, help='点追加割合制御損失の重み')
+    parser.add_argument('--repair_add_shape_guard_weight', default=0.5, type=float, help='形状保持点の近傍に追加しすぎない正則化')
+    parser.add_argument('--repair_add_offset_weight', default=0.25, type=float, help='追加点オフセットの正則化')
+    parser.add_argument('--repair_add_drop_conflict_weight', default=2.0, type=float, help='削除される点を基点に追加する無駄操作へのペナルティ')
+    parser.add_argument('--repair_add_keep_weight', default=1.0, type=float, help='追加した点が推論時hardeningで消えないようにする損失重み')
+    parser.add_argument('--repair_add_min_offset_weight', default=0.5, type=float, help='追加点オフセットが小さすぎる時のペナルティ重み')
+    parser.add_argument('--repair_move_require_empty_target', default=True, type=str2bool, help='移動先を空の近傍量子化ボクセルに制限するか')
+    parser.add_argument(
+        '--repair_voxel_edit_state',
+        default=True,
+        type=str2bool,
+        help='Actuator内でPrune/Add/Move後のVoxel編集状態を作る',
+    )
+    parser.add_argument(
+        '--repair_voxel_edit_require_empty_move_target',
+        default=True,
+        type=str2bool,
+        help='Voxel編集状態ではMove targetをempty voxelに限定する',
+    )
+    parser.add_argument('--repair_move_prefer_occupied_target', default=False, type=str2bool, help='移動先候補に既存occupied voxelを優先し、codec上のmergeを促すか')
+    parser.add_argument('--repair_move_source_prior_weight', default=0.35, type=float, help='原因診断scoreからmove source候補を起こす補助重み')
+    parser.add_argument('--repair_selection_mode', default='target', type=str, help='修復操作のhard選択方式(target/threshold_cap)。threshold_capでは目標割合を強制せず上限として扱う')
+    parser.add_argument('--repair_move_hard_threshold', default=0.5, type=float, help='threshold_cap時に移動をhard化する最小score')
+    parser.add_argument('--target_move_ratio', default=0.0, type=float, help='Adjust/Moveの目標実行割合。未指定時もtarget_repair_ratioとは分けて扱う')
+    parser.add_argument('--max_move_ratio', default=0.02, type=float, help='Adjustの学習済み実行割合の上限')
+    parser.add_argument(
+        '--repair_move_ratio_floor',
+        default=0.0,
+        type=float,
+        help='学習中にAdjustのHard実行割合が0へ潰れないようにする最小forward割合。backwardは元のlearned ratioへ流す',
+    )
+    parser.add_argument(
+        '--repair_drop_ratio_floor',
+        default=0.0,
+        type=float,
+        help='学習中にPruneのHard実行割合が0へ潰れないようにする最小forward割合。backwardは元のlearned ratioへ流す',
+    )
+    parser.add_argument(
+        '--repair_max_hard_drop_voxels',
+        default=0,
+        type=int,
+        help='1 forwardで実行するPrune hard voxel数の絶対上限。0ならratio上限のみ',
+    )
+    parser.add_argument(
+        '--repair_max_hard_move_voxels',
+        default=0,
+        type=int,
+        help='1 forwardで実行するMove hard source voxel数の絶対上限。0ならratio上限のみ',
+    )
+    parser.add_argument('--repair_move_warmup_steps', default=300, type=int, help='Adjust/Move実行上限を学習初期に徐々に上げるstep数')
+    parser.add_argument('--repair_drop_hard_threshold', default=0.5, type=float, help='threshold_cap時に削除をhard化する最小score')
+    parser.add_argument('--repair_add_hard_threshold', default=0.5, type=float, help='threshold_cap時に追加をhard化する最小score')
+    parser.add_argument('--repair_quant_guard_weight', default=0.0, type=float, help='量子化ボクセル上で無効な移動/追加を抑える正則化')
+    parser.add_argument('--repair_local_guard_weight', default=0.0, type=float, help='形状保持原因が強い局所点の削除/移動を抑える正則化')
+    parser.add_argument('--add_noop_keep_threshold', default=0.5, type=float, help='このkeep確率未満の点は追加基点から除外する')
+    parser.add_argument('--repair_add_weight_mode', default='hard', type=str, help='追加点のfinal_wをhard/softのどちらで作るか')
+    parser.add_argument('--repair_exploration_fraction', default=0.25, type=float, help='annealedモードで全学習Stepのうち探索ノイズを残す割合。既定は前半4分の1')
+    parser.add_argument('--repair_exploration_smooth_tail_fraction', default=0.25, type=float, help='探索減衰末尾を傾き0へ滑らかにつなぐ割合。0なら従来の線形clip')
+    parser.add_argument('--repair_exploration_plateau_fraction', default=0.40, type=float, help='前半25% exploration window内で最大探索強度を保持する割合。windowの最後では必ず0へ収束する')
+    parser.add_argument('--repair_policy_exploration_mode', default='annealed', choices=['constant', 'annealed'], help='Exact-online離散方策の探索強度。annealedは指定fraction内で0へ滑らかに収束し、それ以降は決定論的方策を使う')
+    parser.add_argument('--repair_policy_exploration_constant_multiplier', default=0.50, type=float, help='constant時のWhere/Amount/Fineおよび旧汎用random-mixの基準倍率。実効探索はActual evidence品質で縮小し、eval時の確率ノイズは常に0')
+    parser.add_argument('--repair_add_candidate_ratio_start', default=0.0, type=float, help='探索初期の追加候補割合(0ならmax_add_ratio)')
+    parser.add_argument('--repair_add_candidate_ratio_end', default=0.0, type=float, help='探索終了後の追加候補割合(0ならmax_add_ratio)')
+    parser.add_argument('--repair_add_score_noise_start', default=0.0, type=float, help='探索初期に追加位置logitへ入れるGumbelノイズ量')
+    parser.add_argument('--repair_add_score_noise_end', default=0.0, type=float, help='探索終了後に追加位置logitへ入れるGumbelノイズ量')
+    parser.add_argument('--repair_add_weight_random_mix_start', default=0.0, type=float, help='探索初期に追加点final_wへ混ぜるランダム重み割合')
+    parser.add_argument('--repair_add_weight_random_mix_end', default=0.0, type=float, help='探索終了後に追加点final_wへ混ぜるランダム重み割合')
+    parser.add_argument('--repair_learn_operation_amounts', default=True, type=str2bool, help='Add/Adjustの実行量を固定比率ではなくActuator特徴から学習する')
+    parser.add_argument('--repair_operation_amount_bias_scale', default=2.0, type=float, help='学習されたAdd/Adjust実行量を位置logitへ反映する強さ')
+    parser.add_argument('--repair_operation_gate_enabled', default=True, type=str2bool, help='Prune/Add/Moveを個別にON/OFFするoperation gateを使う')
+    parser.add_argument('--repair_operation_gate_temperature', default=1.0, type=float, help='operation gate sigmoid温度')
+    parser.add_argument('--repair_operation_gate_hard_threshold', default=0.5, type=float, help='operation gateをhard化する閾値')
+    parser.add_argument('--repair_operation_gate_random_mix_start', default=0.0, type=float, help='探索初期にoperation gateへ混ぜるランダム割合')
+    parser.add_argument('--repair_operation_gate_random_mix_end', default=0.0, type=float, help='探索終了後にoperation gateへ混ぜるランダム割合')
+    parser.add_argument('--repair_operation_gate_min_forward', default=0.0, type=float, help='学習中にoperation gateのforward値へ残す最小soft探索量')
+    parser.add_argument('--repair_operation_gate_hard_forward', default=False, type=str2bool, help='operation gateをhard/STE値としてforwardへ使う')
+    parser.add_argument('--repair_operation_gate_logit_scale', default=6.0, type=float, help='operation gate logitのtanh制限幅')
+    parser.add_argument('--repair_operation_gate_pool_std_weight', default=0.50, type=float, help='operation gate poolingでstd特徴を足す重み')
+    parser.add_argument('--repair_operation_gate_pool_max_weight', default=0.25, type=float, help='operation gate poolingでmax特徴を足す重み')
+    parser.add_argument('--repair_operation_gate_init_drop', default=0.50, type=float, help='Prune operation gateの初期確率')
+    parser.add_argument('--repair_operation_gate_init_add', default=0.50, type=float, help='Add operation gateの初期確率')
+    parser.add_argument('--repair_operation_gate_init_move', default=0.50, type=float, help='Move operation gateの初期確率')
+    parser.add_argument('--repair_output_voxel_restored_points', default=False, type=str2bool, help='Voxel edit stateから復元したoccupied voxel中心をActuator出力点群として使う')
+    parser.add_argument('--repair_pattern_prior_scale', default=6.0, type=float, help='親occupancy code頻度差を操作priorへ写すスケール')
+    parser.add_argument('--repair_drop_pattern_prior_weight', default=1.5, type=float, help='頻出occupancy codeへ近づくPrune候補を強める重み')
+    parser.add_argument('--repair_add_pattern_prior_weight', default=1.25, type=float, help='頻出occupancy codeへ近づくAdd source候補を強める重み')
+    parser.add_argument('--repair_add_pair_pattern_prior_weight', default=2.0, type=float, help='頻出occupancy codeへ近づくAdd target pair候補を強める重み')
+    parser.add_argument('--repair_move_pattern_prior_weight', default=1.25, type=float, help='頻出occupancy codeへ近づくMove source候補を強める重み')
+    parser.add_argument('--repair_pattern_prior_smoothing', default=1.0, type=float, help='occupancy code頻度priorのLaplace smoothing')
+    parser.add_argument('--repair_force_min_drop_voxels', default=False, type=str2bool, help='target選択時にPruneを最低1 voxel強制する')
+    parser.add_argument('--repair_force_min_add_voxels', default=False, type=str2bool, help='Addを最低1 voxel強制する')
+    parser.add_argument('--repair_force_min_move_voxels', default=False, type=str2bool, help='target選択時にMoveを最低1 voxel強制する')
+    parser.add_argument('--repair_add_min_expected_voxels', default=1.0, type=float, help='Add候補の期待voxel数がこの値未満ならhard Addを0にする')
+    parser.add_argument('--cause_aggregation_learnable_refine', default=True, type=str2bool, help='CauseDiagnosisAggregationの集約後scoreへ小さい学習可能refineを入れる')
+    parser.add_argument('--cause_aggregation_refine_hidden', default=32, type=int, help='CauseAggregation refine MLPの隠れ次元')
+    parser.add_argument('--cause_aggregation_refine_scale', default=0.10, type=float, help='CauseAggregation refineの初期影響倍率')
+    parser.add_argument('--cause_aggregation_cause_dim', default=8, type=int, help='CauseAggregation refineで想定するcause channel数')
+  
+    """損失項の重みパラメータ"""
+    parser.add_argument('--full_context_subtree_loss', default=True, type=str2bool, help='Subtree編集をfull cloud文脈上のoccupancy差分として評価する補助lossを使う')
+    parser.add_argument('--full_context_subtree_loss_weight', default=0.2, type=float, help='full-context subtree delta lossの重み')
+    parser.add_argument('--full_context_subtree_loss_grad_weight', default=0.1, type=float, help='full-context subtree delta lossのproxy勾配重み')
+    parser.add_argument('--full_context_subtree_loss_require_context', default=True, type=str2bool, help='subtree_tree/full_octree_contextがない場合はfull-context subtree lossを無効化する')
+    parser.add_argument('--full_context_subtree_loss_node_weight', default=0.05, type=float, help='full-context subtree loss内のnode count差分重み')
+    parser.add_argument('--full_context_subtree_loss_single_weight', default=0.10, type=float, help='full-context subtree loss内のsingle-child差分重み')
+    parser.add_argument('--full_context_subtree_loss_entropy_weight', default=0.20, type=float, help='full-context subtree loss内のoccupancy entropy差分重み')
+    parser.add_argument('--full_context_subtree_loss_nll_weight', default=0.00, type=float, help='full-context subtree loss内のoccupancy NLL差分重み')
+    parser.add_argument('--full_context_subtree_loss_lowprob_weight', default=0.20, type=float, help='full-context subtree loss内のlowprob occupancy差分重み')
+    parser.add_argument('--full_context_subtree_loss_count_weight', default=0.02, type=float, help='full-context subtree loss内のoccupied voxel数差分重み')
+    parser.add_argument('--full_context_subtree_loss_fragment_weight', default=0.05, type=float, help='full-context subtree loss内のisolated voxel / fragmentation差分重み')
+    parser.add_argument('--full_context_subtree_loss_max_depth', default=0, type=int, help='full-context subtree lossで使うoccupancy統計の最大深さ。0ならcoords範囲から推定する')
+    parser.add_argument('--full_context_subtree_soft_proxy', default=True, type=str2bool, help='full-context subtree lossでsoft edit proxy勾配を使う')
+    parser.add_argument('--full_context_subtree_soft_proxy_weight', default=0.1, type=float, help='full-context subtree soft proxy lossの重み')
+    parser.add_argument('--full_context_subtree_soft_proxy_severity_floor', default=1.0, type=float, help='full-context hard悪化が正だが小さい場合にsoft proxy勾配が消えないようにするseverity下限')
+    parser.add_argument('--full_context_subtree_soft_proxy_move_weight', default=1.0, type=float, help='full-context subtree soft proxy内のMove抑制重み')
+    parser.add_argument('--full_context_subtree_soft_proxy_add_weight', default=0.5, type=float, help='full-context subtree soft proxy内のAdd抑制重み')
+    parser.add_argument('--full_context_subtree_soft_proxy_drop_weight', default=0.0, type=float, help='full-context subtree soft proxy内のDrop抑制重み')
+    parser.add_argument('--full_cloud_actual_correction', default=True, type=str2bool, help='periodic full cloud actualを使ってsubtree/proxy lossを補正する')
+    parser.add_argument('--cp_full_cloud_actual_correction_weight', default=0.05, type=float, help='compression_primary時にfull cloud actual correctionをlossへ反映する重み')
+    parser.add_argument('--full_cloud_actual_correction_warmup_steps', default=0, type=int, help='full cloud actual correctionを有効化するまでのwarmup step')
+    parser.add_argument('--full_cloud_actual_correction_ema', default=0.90, type=float, help='full cloud actual gapのEMA係数')
+    parser.add_argument('--full_cloud_actual_correction_clip', default=5.0, type=float, help='full cloud actual correction値のclip上限')
+    parser.add_argument('--full_cloud_actual_correction_debug', default=False, type=str2bool, help='full cloud actual correctionのdebugログを出す。通常学習では既定False')
+    parser.add_argument('--full_cloud_actual_correction_loss_enable', default=True, type=str2bool, help='full cloud actual correctionを実際にlossへ足すか')
+    parser.add_argument('--full_cloud_actual_correction_penalize_move', default=True, type=str2bool, help='full cloud actual悪化時にMove量を補正ペナルティの観測対象にする')
+    parser.add_argument('--full_cloud_actual_correction_penalize_add', default=True, type=str2bool, help='full cloud actual悪化時にAdd量を補正ペナルティの観測対象にする')
+    parser.add_argument('--full_cloud_actual_correction_penalize_drop', default=True, type=str2bool, help='full cloud actual悪化時にDrop量を補正ペナルティの観測対象にする')
+    parser.add_argument('--full_cloud_actual_correction_soft_proxy', default=True, type=str2bool, help='full cloud actual correctionでsoft edit proxyを使う')
+    parser.add_argument('--full_cloud_actual_correction_move_weight', default=1.0, type=float, help='full cloud actual悪化時のMove soft抑制重み')
+    parser.add_argument('--full_cloud_actual_correction_add_weight', default=0.5, type=float, help='full cloud actual悪化時のAdd soft抑制重み')
+    parser.add_argument('--full_cloud_actual_correction_drop_weight', default=0.05, type=float, help='full cloud actual悪化時のDrop soft抑制重み')
+
+
+    # 圧縮損失における点操作のAmount
+    parser.add_argument('--repair_amount_downstream_grad_scale', default=10.0, type=float, help='Amount ratioから実際の点操作へ向かう下流勾配だけを強める倍率。forward値は変えず、backwardだけ強める')
+    parser.add_argument('--repair_drop_amount_downstream_grad_scale', default=3000.0, type=float, help='Prune Amount ratioから実際の削除操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_add_amount_downstream_grad_scale', default=150.0, type=float, help='Add Amount ratioから実際の追加操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_move_amount_downstream_grad_scale', default=25.0, type=float, help='Move Amount ratioから実際の移動操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_amount_downstream_grad_max_scale', default=10000.0, type=float, help='Amount downstream STE倍率の上限。極端な勾配増幅を抑える')
+    parser.add_argument('--repair_soft_normalizer_floor', default=1e-4, type=float, help='Soft操作量正規化の分母下限。AMP fp16で0除算/inf勾配を防ぐ')
+    # 圧縮損失における点操作のWhere
+    parser.add_argument('--repair_where_downstream_grad_scale', default=1.0, type=float, help='Where scoreから実際の点操作へ向かう下流勾配だけを調整する倍率。forward値は変えず、backwardだけ変える')
+    parser.add_argument('--repair_drop_where_downstream_grad_scale', default=0.004, type=float, help='Prune Where scoreから実際の削除操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_add_where_downstream_grad_scale', default=1.0, type=float, help='Add Where scoreから実際の追加操作へ向かう下流勾配倍率')
+    parser.add_argument('--repair_move_where_downstream_grad_scale', default=1.0, type=float, help='Move Where scoreから実際の移動操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument(
+        '--repair_where_downstream_grad_min_scale',
+        default=0.005,
+        type=float,
+        help='Where downstream STE倍率の下限。Add Whereだけを1倍未満に弱めるために使う',
+    )
+    parser.add_argument(
+        '--repair_where_downstream_grad_max_scale',
+        default=12.0,
+        type=float,
+        help='Where downstream STE倍率の上限。Prune/Moveを強めすぎた時の勾配爆発を防ぐ',
+    )
+    parser.add_argument(
+        '--repair_drop_where_saturated_grad_eps',
+        default=0.05,
+        type=float,
+        help='Prune soft削除確率がclampで飽和した場合でも、drop_headへ最小限の勾配を返す倍率。forward値は変えない',
+    )
+    parser.add_argument(
+        '--repair_drop_where_logit_scale',
+        default=6.0,
+        type=float,
+        help='Prune Whereのdrop_head logitをsigmoid前にtanhで制限するスケール。drop_prob_proxyの飽和を防ぐ',
+    )
+    parser.add_argument(
+        '--repair_prune_ratio_bias_scale',
+        default=0.10,
+        type=float,
+        help='Prune Amount由来のratio biasをPrune Where scoreへ足す倍率。大きすぎるとdrop_headが飽和する',
+    )
+    parser.add_argument(
+        '--repair_prune_ratio_bias_clip',
+        default=1.50,
+        type=float,
+        help='Prune Amount由来のratio biasをlogit空間でclampする上限。Prune Whereの飽和を防ぐ',
+    )
+    parser.add_argument(
+        '--compression_soft_prune_logit_direct_grad_weight',
+        default=0.00002,
+        type=float,
+        help='train.pyでdrop_logitからPrune Whereへ直接返す保険用の微小勾配重み。forward値は変えない',
+    )
+    # Actuatorにおける点操作のWhere
+    parser.add_argument('--repair_drop_where_actuator_weight', default=0.03, type=float, help='Prune Where scoreへ直接かけるActuator補助損失重み')
+    parser.add_argument('--repair_add_where_actuator_weight', default=0.3, type=float, help='Add Where scoreへ直接かけるActuator補助損失重み')
+    parser.add_argument('--repair_move_where_actuator_weight', default=0.03, type=float, help='Move Where scoreまたは方向へ直接かけるActuator補助損失重み')
+    parser.add_argument('--repair_operation_gate_oracle_weight', default=0.1, type=float, help='actual oracle good/bad教師でoperation gateを学習する補助損失重み')
+    # Actuatorにおける点操作のAmount
+    parser.add_argument('--repair_operation_amount_consistency_weight', default=0.0, type=float, help='学習済み操作割合と実soft操作率を一致させる補助損失重み')
+    parser.add_argument('--repair_operation_amount_direct_weight', default=0.0, type=float, help='learned操作割合を目標割合へ近づける直接補助損失。圧縮主目的では弱く使う')
+    parser.add_argument('--repair_drop_amount_supervision_weight', default=0.0, type=float, help='Prune hard実行量を教師にするAmount補助損失。圧縮主目的では弱く使う')
+    parser.add_argument('--repair_drop_amount_soft_consistency_weight', default=0.0005, type=float, help='Prune soft実行量とlearned ratioの整合補助損失')
+    parser.add_argument('--repair_move_amount_supervision_weight', default=0.0, type=float, help='Move hard実行量を教師にするAmount補助損失。圧縮主目的では弱く使う')
+    parser.add_argument('--repair_move_amount_soft_consistency_weight', default=0.0, type=float, help='Move soft実行量とlearned ratioの整合補助損失')
+    parser.add_argument('--repair_add_amount_supervision_weight', default=0.0, type=float, help='Add hard実行量を教師にするAmount補助損失。圧縮主目的では弱く使う')
+    parser.add_argument('--repair_add_amount_soft_consistency_weight', default=0.0005, type=float, help='Add soft実行量とlearned ratioの整合補助損失')
+
+    parser.add_argument('--repair_drop_amount_random_mix_start', default=0.1, type=float, help='探索初期にPrune実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_drop_amount_random_mix_end', default=0.0, type=float, help='探索終了後にPrune実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_add_amount_random_mix_start', default=0.1, type=float, help='探索初期にAdd実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_add_amount_random_mix_end', default=0.0, type=float, help='探索終了後にAdd実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_move_amount_random_mix_start', default=0.0, type=float, help='探索初期にAdjust実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_move_amount_random_mix_end', default=0.0, type=float, help='探索終了後にAdjust実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_move_score_noise_start', default=0.0, type=float, help='探索初期にAdjust source scoreへ入れる正規ノイズ量')
+    parser.add_argument('--repair_move_score_noise_end', default=0.0, type=float, help='探索終了後にAdjust source scoreへ入れる正規ノイズ量')
+    parser.add_argument('--repair_drop_score_noise_start', default=0.0, type=float, help='探索初期に削除logitへ入れる正規ノイズ量')
+    parser.add_argument('--repair_drop_score_noise_end', default=0.0, type=float, help='探索終了後に削除logitへ入れる正規ノイズ量')
+    parser.add_argument('--repair_drop_random_mix_start', default=0.0, type=float, help='探索初期に削除確率へ混ぜるランダム削除マスク割合')
+    parser.add_argument('--repair_drop_random_mix_end', default=0.0, type=float, help='探索終了後に削除確率へ混ぜるランダム削除マスク割合')
+    parser.add_argument('--repair_priority_gate', default=True, type=str2bool, help='高コスト領域だけを修復対象にする優先度ゲートを使うか')
+    parser.add_argument('--repair_priority_gate_tau', default=0.08, type=float, help='修復優先度ゲートの温度')
+    parser.add_argument('--repair_gate_mean_cap', default=True, type=str2bool, help='修復対象割合の平均がtarget_repair_ratioを超えないように再スケールするか')
+    parser.add_argument('--repair_unit_level', default=5, type=int, help='原因集約で使う粗いOctree/subtree単位の深さ')
+    parser.add_argument('--allow_local_repair_unit_recompute', default=False, type=str2bool, help='unit_keysが無い場合にCauseDiagnosisAggregation内で局所Repair Unitを再計算するか')
+    parser.add_argument('--allow_local_octree_recompute', default=False, type=str2bool, help='prebuilt_subtree_tree以外のdebug用途でOctreeStructureAnalysisの局所Octree再計算を許可するか')
+    parser.add_argument('--forbid_local_voxel_recompute', default=True, type=str2bool, help='StructureRepairActuatorでoctree_context無しの局所Voxel再計算を禁止するか')
+    parser.add_argument(
+        '--full_cloud_forbid_actuator_local_recompute',
+        default=True,
+        type=str2bool,
+        help='FullCloud forward時にActuatorがlocal_recomputedへ落ちることを禁止する',
+    )
+    parser.add_argument(
+        '--full_cloud_require_actuator_octree_context',
+        default=True,
+        type=str2bool,
+        help='FullCloud forward時にActuatorへ渡すoctree_contextとしてfull_octree_contextを必須にする',
+    )
+    parser.add_argument('--structure_geo_k', default=8, type=int, help='構造解析に使う局所幾何kNN数')
+    parser.add_argument('--structure_geo_max_points', default=2048, type=int, help='局所幾何統計を厳密計算する最大点数（超過時はOctree特徴を優先）')
+    parser.add_argument('--octree_diag_levels', default='4,6,8,10,12', type=str, help='Octree階層ごとの診断ログを出すレベル')
+    parser.add_argument('--training_stage', default='joint', type=str, help='学習段階(diagnosis/joint)')
+    parser.add_argument('--two_stage_training', default=False, type=str2bool, help='2段階学習(diagnosis->joint)を自動で行うか')
+    parser.add_argument('--diagnosis_episode_ratio', default=0.25, type=float, help='全episodeのうちdiagnosis段階に使う割合')
+    parser.add_argument('--diagnosis_episodes', default=0, type=int, help='diagnosis段階のepisode数(0ならratioから自動計算)')
+    parser.add_argument('--diagnosis_actuator_strength', default=0.1, type=float, help='diagnosis段階でのactuator強度')
+    parser.add_argument('--repair_actuator_strength', default=0.50, type=float, help='joint段階でのactuator強度')
+    parser.add_argument('--diagnosis_geom_factor', default=0.1, type=float, help='diagnosis段階で幾何損失に掛ける係数')
+    parser.add_argument('--diagnosis_com_factor', default=0.25, type=float, help='diagnosis段階で圧縮損失に掛ける係数')
+    parser.add_argument('--diagnosis_attr_factor', default=1.0, type=float, help='diagnosis段階で原因分解損失に掛ける係数')
+    parser.add_argument('--diagnosis_policy_factor', default=1.0, type=float, help='diagnosis段階で方策整合損失に掛ける係数')
+    parser.add_argument('--diagnosis_repair_factor', default=0.25, type=float, help='diagnosis段階で内部正則化損失に掛ける係数')
+    parser.add_argument('--attr_node_weight', default=1.0, type=float, help='node count原因教師の重み')
+    parser.add_argument('--attr_single_weight', default=1.5, type=float, help='single-child chain原因教師の重み')
+    parser.add_argument('--attr_lowprob_weight', default=1.5, type=float, help='低確率occupancy原因教師の重み')
+    parser.add_argument('--attr_context_weight', default=1.0, type=float, help='context difficulty原因教師の重み')
+    parser.add_argument('--attr_quant_weight', default=1.25, type=float, help='量子化ボクセル無駄原因教師の重み')
+    parser.add_argument('--attr_sparse_weight', default=1.0, type=float, help='sparse fragmentation原因教師の重み')
+    parser.add_argument('--attr_outlier_weight', default=1.0, type=float, help='outlier原因教師の重み')
+    parser.add_argument('--attr_shape_weight', default=0.75, type=float, help='形状保持原因教師の重み')
+    parser.add_argument(
+        '--direct_octree_structure_targets',
+        default=True,
+        type=str2bool,
+        help='推論時にも得られるOctree原因教師と決定論的方策を直接使い、冗長なL_Attr/L_Polと近似headを無効化する',
+    )
+    parser.add_argument('--loss_attr_scale', default=0.05, type=float, help='原因分解損失の内部スケール')
+    parser.add_argument('--loss_policy_scale', default=1.0, type=float, help='修復ポリシー損失の内部スケール')
+    parser.add_argument('--loss_repair_scale', default=1.0, type=float, help='修復アクチュエータ損失の内部スケール')
+    # その他設定
+    parser.add_argument('--encoder_bn', default=False, type=str2bool, help='EncoderでBatchNormを使うか')
+    parser.add_argument('--k', default=8, type=int, help='近傍点数（kNN）')
+    parser.add_argument('--global_mlp', default=True, type=str2bool, help='global MLPを使うか')
+    parser.add_argument('--encoder_query_chunk', default=2048, type=int, help='Encoderのattention計算の分割サイズ（0で無効）')
+
+    """Train"""
+    parser.add_argument('--save_dir', default=str((_DATA_ROOT / 'trained_model').resolve()), type=str, help='モデル保存ディレクトリ')
+    parser.add_argument('--ckpt', default=_default_checkpoint_path(), type=str, help='チェックポイントのパス')
+    parser.add_argument('--pretrained_date', default=pretrained_date, type=str, help='test.pyで読む学習済みモデルの日付')
+    parser.add_argument('--pretrained_time', default=pretrained_time, type=str, help='test.pyで読む学習済みモデルの時刻')
+    parser.add_argument(
+        '--more_training_ckpt',
+        default='',
+        type=str,
+        help='more_training=True のときに追加学習の初期値として読み込むモデルパス。空なら pretrained_date/pretrained_time/method_com/model_name から自動生成する',
+    )
+    parser.add_argument('--out_path', default=str((_LOG_ROOT / file_day / "MyNetwork_train" / "pretrained" / file_time).resolve()), type=str, help='チェックポイント保存先')
+    parser.add_argument('--log_root', default=str(_LOG_ROOT), type=str, help='学習・推論ログ保存ルート')
+    parser.add_argument('--optim', default='adam', type=str, help='最適化手法（adamまたはsgd）')
+    parser.add_argument('--gamma', default=0.5, type=float, help='学習率減衰の係数')
+    parser.add_argument('--lr_decay_step', default=24, type=int, help='学習率を減衰させるステップ間隔')
+    parser.add_argument('--lr_scheduler_enabled', default=False, type=str2bool, help='TrueならEpoch単位のStepLRを使う。SparsePCGCではLR崩壊防止のため既定でFalse')
+    parser.add_argument(
+        '--lr_scheduler_mode', default='step', choices=['step', 'plateau'],
+        help='stepは従来StepLR、plateauはraw deterministic fixed RD停滞時だけLRを下げる',
+    )
+    parser.add_argument(
+        '--lr_plateau_patience', default=60, type=int,
+        help='fixed RD best更新なしでLRを下げるEpisode数（8iの15-Episode窓を4周期待つ）',
+    )
+    parser.add_argument(
+        '--lr_plateau_min_delta', default=0.02, type=float,
+        help='fixed RD best更新と認める絶対差。0.04ではE41の実改善を無視してE46で早期減衰したため半減',
+    )
+    parser.add_argument('--lr_plateau_cooldown', default=15, type=int)
+    parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
+    parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
+    parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
+    parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
+    parser.add_argument('--train_window_shuffle_each_cycle', default=True, type=str2bool, help='訓練フレームを1周ごとにseed固定で再配置し、固定的なEpisode周期を防ぐ')
+    parser.add_argument('--episodes', default=382, type=int, help='学習エピソード数')
+    parser.add_argument('--exploration_schedule_episodes', default=0, type=int, help='探索ノイズの減衰基準Episode数。0なら実際の最大訓練長へ連動し、訓練延長時に旧固定長で探索が途中終了することを防ぐ')
+    parser.add_argument('--train_until_converged', default=False, type=str2bool, help='Trueならepisodesを最低訓練長とし、固定検証で十分な収束証拠が得られるまで継続する')
+    parser.add_argument('--convergence_min_episodes', default=0, type=int, help='収束判定を始める最低Episode数。0なら--episodesを使う')
+    parser.add_argument('--convergence_max_episodes', default=384, type=int, help='収束制御の安全上限。未収束で到達した場合は正常終了にせずエラーにする')
+    parser.add_argument('--convergence_window_episodes', default=16, type=int, help='収束判定に使う直近Episode窓')
+    parser.add_argument('--convergence_patience_episodes', default=32, type=int, help='最低訓練長を越えた後、安定判定を連続して満たす必要があるEpisode数')
+    parser.add_argument('--convergence_guard_cooldown_episodes', default=16, type=int, help='Actual guard rollback後に収束判定を禁止するEpisode数')
+    parser.add_argument('--convergence_actual_compression_target', default=-3.5, type=float, help='収束に必要な固定検証Actual圧縮率[%%]')
+    parser.add_argument('--convergence_total_loss_slope_max', default=0.02, type=float, help='旧train-loss収束判定とのCLI互換用（現在は固定validationのみで判定）')
+    parser.add_argument('--convergence_total_loss_half_delta_max', default=0.12, type=float, help='旧train-loss収束判定とのCLI互換用（現在は固定validationのみで判定）')
+    parser.add_argument('--convergence_compression_slope_max', default=0.01, type=float, help='旧train圧縮収束判定とのCLI互換用（探索影響のため現在は非使用）')
+    parser.add_argument('--convergence_compression_half_delta_max', default=0.08, type=float, help='旧train圧縮収束判定とのCLI互換用（探索影響のため現在は非使用）')
+    parser.add_argument('--convergence_fixed_objective_slope_max', default=0.001, type=float, help='固定検証Rate-Distortion目的の許容絶対傾き/Episode')
+    parser.add_argument('--convergence_fixed_objective_half_delta_max', default=0.01, type=float, help='固定検証RDの収束窓前半・後半平均差の許容絶対値')
+    parser.add_argument('--convergence_geometry_relative_worsening_max', default=0.0025, type=float, help='固定検証幾何損失の収束窓前半比で許す悪化率')
+    parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
+    parser.add_argument('--deform', default=False, type=str2bool, help='変形モジュールをゆっくり学習するか')
+    parser.add_argument('--loss_type', default='cd', type=str, help='幾何損失の種類')
+    parser.add_argument('--method_name', default=method_name, type=str, help='ログ上の提案手法名')
+    parser.add_argument('--run_name', default='', type=str, help='チェックポイント保存名。空なら <time>_<compress> を使う')
+    parser.add_argument('--operation_count_drop_threshold', default=0.50, type=float, help='学習ログで削除点として数えるkeep確率のしきい値')
+    parser.add_argument('--operation_count_adjust_threshold', default=1e-6, type=float, help='学習ログで調整点として数える最小移動距離')
+
+    parser.add_argument(
+        '--loss_mode',
+        default='compression_primary',
+        choices=['legacy_total', 'compression_primary'],
+        type=str,
+        help='loss構成。legacy_totalは既存互換、compression_primaryは圧縮主目的の実験モード',
+    )
+    parser.add_argument('--compression_primary_warmup_steps', default=0, type=int, help='compression_primaryでw_comを滑らかに上げるstep数(0で無効)')
+    parser.add_argument(
+        '--cp_lambda_geom',
+        '--geometry_loss_weight',
+        dest='cp_lambda_geom',
+        default=150.0,
+        type=float,
+        help=(
+            'compression_primaryで実際に使う幾何損失重み。'
+            '--geometry_loss_weightは同じ値を指定する読みやすいalias'
+        ),
+    )
+    parser.add_argument(
+        '--cp_geometry_backward_scale',
+        default=0.036,
+        type=float,
+        help=(
+            'cp_lambda_geomによるforward損失値を変えず、幾何primaryのbackwardだけを'
+            '倍率調整する。0.036はauxの固定25%化を解除した実効scale=1で、'
+            '圧縮/幾何gradient L2が同程度になるよう実Stepから校正'
+        ),
+    )
+    parser.add_argument(
+        '--rd_geometry_weight_multiplier',
+        default=1.10,
+        type=float,
+        help=(
+            'SparsePCGC online方策のGeometry重要度を、従来RD設定に対して共通に'
+            '倍率調整する。candidate-local、global policy、fixed RDで同じ倍率を使う'
+        ),
+    )
+    parser.add_argument('--cp_lambda_single', default=0.05, type=float, help='compression_primaryのsingle-child safety penalty重み')
+    parser.add_argument('--cp_lambda_nodes', default=0.03, type=float, help='compression_primaryのnode safety penalty重み')
+    parser.add_argument('--cp_lambda_actuator', default=0.05, type=float, help='compression_primaryのactuator safety penalty重み')
+    parser.add_argument('--cp_lambda_sparsepcgc', default=0.0, type=float, help='compression_primaryのSparsePCGC soft aux safety penalty重み')
+    parser.add_argument('--cp_lambda_op', default=0.0, type=float, help='compression_primaryのoperation safety penalty重み(現状は実験用、default無効)')
+    parser.add_argument(
+        '--compression_primary_aux_target_ratio',
+        default=0.75,
+        type=float,
+        help=(
+            'compression_primary内部support blockの|main|に対する上限。'
+            '通常の幾何block比(約0.5)より上に置き、毎Stepの全体損失が'
+            '圧縮損失の固定倍率へ潰れるのを防ぐ'
+        ),
+    )
+    parser.add_argument('--compression_primary_aux_balance_min_scale', default=0.0, type=float, help='compression_primary内部support blockの最小scale')
+    parser.add_argument('--compression_primary_aux_balance_max_scale', default=1.0, type=float, help='compression_primary内部support blockの最大scale')
+    parser.add_argument('--compression_primary_tail_target_ratio', default=0.40, type=float, help='compression_primary終盤で加えるattr/policy/actuator/correction support blockを|main|に対してどこまで許すかの比率上限')
+    parser.add_argument('--compression_primary_tail_balance_min_scale', default=0.0, type=float, help='compression_primary終盤support blockの最小scale')
+    parser.add_argument('--compression_primary_tail_balance_max_scale', default=1.0, type=float, help='compression_primary終盤support blockの最大scale')
+    parser.add_argument('--compression_primary_total_support_target_ratio', default=0.40, type=float, help='compression_primaryの全support block合計を|main|に対して許す比率上限')
+    parser.add_argument(
+        '--compression_primary_proxy_grad_weight',
+        default=0.02,
+        type=float,
+        help='compression_primaryでhard圧縮目的のforward値を保ったまま、backwardだけ微分可能proxyへ流す重み',
+    )
+    parser.add_argument('--cp_tau_geom', default=0.06, type=float, help='compression_primaryのgeometry許容閾値')
+    parser.add_argument('--cp_tau_single', default=0.0, type=float, help='compression_primaryのsingle-child許容閾値')
+    parser.add_argument('--cp_tau_nodes', default=0.0, type=float, help='compression_primaryのnode許容閾値')
+    parser.add_argument('--cp_tau_actuator', default=0.0, type=float, help='compression_primaryのactuator許容閾値')
+    parser.add_argument('--cp_tau_sparsepcgc', default=0.0, type=float, help='compression_primaryのSparsePCGC soft aux許容閾値')
+    parser.add_argument('--cp_use_stage_factors', default=False, type=str2bool, help='compression_primaryでも既存stage factorを使うか(default False)')
+    parser.add_argument('--cp_force_joint_actuator', default=True, type=str2bool, help='compression_primaryでactuator strengthをjoint相当に固定するか')
+    parser.add_argument('--cp_log_grad_terms', default=True, type=str2bool, help='compression_primaryの各loss項のrequires_grad/finiteをログするか')
+    parser.add_argument(
+        '--w_geom',
+        default=10**4,
+        type=float,
+        help='legacy_totalモードの幾何損失重み（compression_primaryでは--cp_lambda_geomを使う）',
+    )
+    parser.add_argument('--geom_d2_weight', default=0.2, type=float, help='loss_type=cd+d2 のときの D2PSNR 報酬項の重み')
+    parser.add_argument(
+        '--w_com',
+        '--compression_loss_weight',
+        dest='w_com',
+        default=3.0,
+        type=float,
+        help=(
+            '圧縮損失の実行重み（actual/surrogate backendでは total-bit 差[%%] に直接掛かる）。'
+            '--compression_loss_weightは同じ値を指定する読みやすいalias'
+        ),
+    )
+    parser.add_argument('--w_attr',     default=20.0, type=float, help='原因分解損失ブロック全体の重み')
+    parser.add_argument('--w_policy',   default=0.3, type=float, help='構造修復ポリシー損失ブロック全体の重み')
+    parser.add_argument('--w_actuator', default=1.0, type=float, help='構造修復アクチュエータ正則化損失ブロック全体の重み')
+    parser.add_argument('--w_prun',     default=None, type=float, help='旧名: --w_attr の後方互換alias')
+    parser.add_argument('--w_add',      default=None, type=float, help='旧名: --w_policy の後方互換alias')
+    parser.add_argument('--w_dis',      default=None, type=float, help='旧名: --w_actuator の後方互換alias')
+    parser.add_argument('--com_bit',    default=10*100, type=float, help='proxy backend で bit 差(%%)項へ掛ける重み')
+    parser.add_argument('--com_sin',    default=1, type=float, help='proxy backend で single-child 差(%%)項へ掛ける重み')
+    parser.add_argument('--com_node',   default=4, type=float, help='proxy backend で node 数差(%%)項へ掛ける重み')
+    parser.add_argument('--com_bpn',    default=0.25, type=float, help='proxy backend で bits-per-node 差(%%)項へ掛ける重み')
+    parser.add_argument('--actual_total_bit_objective_mix', default=1.0, type=float, help='actual/surrogate backendでL_com直結と内訳合成を混ぜる比率。1.0なら実bit差分のみ')
+    parser.add_argument('--com_sparsepcgc', default=0.0, type=float, help='SparsePCGC補助proxy項へ掛ける重み。主objectiveには既定で混ぜない')
+    parser.add_argument('--com_lowprob', default=1, type=float, help='proxy backend で low-probability occupancy 項へ掛ける重み')
+
+    parser.add_argument('--lambda_p',   default=10**-5, type=float, help='soft圧縮損失の係数')
+    parser.add_argument('--discrete_loss_mode', default='ste_hard', type=str, help='離散学習のモード')
+    parser.add_argument('--discrete_surrogate_weight', default=1.0, type=float, help='STE時の代理勾配の重み')
+    parser.add_argument(
+        '--compression_loss_delta',
+        default=True,
+        type=str2bool,
+        help='Trueなら圧縮損失を従来どおりのdelta percentで使う。Falseなら1-delta percentへ切り替える',
+    )
+    parser.add_argument(
+        '--minimal_loss_objective',
+        default=True,
+        type=str2bool,
+        help='Trueなら学習の主損失を圧縮損失と幾何損失のみに絞る',
+    )
+    parser.add_argument(
+        '--geometry_fit_weight',
+        default=0.05,
+        type=float,
+        help='追加点からGT局所表面への法線方向二乗距離平均に掛ける重み',
+    )
+    parser.add_argument(
+        '--geometry_fit_normal_radius',
+        default=2,
+        type=int,
+        help='追加点Fit用のGT局所法線を推定するvoxel近傍半径',
+    )
+    parser.add_argument(
+        '--geometry_fit_min_neighbors',
+        default=3,
+        type=int,
+        help='追加点Fitで局所PCA法線を有効とする最小GT近傍数',
+    )
+    parser.add_argument(
+        '--geometry_use_d2',
+        default=False,
+        type=str2bool,
+        help='幾何損失でD2を主目的に含めるか。既定では無効',
+    )
+
+    # 勾配数値
+    parser.add_argument(
+        '--grad_scale_prune_where_compression',
+        default=0.17,
+        type=float,
+        help='圧縮損失側のPrune Where関連勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
+    )
+    parser.add_argument(
+        '--grad_scale_prune_where_actuator',
+        default=1.0,
+        type=float,
+        help='Actuator側のPrune Where関連勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
+    )
+    parser.add_argument(
+        '--grad_scale_operation_amount',
+        default=200.0,
+        type=float,
+        help='Operation Amount関連の勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
+    )
+    parser.add_argument(
+        '--grad_scale_prune_where_head',
+        default=1.0 / 6.0,
+        type=float,
+        help='Prune Whereのdrop_headへ入る勾配全体を縮小する倍率。0.1667なら約1/6倍にする',
+    )
+
+    """Compression"""
+    parser.add_argument('--compress', '--compression', dest='compress', default='SparsePCGC', type=str, help='使用する圧縮手法: SparsePCGC / G-PCC / OctAttention')
+    parser.add_argument('--geometry_octree_initial_total_ratio', default=0.0025, type=float, help='G-PCC/OctAttentionの初期合計編集割合（fraction）。以後は共通Amount headが学習する')
+    parser.add_argument('--geometry_octree_pool_reserve_factor', default=4.0, type=float, help='幾何Octree用の各操作候補pool余裕倍率')
+    parser.add_argument('--geometry_octree_pool_max_per_operation', default=8192, type=int, help='幾何Octree用の各操作候補pool上限')
+    parser.add_argument('--geometry_octree_joint_policy', default=True, type=str2bool, help='幾何codecのみ: 3操作共通Octree状態で限界コストを再評価して1planを構築')
+    parser.add_argument('--geometry_octree_max_edit_ratio', default=0.0099, type=float, help='幾何codec専用の総操作/変更Voxel率上限。大きいAmount binを試す際だけ明示的に拡張する')
+    parser.add_argument('--geometry_octree_distortion_weight', default=0.05, type=float, help='幾何codecの候補prior用の局所距離コスト係数。Actual RD損失とは別')
+    parser.add_argument('--geometry_octree_actor_weight', default=0.25, type=float, help='joint限界コストへ加える有界Actor残差の重み')
+    parser.add_argument('--geometry_octree_score_scale', default=4.0, type=float, help='empirical occupancy gainをjoint選択logitへ変換するscale')
+    parser.add_argument('--geometry_octree_joint_temperature', default=0.25, type=float, help='joint候補選択の初期Gumbel温度。既存探索scheduleで0まで減衰')
+    parser.add_argument('--geometry_octree_rate_model', default='empirical', choices=['empirical', 'neighbour_binary'], help='幾何候補prior。どちらもActual bitsではない。neighbour_binaryはG-PCC用の実験的近傍条件付きモデル')
+    parser.add_argument('--octree_voxel', type=float, default=1e-3, help='Octreeボクセルサイズ')
+    parser.add_argument('--qs', type=int, default=2, help='量子化ステップサイズ')
+
+    # Octree Compression
+    parser.add_argument('--surrogate', default=False, type=str2bool, help='Trueなら明示的にcodec別Surrogate backendへ切り替える（SparsePCGCは既定でSurrogate backend）')
+    parser.add_argument('--compression_loss_backend', default='sparsepcgc_surrogate', type=str, help='圧縮損失の計算方法。既定は毎StepのSparsePCGC実圧縮値を教師にSurrogateを更新し、実測値をforward、Surrogate勾配をbackwardへ使う')
+    parser.add_argument('--compression_grad_probe', default=False, type=str2bool, help='圧縮損失から出力点群へ勾配が流れるか各stepで表示するか')
+    parser.add_argument('--compression_grad_probe_every', default=10, type=int, help='圧縮損失の勾配診断を何回に1回表示するか')
+    parser.add_argument('--octattention_actualcode', default=False, type=str2bool, help='OctAttention実圧縮で算術符号化後の実bitを使うか（学習中はFalse推奨）')
+    parser.add_argument('--octattention_ckpt', default=str(_DEFAULT_OCTATTENTION_CKPT), type=str, help='OctAttention encoder checkpoint')
+    parser.add_argument('--octattention_tmp_dir', default='', type=str, help='OctAttention実圧縮用の一時ディレクトリ（空なら/dev/shm優先）')
+    parser.add_argument('--sparsepcgc_env', default='sparsepcgc', type=str, help='SparsePCGC teacherを実行するconda環境名')
+    parser.add_argument('--sparsepcgc_python', default='', type=str, help='SparsePCGC teacher用Pythonの絶対パス（空ならsparsepcgc_envから探索）')
+    parser.add_argument('--sparsepcgc_root', default=str(_DEFAULT_SPARSEPCGC_ROOT), type=str, help='SparsePCGCリポジトリのパス')
+    parser.add_argument('--sparsepcgc_mode', default='dense_lossy', type=str, help='SparsePCGC mode。提案手法の既定はdense_lossy')
+    parser.add_argument('--sparsepcgc_device', default='auto', type=str, help='SparsePCGC teacherの実行先(auto/cuda/cpu/cuda:0など)')
+    parser.add_argument('--sparsepcgc_tmp_dir', default='', type=str, help='SparsePCGC teacher用一時ディレクトリ（空なら/dev/shm優先）')
+    parser.add_argument('--sparsepcgc_timeout', default=600.0, type=float, help='SparsePCGC teacherの1リクエスト待ち時間（秒）')
+    parser.add_argument('--sparsepcgc_skip_decode', default=True, type=str2bool, help='SparsePCGC teacherで復号を省略してbitだけ計測するか')
+    parser.add_argument('--sparsepcgc_inner_psnr', default=False, type=str2bool, help='SparsePCGC内部の復号・PSNR計算を有効化するか。圧縮lossのbit教師には不要なので既定False')
+    parser.add_argument('--sparsepcgc_fast_binary_ply', default=True, type=str2bool, help='worker入力PLYを同じfloat32座標のbinary little-endianで保存しI/Oを高速化するか')
+    parser.add_argument(
+        '--sparsepcgc_release_worker_after_request',
+        default=None,
+        type=str2bool,
+        help='各actual encode後にworkerを終了するか。再ロードが非常に重いため既定False',
+    )
+    parser.add_argument('--sparsepcgc_warmup_worker_before_train', default=True, type=str2bool, help='SparsePCGC worker/model初期化をStep時間計測前に一度だけ行うか')
+    parser.add_argument('--sparsepcgc_binary_ply_fallback_ascii', default=True, type=str2bool, help='環境側readerがbinary PLYを読めない場合にASCIIへ一度だけ自動fallbackするか')
+    parser.add_argument('--sparsepcgc_reuse_workspace', default=True, type=str2bool, help='actual worker用一時directoryをrequest間で再利用するか')
+    parser.add_argument('--sparsepcgc_actual_result_cache', default=True, type=str2bool, help='同一Voxel集合・同一codec設定のactual結果をprocess内LRU cacheで再利用するか')
+    parser.add_argument('--sparsepcgc_actual_result_cache_max_entries', default=256, type=int, help='SparsePCGC actual結果LRU cacheの最大件数')
+    parser.add_argument('--sparsepcgc_omp_threads', default=12, type=int, help='SparsePCGC workerのOMP thread数')
+    parser.add_argument(
+        '--sparsepcgc_cpu_actual_overlap',
+        default=True,
+        type=str2bool,
+        help='CPU teacherの1回の実符号化とGPU幾何損失を重ねる。CUDA teacherでは常に無効',
+    )
+    parser.add_argument('--sparsepcgc_worker_cpu_trim_interval', default=16, type=int, help='永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）')
+    parser.add_argument('--sparsepcgc_worker_cuda_cleanup_interval', default=1, type=int, help='CUDA teacherのallocator cacheを完全解放するrequest間隔。既定値1は各request終了時に解放し、符号化前の重複解放だけを省く（0でworker終了まで完全解放なし）')
+    parser.add_argument('--sparsepcgc_gpu_min_free_mb', default=4096, type=int, help='CUDA teacherへrequestを送るために必要なGPU全体の空き容量MB。競合時は値を変えず待機する')
+    parser.add_argument('--sparsepcgc_host_min_available_mb', default=8192, type=int, help='SparsePCGC workerの起動・encode前に必要なホストMemAvailable(MB)。共有hostのOOM killを避ける')
+    parser.add_argument('--sparsepcgc_host_wait_timeout', default=600.0, type=float, help='SparsePCGC workerのホスト空きメモリ待機上限秒')
+    parser.add_argument(
+        '--sparsepcgc_auto_cpu_fallback',
+        default=True,
+        type=str2bool,
+        help='device=autoでGPU空き容量が不足する場合、起動時またはencode前に待機せずCPU teacherへ切り替える',
+    )
+    parser.add_argument('--sparsepcgc_gpu_wait_timeout', default=600.0, type=float, help='SparsePCGC CUDA teacherの空きGPU待機上限秒')
+    parser.add_argument('--sparsepcgc_gpu_wait_interval', default=2.0, type=float, help='SparsePCGC CUDA teacherの空きGPU確認間隔秒')
+    parser.add_argument('--sparsepcgc_oom_retry_count', default=2, type=int, help='SparsePCGC teacherがCUDA OOMになった場合に同じ点群を再実行する回数')
+    parser.add_argument('--sparsepcgc_actual_gt_disk_cache', default=True, type=str2bool, help='静的GTの実SparsePCGC統計をcodec条件付きで永続cacheするか')
+    parser.add_argument('--sparsepcgc_actual_gt_disk_cache_dir', default=str((_DATA_ROOT / 'cache' / 'sparsepcgc_actual_gt').resolve()), type=str, help='実SparsePCGC GT統計の永続cache先')
+    parser.add_argument(
+        '--sparsepcgc_worker_gpu_stats',
+        default=False,
+        type=str2bool,
+        help='SparsePCGC worker側のCUDA/GPU使用量をworker resultへ含める。毎回CUDA同期するため通常学習では既定False',
+    )
+    parser.add_argument(
+        '--sparsepcgc_worker_gpu_stats_print',
+        default=False,
+        type=str2bool,
+        help='SparsePCGC worker側のCUDA/GPU使用量をstderrにも出す',
+    )
+    parser.add_argument('--sparsepcgc_ckptdir', default=str(_DEFAULT_SPARSEPCGC_CKPT_DENSE), type=str, help='SparsePCGC dense checkpoint')
+    parser.add_argument('--sparsepcgc_ckptdir_sr', default=str(_DEFAULT_SPARSEPCGC_CKPT_DENSE_SR), type=str, help='SparsePCGC dense SR checkpoint')
+    parser.add_argument('--sparsepcgc_ckptdir_ae', default=str(_DEFAULT_SPARSEPCGC_CKPT_DENSE_AE), type=str, help='SparsePCGC dense AE checkpoint')
+    parser.add_argument('--sparsepcgc_ckptdir_low', default=str(_DEFAULT_SPARSEPCGC_CKPT_SPARSE_LOW), type=str, help='SparsePCGC sparse low checkpoint')
+    parser.add_argument('--sparsepcgc_ckptdir_high', default=str(_DEFAULT_SPARSEPCGC_CKPT_SPARSE_HIGH), type=str, help='SparsePCGC sparse high checkpoint')
+    parser.add_argument('--sparsepcgc_ckptdir_offset', default=str(_DEFAULT_SPARSEPCGC_CKPT_SPARSE_OFFSET), type=str, help='SparsePCGC offset checkpoint')
+    parser.add_argument('--sparsepcgc_offset', default=False, type=str2bool, help='SparsePCGC sparse_lossy_gpccでoffset modelを使うか')
+    parser.add_argument('--sparsepcgc_match_qs', default=False, type=str2bool, help='SparsePCGCの有効量子化幅を--qsに合わせる（SparsePCGC本体条件を優先するならFalse）')
+    parser.add_argument('--sparsepcgc_voxel_size', default=1.0, type=float, help='SparsePCGC load_sparse_tensorのvoxel_size')
+    parser.add_argument('--sparsepcgc_pos_quantscale', default=1, type=int, help='SparsePCGC posQuantscale')
+    parser.add_argument(
+        '--sparsepcgc_dequantize_center',
+        default=False,
+        type=str2bool,
+        help='canonical voxel coordsからxyzへ戻すときにvoxel中心へ半step寄せるか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_restore_points_debug',
+        default=False,
+        type=str2bool,
+        help='canonical voxel coordsから復元した点群のdebugログを出す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_restore_unique_voxels',
+        default=True,
+        type=str2bool,
+        help='voxel coordsから点群復元するときに重複voxelを1点へまとめる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_quant_mode',
+        default='round_voxel_then_pos',
+        type=str,
+        help='SparsePCGC互換canonical voxel座標の量子化方式。既定は round(xyz/voxel_size) 後に round(/posQuantscale) を行う',
+    )
+    parser.add_argument('--sparsepcgc_psnr_resolution', default=1023, type=int, help='D1/D2 PSNRのpeak座標値（通常10-bitは1023、9-bitは511）。全dataset modeでは起動時の値を共通使用')
+    parser.add_argument('--sparsepcgc_test_d2', default=False, type=str2bool, help='SparsePCGC lossy評価でD2を計算するか')
+    parser.add_argument('--sparsepcgc_dense_scale_ae_list', default='1,0,1,0,1,0', type=str, help='SparsePCGC dense_lossy用AE scale list')
+    parser.add_argument('--sparsepcgc_dense_scale_sr_list', default='0,1,1,2,2,3', type=str, help='SparsePCGC dense_lossy用SR scale list')
+    parser.add_argument('--sparsepcgc_pos_quantscale_list', default='4', type=str, help='SparsePCGC sparse_lossy_gpcc用posQuantscale list')
+    parser.add_argument('--sparsepcgc_scale_m', default=8, type=int, help='SparsePCGC dense lossyの有効m。既定8')
+    parser.add_argument('--sparsepcgc_scale_ae', default=0, type=int, choices=[0, 1], help='mからAE/SRを決める際のAE scale。ana_den6と同じ既定0')
+    parser.add_argument('--sparsepcgc_scale_sr', default=None, type=int, help='SparsePCGC dense lossyのSR scale。未指定時は起動時にnative bit depth-m-AEから一度だけ計算')
+    parser.add_argument('--sparsepcgc_native_bit_depth', default=0, type=int, help='m=bit_depth-(AE+SR)を計算するnative bit depth。0は起動時datasetから決め、全dataset mode中は固定')
+    parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
+    parser.add_argument(
+        '--heuristic_guidance_network_only_inference',
+        default=False,
+        type=str2bool,
+        help='True時だけeval/testでExact cacheを切り、Network-only性能を別測定する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_mode',
+        default='ana_den6_online',
+        choices=[
+            'single_plan_student',
+            'network_k_proposal_policy',
+            'network_only_codec_policy',
+            'proxy_prior',
+            'ana_den6_online',
+            'ana_den6_residual',
+            'ana_den6_reproduce',
+            'ana_den6_reference_ply',
+        ],
+        help=(
+            'SparsePCGC行動経路。既定ana_den6_onlineは訓練時にExact den6順位'
+            '＋Network residualの1複合planを実行する。推論時はtest.pyが'
+            'single_plan_studentへ強制し、den6/Cacheを参照しない。'
+            'network_only_codec_policyは旧単一候補の比較用legacy mode'
+        ),
+    )
+    parser.add_argument('--single_plan_student_hidden_dim', default=48, type=int)
+    parser.add_argument('--single_plan_student_max_total_ratio', default=0.0099, type=float)
+    parser.add_argument('--single_plan_student_unfreeze_upstream', default=False, type=str2bool)
+    parser.add_argument(
+        '--single_plan_require_complete_teacher_pool',
+        default=False,
+        type=str2bool,
+        help=(
+            'Offline蒸留でoperation別の完全Teacher候補Poolとscore/rankを必須にする。'
+            'FalseでもPool外Voxelをnegative化せず、保存済み正例だけを使用する'
+        ),
+    )
+    parser.add_argument(
+        '--single_plan_stage1_train_encoder',
+        default=True,
+        type=str2bool,
+        help='representation段階だけencoderとStudent上流を学習し、Stage 2以降は固定する',
+    )
+    parser.add_argument(
+        '--single_plan_training_stage',
+        default='actual_calibration',
+        choices=['representation', 'fast_distillation', 'actual_calibration'],
+        type=str,
+        help=(
+            'Single-Plan学習段階。既定actual_calibrationはStudent planを毎Step'
+            '実圧縮し、Actual/Geometryログを記録する'
+        ),
+    )
+    parser.add_argument(
+        '--single_plan_amount_learning_enabled',
+        default=False,
+        type=str2bool,
+        help='Phase 3以降だけtotal ratio/share/gateを学習planへ反映する',
+    )
+    parser.add_argument('--single_plan_fixed_total_ratio', default=0.0025, type=float)
+    parser.add_argument('--single_plan_fixed_prune_share', default=0.40, type=float)
+    parser.add_argument('--single_plan_fixed_add_share', default=0.40, type=float)
+    parser.add_argument('--single_plan_fixed_adjust_share', default=0.20, type=float)
+    parser.add_argument('--single_plan_debug_hash', default=False, type=str2bool)
+    parser.add_argument('--single_plan_local_tile_size', default=0, type=int)
+    parser.add_argument(
+        '--exact_teacher_cache_root',
+        default='/data/maejima/log/mynet_exact_teacher_cache',
+        type=str,
+        help='訓練専用Layer A Exact Teacher Cache。推論では参照禁止。',
+    )
+    parser.add_argument('--single_plan_distillation_weight', default=1.0, type=float)
+    parser.add_argument('--single_plan_student_lr_scale', default=1.0, type=float)
+    parser.add_argument('--single_plan_policy_gradient_weight', default=0.0, type=float)
+    parser.add_argument(
+        '--single_plan_shadow_target_ratio',
+        default=0.10,
+        type=float,
+        help='ana_den6_onlineのShadow蒸留を圧縮主目的の絶対値に対して許容する比率',
+    )
+    parser.add_argument(
+        '--single_plan_shadow_balance_min_scale',
+        default=0.01,
+        type=float,
+        help='Shadow蒸留の動的balanceで維持する最小scale',
+    )
+    parser.add_argument(
+        '--single_plan_shadow_balance_max_scale',
+        default=1.0,
+        type=float,
+        help='Shadow蒸留の動的balanceで許可する最大scale',
+    )
+    parser.add_argument(
+        '--single_plan_shadow_distillation',
+        default=True,
+        type=str2bool,
+        help='ana_den6_online訓練で実行した1 planを同時にSingle-Plan Studentへ蒸留する',
+    )
+    parser.add_argument(
+        '--test_force_single_plan_student',
+        default=True,
+        type=str2bool,
+        help='SparsePCGC推論をCache/denなしのSingle-Plan Studentへ強制する',
+    )
+    parser.add_argument(
+        '--test_require_trained_single_plan_student',
+        default=True,
+        type=str2bool,
+        help='蒸留更新0回のcheckpointをNetwork-only推論で拒否する',
+    )
+    parser.add_argument(
+        '--test_require_actual_calibrated_single_plan_student',
+        default=True,
+        type=str2bool,
+        help=(
+            'Networkが生成したSingle-Planを訓練中に実Actual評価した履歴がない'
+            'checkpointを、推論性能確認へ誤使用しない'
+        ),
+    )
+    parser.add_argument('--network_k_proposal_count', default=8, type=int)
+    parser.add_argument('--network_k_proposal_hidden_dim', default=48, type=int)
+    parser.add_argument('--network_k_proposal_shortlist_size', default=32768, type=int)
+    parser.add_argument('--network_k_actor_lr_scale', default=0.1, type=float)
+    parser.add_argument('--network_k_critic_lr_scale', default=1.0, type=float)
+    parser.add_argument(
+        '--network_k_target_domain', default='neighbor26_empty',
+        choices=['neighbor26_empty', 'child_slot'],
+        help='K経路のAdd/Adjust先。既定はden6と同じ26近傍の空Voxel',
+    )
+    parser.add_argument(
+        '--network_k_ratio_values', default='0.0005,0.0010,0.0025,0.0050,0.0100', type=str,
+        help='K専門slotが第1段階で選ぶ総編集率の離散値',
+    )
+    parser.add_argument('--network_k_share_lattice_step', default=0.05, type=float)
+    parser.add_argument('--network_k_critic_lambda_geometry', default=1.0, type=float)
+    parser.add_argument('--network_k_critic_lambda_uncertainty', default=0.05, type=float)
+    parser.add_argument('--network_k_critic_gain_scale', default=5.0, type=float)
+    parser.add_argument('--network_k_critic_geometry_scale', default=1.0, type=float)
+    parser.add_argument('--network_k_critic_huber_beta', default=0.05, type=float)
+    parser.add_argument('--network_k_critic_sign_loss_weight', default=0.25, type=float)
+    parser.add_argument('--network_k_critic_improvement_sign_weight', default=4.0, type=float)
+    parser.add_argument('--network_k_critic_sign_scale', default=0.10, type=float)
+    parser.add_argument('--network_k_critic_selection_temperature', default=0.10, type=float)
+    parser.add_argument('--network_k_unfreeze_upstream', default=False, type=str2bool)
+    parser.add_argument('--network_k_debug_plan_hash', default=False, type=str2bool)
+    parser.add_argument(
+        '--network_k_diagnostic_sequence_name', default='', type=str,
+        help='K Proposalの少数state診断時だけ使用する系列basename。通常訓練は空文字。',
+    )
+    parser.add_argument(
+        '--network_k_target_set_loss_cadence', default=5, type=int,
+        help='offline Add/Adjust target集合の密教師を計算するStep間隔。',
+    )
+    parser.add_argument('--network_k_elite_enabled', default=True, type=str2bool)
+    parser.add_argument('--network_k_elite_replay_capacity', default=256, type=int)
+    parser.add_argument('--network_k_elite_replay_count', default=8, type=int)
+    parser.add_argument('--network_k_elite_replay_weight', default=1.0, type=float)
+    parser.add_argument('--network_k_replay_shortlist_plan_limit', default=8, type=int)
+    parser.add_argument('--network_k_replay_shortlist_point_limit', default=8192, type=int)
+    parser.add_argument('--network_k_elite_where_weight', default=0.25, type=float)
+    parser.add_argument('--network_k_elite_direction_weight', default=0.25, type=float)
+    parser.add_argument('--network_k_elite_min_gain_percent', default=1e-6, type=float)
+    parser.add_argument(
+        '--network_k_all_actual_enabled', default=False, type=str2bool,
+        help=(
+            'NetworkのK executable planを全件Actual評価し、絶対Actual rewardで'
+            'theta/Where/Direction/Criticを更新する。falseは旧1-plan比較用'
+        ),
+    )
+    parser.add_argument('--network_k_all_actual_temperature', default=1.25, type=float)
+    parser.add_argument('--network_k_all_actual_temperature_min', default=0.50, type=float)
+    parser.add_argument('--network_k_all_actual_anneal_steps', default=5000, type=int)
+    parser.add_argument('--network_k_min_positive_before_anneal', default=8, type=int)
+    parser.add_argument('--network_k_freeze_negative_theta_until_positive', default=True, type=str2bool, help='正改善経験が十分たまるまで悪化planでratio/share/orderを一点化しない')
+    parser.add_argument('--network_k_all_actual_coefficient_std', default=0.15, type=float)
+    parser.add_argument('--network_k_all_actual_direction_std', default=0.10, type=float)
+    parser.add_argument('--network_k_all_actual_actor_weight', default=1.0, type=float)
+    parser.add_argument('--network_k_all_actual_critic_weight', default=0.5, type=float)
+    parser.add_argument('--network_k_all_actual_ranking_weight', default=0.25, type=float)
+    parser.add_argument(
+        '--network_k_all_actual_local_value_weight', default=0.5, type=float,
+        help='実行Voxelのclean score加重和をActual gainへ合わせる局所教師係数',
+    )
+    parser.add_argument(
+        '--network_k_all_actual_critic_selection_weight', default=1.0, type=float,
+        help='全K Actualの最良slotをCriticが選ぶ交差entropy係数',
+    )
+    parser.add_argument('--network_k_all_actual_entropy_weight', default=0.01, type=float)
+    parser.add_argument(
+        '--network_k_entropy_floor_target', default=0.60, type=float,
+        help='ratio/share/order/variant/Whereの正規化entropy下限',
+    )
+    parser.add_argument(
+        '--network_k_entropy_floor_weight', default=1.0, type=float,
+        help='探索分布が早期に一点へ崩壊した時だけ働くentropy下限loss係数',
+    )
+    parser.add_argument('--network_k_all_actual_reward_scale_percent', default=1.0, type=float)
+    parser.add_argument('--network_k_all_actual_absolute_advantage_weight', default=1.0, type=float)
+    parser.add_argument('--network_k_all_actual_relative_advantage_weight', default=0.25, type=float)
+    parser.add_argument(
+        '--network_k_coverage_positive_actor_weight', default=1.0, type=float,
+        help='系統探索slotで実改善したplanだけをNetwork分布へ再現する係数',
+    )
+    parser.add_argument(
+        '--network_k_coverage_spatial_actor_weight', default=1.0, type=float,
+        help='schedule探索slotのActualをWhere・Direction・score係数へ返す係数',
+    )
+    parser.add_argument(
+        '--network_k_coverage_pair_ranking_weight', default=0.5, type=float,
+        help='同一thetaの2 plan Actual差でWhere順位を学ぶ係数',
+    )
+    parser.add_argument(
+        '--network_k_coverage_pair_where_contrast_weight', default=0.5, type=float,
+        help='同一theta候補対のActual差を固有source順位へ返す係数',
+    )
+    parser.add_argument(
+        '--network_k_shortlist_exploration_fraction', default=0.5, type=float,
+        help='訓練時shortlistを座標hash巡回へ割り当てる比率',
+    )
+    parser.add_argument('--network_k_all_actual_diversity_weight', default=0.02, type=float)
+    parser.add_argument(
+        '--network_k_offline_bootstrap_steps', default=0, type=int,
+        help='診断用offline教師の更新回数。純粋なNetwork-only訓練では0のまま使用する',
+    )
+    parser.add_argument(
+        '--network_k_require_cache_free_training', default=True, type=str2bool,
+        help='通常K訓練でoffline候補・teacher・cache参照を例外として拒否する',
+    )
+    parser.add_argument('--network_k_coverage_enabled', default=True, type=str2bool)
+    parser.add_argument(
+        '--network_k_coverage_slots', default=6, type=int,
+        help='各Stepでθ格子を巡回するslot数。残りslotは学習分布から探索する',
+    )
+    parser.add_argument(
+        '--network_k_coverage_share_stride', default=7919, type=int,
+        help='ratio/share/order/variant直積を重複なく巡回する互いに素な置換stride',
+    )
+    parser.add_argument('--network_k_offline_bootstrap_loss_weight', default=1.0, type=float)
+    parser.add_argument(
+        '--network_k_all_actual_selected_surrogate_weight', default=0.1, type=float,
+        help='全K Actual更新と併用する選択plan Surrogate勾配の係数',
+    )
+    parser.add_argument(
+        '--network_k_diagnostic_factorization', default='network_map_network_theta',
+        choices=[
+            'heuristic_map_heuristic_theta',
+            'heuristic_map_network_theta',
+            'network_map_heuristic_theta',
+            'network_map_network_theta',
+        ],
+        help='分解診断用。通常推論ではnetwork_map_network_theta以外を拒否する',
+    )
+    parser.add_argument(
+        '--network_k_offline_dataset',
+        default='',
+        type=str,
+        help='明示的な診断時だけ使うoffline dataset。通常Network-only訓練は空文字',
+    )
+    parser.add_argument(
+        '--network_k_offline_split', default='train', choices=['train', 'validation', 'test'],
+        help='frameとcodec設定を分離したoffline split',
+    )
+    parser.add_argument('--network_k_offline_loss_weight', default=0.1, type=float)
+    parser.add_argument('--network_only_policy_hidden_dim', default=48, type=int)
+    parser.add_argument('--network_only_max_total_ratio', default=0.0099, type=float)
+    parser.add_argument('--network_only_action_exploration_floor', default=0.05, type=float)
+    parser.add_argument('--network_only_where_gumbel_scale', default=1.0, type=float)
+    parser.add_argument('--network_only_exploration_steps', default=100, type=int)
+    parser.add_argument(
+        '--network_only_exploration_anneal_steps', default=200, type=int,
+        help='Network-only再パラメータ化探索を最低25%%まで緩やかにannealするStep数',
+    )
+    parser.add_argument('--network_only_plan_gain_loss_weight', default=0.25, type=float)
+    parser.add_argument('--network_only_actual_surrogate_loss_weight', default=1.0, type=float)
+    parser.add_argument(
+        '--network_only_diagnostic_repeat_single_frame',
+        default=0,
+        type=int,
+        help='診断専用。同じ1 PLYを指定回数繰り返す（0で通常Dataset）',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_den6_plan_manifest',
+        default='',
+        type=str,
+        help='tools/ana_den6_reproduce.py --manifest-out が出力したv2 candidate pool JSON。単一frame固定時に使用する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_den6_manifest_dir',
+        default='/data/maejima/log/mynet_den6_manifests',
+        type=str,
+        help='複数frame学習時に入力SHA256とAE/SR/mからv2 manifestを自動選択するディレクトリ',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_cache_dir',
+        default='/data/maejima/log/mynet_den6_online_cache',
+        type=str,
+        help='GT metadataと、1完成planを構成する静的den6 edit-unit teacherのcache先（Network出力・加工結果は保存しない）',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_conda_env',
+        default='sparsepcgc',
+        type=str,
+        help='ana_den6 online workerを起動するconda環境。空なら現在Pythonを使う',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_python',
+        default='',
+        type=str,
+        help='online worker用Pythonの絶対path。指定時はconda envより優先する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_compact_reserve_factor',
+        default=4.0,
+        type=float,
+        help='Exact anchor件数に対して保持するden6 edit-unit順位の倍率。既定4.0でNetworkが順位を学べる余地を残す',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_selection_mode',
+        default='prior_residual',
+        choices=['actor_critic', 'prior_residual'],
+        help=(
+            'ana_den6_onlineの候補選択。actor_criticはHeuristic順位を最終scoreへ'
+            '加えず、安全pool内をNetwork Actor/Criticで直接選ぶ。prior_residualは'
+            '従来のHeuristic順位+Network残差比較用'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_mode',
+        default='exact_den6',
+        choices=['fast_unordered', 'exact_den6'],
+        help=(
+            'ana_den6_onlineの候補生成。exact_den6は事前計算済みcompact poolの'
+            'codec-context特徴を再利用する（候補別Actual encodeは行わない）。'
+            'fast_unorderedは局所近傍だけを使う速度ablation'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fast_pool_reserve_factor',
+        default=2.0,
+        type=float,
+        help='実行予定operation数に対してfast unordered poolへ保持する候補倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fast_pool_max_per_operation',
+        default=8192,
+        type=int,
+        help='fast unordered proposalのoperation別安全上限。0以下なら上限なし',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_hidden_dim', default=32, type=int,
+        help='unordered safe candidate poolを選択するActor/Criticの中間次元',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_use_rank_feature',
+        default=False,
+        type=str2bool,
+        help=(
+            'Actor/Criticへden6 pool_rankを入力する旧比較用設定。既定Falseでは'
+            'Heuristic順位を行動価値入力から除外し、順位を最終方策へ漏らさない'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_proxy_weight',
+        default=0.0,
+        type=float,
+        help=(
+            'codec-context local RD proxyをActorへ直接模倣させるablation重み。'
+            '既定0ではproxyはCandidate Criticのwarm-startだけに用いる'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_rate_proxy_scale', default=0.0, type=float,
+        help='optimistic gain由来rate特徴をActorへ入れる倍率。Criticは常に受け取る',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_geometry_proxy_scale', default=0.25, type=float,
+        help='安全性のためActorへ残すgeometry-risk特徴の倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_critic_distill_weight',
+        default=0.10,
+        type=float,
+        help='local RD Critic順位をActorへ伝える補助損失。Heuristic順位は教師にしない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_local_geometry_weight',
+        default=0.50,
+        type=float,
+        help=(
+            'candidate/Gate/Amount/Fineのlocal RD教師に使う標準化geometry-risk重み。'
+            '全体損失のaux上限とは独立に設定する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_plan_critic_weight', default=0.10, type=float,
+        help='1 Step 1 Actual encodeのRDをplan Criticへ回帰する損失重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_critic_lr_scale', default=0.10, type=float,
+        help='candidate/plan Critic専用のmain LR倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_plan_critic_replay_entries', default=512, type=int,
+        help='Actual RD plan replayの最大件数。点群やcodec出力は保持せずcompact特徴だけを保存',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_plan_memory_entries', default=512, type=int,
+        help='同一frameのActual candidate-set比較履歴の最大件数（IDは64-bit tokenで保存）',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_plan_critic_replay_batch', default=32, type=int,
+        help='1 Stepでplan Criticへ再利用する過去Actual plan数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_edit_tiebreak_weight', default=2.0, type=float,
+        help='同等RD時だけ少数編集を選ぶActual RD objectiveの微小tie-break係数。0で無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_policy_weight',
+        default=0.25,
+        type=float,
+        help=(
+            '同一frame・同一decision groupで圧縮/幾何性能を維持した場合のみ、'
+            '実行Voxel操作率の低下をAmount/Gate/Fineへ返す方策重み'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_compression_tolerance',
+        default=0.02,
+        type=float,
+        help='Voxel操作効率creditを許すActual圧縮損失の悪化幅[percentage point]',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_geometry_relative_tolerance',
+        default=0.005,
+        type=float,
+        help='Voxel操作効率creditを許す幾何損失の相対悪化率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_advantage_clip',
+        default=0.25,
+        type=float,
+        help='基準操作率に対する操作率削減advantageの絶対値上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_direct_grad_scale',
+        default=0.10,
+        type=float,
+        help=(
+            '圧縮・幾何guard内で、実行値を変えずAmount/Gate/Fineの連続STE操作率へ'
+            '返す低分散gradient倍率'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_factorized_exploration', default=True, type=str2bool,
+        help='1 StepでWhere/Amount/Gate/Fineの一群だけを探索してActual creditを識別可能にする',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_simultaneous_operation_exploration',
+        default=True,
+        type=str2bool,
+        help=(
+            'Where探索StepではAdd/Prune/Adjust三操作の候補順位を同時に探索する。'
+            'Amount/Gate/Fineは因果分離のため従来どおり別groupに保つ'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_factorized_ucb_scale', default=0.25, type=float,
+        help='coverage UCBに加えるdecision group不確実性の係数。Episode番号には依存しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_factorized_min_share', default=0.10, type=float,
+        help='各意思決定群の探索coverage下限。割合の目標ではなく、Amount等の探索飢餓を防ぐ',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_authority_floor', default=0.75, type=float,
+        help='有界coarse Amount selectorのforward裁量下限。0で旧制御。Fine/Gateのconfidenceと安全上限は維持',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_factorized_max_consecutive_steps',
+        default=8,
+        type=int,
+        help='同一factorized探索groupが新規選択を連続占有できる最大Step数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_where_exploration_share', default=0.60, type=float,
+        help=(
+            'Where三群の累積coverageが不足したときだけ加えるsoft UCB基準。'
+            '固定抽選比率ではなくActual evidence/uncertainty scoreと併用する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_where_coverage_weight', default=1.0, type=float,
+        help='Where familyのsoft coverage不足をfactorized group UCBへ加える重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_where_evidence_balance_weight', default=1.0, type=float,
+        help='Add/Prune/Adjust間のusabled matched Actual比較数の差をWhere group探索優先度へ反映する重み。操作率や性能値の目標ではない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_group_evidence_target', default=64, type=int,
+        help='group探索優先度のevidence不足を正規化する比較数。authority閾値ではない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_group_need_weight', default=0.75, type=float,
+        help='Actual evidence不足と低authorityをfactorized group UCBへ加える重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_exploration_max_candidate_changes', default=0, type=int,
+        help=(
+            '1回のWhere探索でincumbentから入れ替えるcandidate上限。'
+            '0以下は固定上限なし（選択数比が上限）。実効数は前半25%の探索係数で0まで縮小する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_exploration_candidate_fraction', default=0.50, type=float,
+        help=(
+            'Where探索開始時にincumbentから入れ替えるcandidateの選択数比。'
+            '上限と探索係数を併用し、探索窓の終端では0になる'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_exploration_tail_fraction', default=1.0, type=float,
+        help=(
+            'Where探索supportに安全pool全域から回転coverage候補を追加する'
+            'requested count比。Actual学習品質に応じて探索係数と共に縮小する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_exploration_full_safe_pool', default=True, type=str2bool,
+        help=(
+            '探索対象のWhere操作ではlearned Proposal上限を一時的に外し、'
+            'static compatibility通過後のsafe pool全体を選択可能にする'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_post_window_exploration_floor', default=0.0, type=float,
+        help=(
+            '前半25%%終了後に任意で残すevidence-driven微小探索上限。'
+            '既定0ではwindow終端でnoiseを完全に停止する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_noop_prior_offset', default=-1.5, type=float,
+        help=(
+            '最良positive Amount priorに対するNo-op logit差。-1.5は'
+            '20260914/155928のfresh Step 1で観測されたNo-op確率約0.071を'
+            '再現する初期priorであり、学習後はActual edit/no-op比較で更新する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_learned_proposal', default=True, type=str2bool,
+        help='安全reservoirからActorへ渡すsubset membershipを学習する軽量Proposalを有効化',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_max_candidates', default=2048, type=int,
+        help='operation別にActorへ渡すlearned proposal subsetの上限。0以下は全safe pool',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_reserve_factor', default=2.0, type=float,
+        help='requested countに対してProposal subsetへ残す最低倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_coverage_fraction', default=0.40, type=float,
+        help='空間hash順のcoverage candidateをProposal subsetへ必ず残す比率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_uncertainty_fraction', default=0.20, type=float,
+        help='Critic uncertaintyでProposal subsetへ残す探索candidate比率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_entropy_min_fraction', default=0.10, type=float,
+        help='Actual根拠が十分な場合にも残すentropy bonusの下限比率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_lcb_kappa', default=1.0, type=float,
+        help='deterministic prior-residualでActual Critic advantageのLCBに用いる係数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fixed_guard_tolerance', default=0.0, type=float,
+        help='Network ON fixed RDがHeuristic-onlyを上回れない時に許容する差',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fixed_guard_retry_evidence', default=0.10, type=float,
+        help='Fixedで棄却したActor authorityを再評価するために必要な追加Actual evidence率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_source_grad_probe', default=True, type=str2bool,
+        help='Actor/ProposalのActual/proxy/entropy/pathwise勾配を低頻度で分離計測',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_source_grad_probe_interval', default=10, type=int,
+        help='source別decision gradient診断のStep間隔。0で無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_replay_weight', default=0.40, type=float,
+        help='比較可能contextのActual RD preferenceをActorへ返す重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_candidate_critic_replay_weight', default=0.40, type=float,
+        help='比較可能contextのActual RD preferenceをcandidate Criticへ返す重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_replay_entries', default=512, type=int,
+        help='Actual Actor replayの最大件数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_matched_anchor_memory_entries', default=512, type=int,
+        help='同一frame/codec/Where群のActual counterfactualで再利用する実行anchor plan上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_pending_matched_frames', default=1024, type=int,
+        help='未完了matched comparisonをframe/codec単位で保持する上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_matched_anchor_max_age_steps', default=1600, type=int,
+        help='strict matched anchorをoff-policy教師として許容する最大Step age',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_completed_matched_entries', default=4096, type=int,
+        help='Actual evidence量を算出する完了済みstrict pairのbounded履歴数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_evidence_target_pairs', default=128, type=int,
+        help='exploration/Proposal authorityを十分なActual evidenceとみなすpair数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_group_authority_pairs', default=8, type=int,
+        help='decision groupごとのActor residual authorityを校正するstrict Actual pair数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_coverage_entries', default=4096, type=int,
+        help='rotating safe-reservoir coverageのframe/operation visit state上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_replay_batch', default=16, type=int,
+        help='1 StepでActor Actual preferenceへ使う経験数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_min_delta', default=0.01, type=float,
+        help='Actor Actual preferenceに使う最小RD差[percentage point]',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_cross_frame_weight', default=0.25, type=float,
+        help='同一sequence・decision groupの別frame比較に掛ける信頼係数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_diagnostic_policy', default='normal',
+        choices=['normal', 'noop', 'random_safe', 'heuristic'],
+        help='Step-0診断専用policy override。通常学習はnormal',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_memory_entries',
+        default=64,
+        type=int,
+        help='process内にimmutable保持するframe別den6 Exact payload数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_prefetch_workers',
+        default=0,
+        type=int,
+        help='旧候補worker互換引数。single-proposal方式では使用せず0固定',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_prefetch_lookahead',
+        default=4,
+        type=int,
+        help='現在stepより先にden6候補cache生成を予約するframe数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_max_total_ratio',
+        default=0.0099,
+        type=float,
+        help='Add+Prune+Adjust操作数の全Voxel比上限。1.0未満を保証するため既定0.0099',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_max_changed_ratio',
+        default=0.0099,
+        type=float,
+        help='Add+Prune+2*Adjustで数える変更Voxel cell比率上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_where_temperature',
+        default=0.75,
+        type=float,
+        help='den6候補pool内Gumbel-TopK探索の温度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_score_temperature',
+        default=1.0,
+        type=float,
+        help=(
+            'candidate pool内RMSで正規化したNetwork scoreをbounded transformへ'
+            '入れる温度。Episode非依存でraw magnitude driftによる飽和を防ぐ'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_gumbel_scale',
+        default=1.0,
+        type=float,
+        help='combined score標準偏差に対するWhere Gumbel探索倍率。Episodeには依存しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_gumbel_logit_floor',
+        default=0.10,
+        type=float,
+        help=(
+            '未学習時のほぼ同値logitでも探索を消さないGumbel基準尺度の下限。'
+            'EpisodeではなくActor不確実性とActual比較証拠で実効強度を縮小する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_exploration_min_fraction',
+        default=0.25,
+        type=float,
+        help=(
+            'RD順位学習後にも残す探索倍率の下限。実効探索はcandidate順位品質に応じて'
+            'この値まで自然に縮小し、Episode番号には依存しない'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_log_sigma',
+        default=0.08,
+        type=float,
+        help='Amountをden6中心から微小探索するlog-normal標準偏差',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_bins',
+        default='0.0015,0.002,0.0025,0.00275,0.003',
+        type=str,
+        help='Exact 0.25%%を含み、Networkが実測Rate-Distortionで選ぶtotal edit ratioの離散集合',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_residual_scale',
+        default=0.35,
+        type=float,
+        help='Add/Prune/Adjustをden6初期値から独立に動かす対数残差の上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_temperature',
+        default=0.35,
+        type=float,
+        help='離散Amount選択の温度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_logit_std_cap',
+        default=0.35,
+        type=float,
+        help='Amount中心logitの絶対値上限。softsignで極端なlogitでも勾配を保つ。0で無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_gumbel_scale',
+        default=2.0,
+        type=float,
+        help='anchor後のAmount binを実際に比較するGumbel探索強度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_policy_weight',
+        default=0.1,
+        type=float,
+        help='actual結果からWhere/Amount/Actionへ返すpolicy-gradient損失重み。主損失を支配しないよう既定値は0.1',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_candidate_local_credit_weight',
+        default=1.0,
+        type=float,
+        help='既存codec-context/geometry attributionから作るcandidate-local RD損失重み。Actual encode回数は増やさない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_candidate_pairwise_weight',
+        default=0.01,
+        type=float,
+        help=(
+            'RD utility差が明確な候補対へ与えるpairwise順位損失重み。'
+            '明確な上下tailだけを使い、listwiseが数千候補へ拡散するのを補助する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_candidate_pairwise_max_pairs',
+        default=256,
+        type=int,
+        help='candidate pairwise順位損失でoperationごとに使う上限pair数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_operation_local_credit_weight',
+        default=0.02,
+        type=float,
+        help=(
+            'cache済みrate/geometry attributionをoperation単位へrobust集約し、'
+            'Gateへ返す低分散creditの重み。Actual encode回数は増やさない'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_local_credit_weight',
+        default=0.05,
+        type=float,
+        help='rate/geometryをbin別に集約したAmount local RD credit重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fine_local_credit_weight',
+        default=0.005,
+        type=float,
+        help='operation別RD targetから作るFine amount residual credit重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_global_actual_credit_weight',
+        default=0.05,
+        type=float,
+        help=(
+            'composite planのActual scalarをcandidate-local creditへ加える補正重み。'
+            '1候補ずつのActual教師ではないため低分散local教師より弱くする'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_set_credit_weight',
+        default=0.50,
+        type=float,
+        help=(
+            '同一frameの連続planで入れ替わったcandidate集合に返すActual順位credit重み'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_set_relative_scale',
+        default=0.02,
+        type=float,
+        help='候補集合Actual差の信頼度を正規化する前回Actual絶対値に対する比率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_set_temperature',
+        default=0.25,
+        type=float,
+        help='入れ替えcandidate集合のActual pairwise preference温度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_set_max_candidates',
+        default=128,
+        type=int,
+        help='operationごとにActual集合比較へ使う最大candidate数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_decision_lr_scale',
+        default=0.1,
+        type=float,
+        help='Exact-online candidate/Where/Gate headのmain LRに対する固定倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_lr_scale',
+        default=0.01,
+        type=float,
+        help='初期飽和を防ぐExact-online Amount selector/fine headのmain LRに対する固定倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_policy_backward_scale',
+        default=10.0,
+        type=float,
+        help='ana_den6_onlineのPolicy forward値を変えず、backwardだけ063943相当へ戻す倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_entropy_weight',
+        default=0.001,
+        type=float,
+        help='候補探索の早期固定化を防ぐentropy bonus重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_reward_ema',
+        default=0.10,
+        type=float,
+        help='frame別actual objective baselineのEMA更新率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_reward_scale',
+        default=1.0,
+        type=float,
+        help='1候補のActual圧縮率[%%]をWhere/Amount/Action方策勾配へ変換する倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_advantage_clip',
+        default=5.0,
+        type=float,
+        help='single-proposal Actual policy advantageの絶対値上限。初見frameの有効planを同一値へ飽和させない範囲',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_geometry_policy_weight',
+        default=0.50,
+        type=float,
+        help='圧縮改善を維持したplanのGeometry改善を離散Amountへ返すRate-Distortion方策重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_geometry_compression_tolerance',
+        default=0.05,
+        type=float,
+        help='Geometry方策更新を許可するActual圧縮率EMAからの悪化許容幅[percentage point]',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_geometry_advantage_clip',
+        default=0.25,
+        type=float,
+        help='Geometry相対改善advantageの絶対値上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_grad_audit',
+        default=False,
+        type=str2bool,
+        help='ana_den6_onlineでWhere/Amount/Actionのhead grad normだけを記録する。通常は同期削減のためFalse',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_grad_audit_interval',
+        default=1,
+        type=int,
+        help='ana_den6_online grad auditの間隔。1なら毎Step、0以下は無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_require_exact_single_plan_teacher',
+        default=True,
+        type=str2bool,
+        help='旧den6と同じGT edit-unit順位から1planだけ作ることを必須化し、汎用proxyへの劣化を禁止する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_auto_build_exact_single_plan_teacher',
+        default=True,
+        type=str2bool,
+        help='exact teacher未生成frameだけden6 workerでGT edit unitsを1回生成する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_den6_codec_strict',
+        default=True,
+        type=str2bool,
+        help='Heuristic guidance時にden6と異なるSparsePCGC codec条件を開始時にエラーにする',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_anchor_steps',
+        default=200,
+        type=int,
+        help='den6 Amount/Action priorをNetwork主体へ連続移行するstep数。Where候補探索はhard Exact anchor終了後に開始する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_amount_expansion',
+        default=4.0,
+        type=float,
+        help='ana_den6_online Amount priorに対する固定residual探索幅。時刻依存ではなく全期間同じ範囲を使う',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_teacher_bootstrap_steps',
+        default=0,
+        type=int,
+        help='旧互換用。ana_den6_onlineでは保存済み行動教師を禁止するため常に0',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_fixed_symbol_features',
+        default=True,
+        type=str2bool,
+        help='SparsePCGCのGT固定symbol scoreを候補/planなしのNetwork入力cacheとして使う',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_teacher_distill_weight',
+        default=0.50,
+        type=float,
+        help='訓練時のGT固定den6判断規則をWhere/Amount/Action headへ蒸留する補助損失係数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_distill_max_points',
+        default=65536,
+        type=int,
+        help='1 Stepでdense Where規則を蒸留する等間隔sample点数（候補選択ではない）',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_distill_max_direction_sources',
+        default=4096,
+        type=int,
+        help='Add/Adjust方向規則の蒸留に使う有効source上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_exact_anchor_steps',
+        default=0,
+        type=int,
+        help='診断時に先頭何stepをden6完成planと完全一致させるか。通常訓練は0でNetwork方策を最初から実行する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_final_prior_strength',
+        default=0.10,
+        type=float,
+        help='anchor移行後もActionに残すden6 prior強度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_final_where_weight',
+        default=0.25,
+        type=float,
+        help='anchor移行後もWhere rankに残すden6 prior重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_residual_weight',
+        default=0.05,
+        type=float,
+        help='den6 Pool候補を再順位付けするNetwork utilityの初期重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_residual_weight_max',
+        default=0.50,
+        type=float,
+        help='固定validation改善時に段階拡大するPool内Network再順位付け重みの上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_to_heuristic_std_cap',
+        default=1.0,
+        type=float,
+        help='候補set内でNetwork score標準偏差をHeuristic成分の何倍まで許すか。0で上限制御なし',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_residual_weight_increment',
+        default=0.025,
+        type=float,
+        help='固定validationがnew bestになったEpisodeごとのNetwork再順位付け重み増分',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_confidence_mode',
+        default='rd_alignment',
+        choices=['none', 'rd_alignment', 'prior_only'],
+        help=(
+            'den6候補に対するNetwork補正のforward強度。rd_alignmentは'
+            'candidate-local RD教師とのPearson/Spearman一致度から毎入力で決め、'
+            'Episode番号には依存しない。prior_onlyはNetwork influence OFFの'
+            '同条件ablation専用'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_confidence_floor',
+        default=0.05,
+        type=float,
+        help=(
+            'rd_alignment時に許すbounded Network補正の最小割合。'
+            'prior_only ablationでは常に0で、Episodeには依存しない'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_score_scale',
+        default=1.0,
+        type=float,
+        help='候補Network raw scoreを固定尺度で校正するtanh scale。frame内min-maxによる微小差の強制増幅を避ける',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_score_init_std',
+        default=0.001,
+        type=float,
+        help='ana_den6_online候補評価headの最終層初期化標準偏差。0なら旧zero初期化',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_outside_pool_logit_penalty',
+        default=20.0,
+        type=float,
+        help='ana_den6_residualでden6 candidate pool外へ与える負logit。pool外へ探索範囲を再拡大しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_target_direction_weight',
+        default=12.0,
+        type=float,
+        help='den6 Add/Adjust source-target方向rankをActuator方向logitへ加える重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_tensor_cache_entries',
+        default=8,
+        type=int,
+        help='frame/subtree別にTensor化済みden6 candidate guidanceを保持する最大件数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_cpu_tensor_cache_entries',
+        default=64,
+        type=int,
+        help='固定den6候補の座標写像をCPUに保持する最大frame数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_cpu_tensor_cache_max_memory_mb',
+        default=2048,
+        type=int,
+        help='固定den6候補のCPU座標写像キャッシュ上限(MB)',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_tensor_disk_cache',
+        default=True,
+        type=str2bool,
+        help='写像済みden6固定Tensorをfingerprint付きでディスク保存し、frame巡回後も厳密再利用する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_tensor_disk_cache_dir',
+        default='',
+        type=str,
+        help='写像済みden6固定Tensorの保存先。空ならonline cache配下',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_disable_full_cloud_amount_override',
+        default=True,
+        type=str2bool,
+        help='Heuristic有効時に旧full_cloud_amountの1.5%%以上のPrune bin上書きを無効化する',
+    )
+    parser.add_argument('--heuristic_guidance_where_weight', default=1.0, type=float, help='Heuristic Where scoreを既存Actuator logitへ加える重み')
+    parser.add_argument('--heuristic_guidance_action_strength', default=0.50, type=float, help='Action gateをHeuristic構成比へ寄せる強さ。0でNetworkのみ、1でprior gate')
+    parser.add_argument('--heuristic_guidance_amount_residual_fraction', default=0.50, type=float, help='NetworkがHeuristic Amountから上下へ変更できる相対幅')
+    parser.add_argument('--heuristic_guidance_amount_min_residual', default=0.0001, type=float, help='Amount residual探索幅の最小値')
+    parser.add_argument('--heuristic_guidance_amount_grad_scale', default=1.0, type=float, help='Heuristic Amount範囲制限のSTEでAmount headへ返す勾配倍率')
+    parser.add_argument('--heuristic_guidance_total_ratio_percent', default=-1.0, type=float, help='合計操作割合の上書き[%%]。負ならデータセット/m別ana_den6初期値')
+    parser.add_argument('--heuristic_guidance_operation_shares', default='', type=str, help='Add,Prune,Adjust構成比の上書き。例0.4,0.4,0.2')
+    parser.add_argument('--heuristic_guidance_operation_heuristics', default='', type=str, help='Add,Prune,AdjustのHeuristic名上書き。3項目をカンマ区切り')
+    parser.add_argument('--gpcc_root', default=str(_DEFAULT_GPCC_ROOT), type=str, help='G-PCCリポジトリのパス')
+    parser.add_argument('--gpcc_encoder_path', default=str(_DEFAULT_GPCC_ENCODER), type=str, help='G-PCC tmc3 encoderのパス')
+    parser.add_argument('--gpcc_cfg_dir', default=str(_DEFAULT_GPCC_CFG_DIR), type=str, help='G-PCC encoder.cfgを含む設定ディレクトリ')
+    parser.add_argument('--gpcc_tmp_dir', default='', type=str, help='G-PCC teacher用一時ディレクトリ（空なら/dev/shm優先）')
+    parser.add_argument('--gpcc_timeout', default=120.0, type=float, help='G-PCC teacherの1リクエスト待ち時間（秒）')
+    parser.add_argument('--gpcc_match_qs', default=True, type=str2bool, help='G-PCC teacher前の有効量子化幅を--qsに合わせる（明示指定が無い場合）')
+    parser.add_argument('--gpcc_prequantize', default=True, type=str2bool, help='tmc3入力前に点群を整数Octree座標へ量子化する')
+    parser.add_argument('--gpcc_effective_qs', default=1.0, type=float, help='G-PCC teacher前量子化に使う有効量子化幅')
+    parser.add_argument('--gpcc_disable_attribute_coding', default=True, type=str2bool, help='G-PCC teacherでは幾何のみを符号化する')
+    parser.add_argument('--gpcc_merge_duplicated_points', default=True, type=str2bool, help='G-PCC teacherで重複点を統合する')
+    parser.add_argument('--draco_root', default=str(_DEFAULT_DRACO_ROOT), type=str, help='Dracoリポジトリのパス')
+    parser.add_argument('--draco_encoder_path', default=str(_DEFAULT_DRACO_ENCODER), type=str, help='Draco encoderバイナリのパス')
+    parser.add_argument('--draco_decoder_path', default=str(_DEFAULT_DRACO_DECODER), type=str, help='Draco decoderバイナリのパス')
+    parser.add_argument('--draco_tmp_dir', default='', type=str, help='Draco teacher用一時ディレクトリ（空なら/dev/shm優先）')
+    parser.add_argument('--draco_timeout', default=120.0, type=float, help='Draco teacherの1リクエスト待ち時間（秒）')
+    parser.add_argument('--draco_match_qs', default=True, type=str2bool, help='Draco teacher前の有効量子化幅を--qsに合わせる（明示指定が無い場合）')
+    parser.add_argument('--draco_prequantize', default=True, type=str2bool, help='Draco入力前に点群を整数格子へ量子化する')
+    parser.add_argument('--draco_effective_qs', default=1.0, type=float, help='Draco teacher前量子化に使う有効量子化幅')
+    parser.add_argument('--draco_position_quantization_bits', default=0, type=int, help='Draco -qp。prequantize=Trueでは0推奨')
+    parser.add_argument('--draco_compression_level', default=7, type=int, help='Draco -cl [0-10]')
+    parser.add_argument('--draco_skip_decode', default=True, type=str2bool, help='Draco teacherで復号を省略してbitだけ計測するか')
+    parser.add_argument('--draco_force_point_cloud', default=True, type=str2bool, help='Draco -point_cloud を付けるか')
+    parser.add_argument('--draco_merge_duplicated_points', default=True, type=str2bool, help='Draco teacher入力で重複点を統合する')
+    parser.add_argument('--compression_surrogate_levels', default='4,6,8', type=str, help='Soft octree surrogate特徴に使う階層')
+    parser.add_argument('--compression_surrogate_hidden_dim', default=128, type=int, help='圧縮サロゲートMLPの隠れ次元')
+    parser.add_argument('--compression_surrogate_lr', default=3e-3, type=float, help='圧縮サロゲートのオンライン学習率')
+    parser.add_argument('--compression_surrogate_huber_beta', default=0.05, type=float, help='微小な実圧縮差にも勾配を返すHuber遷移幅')
+    parser.add_argument('--compression_surrogate_sign_loss_weight', default=0.25, type=float, help='Actual改善/悪化符号を模倣する補助損失係数')
+    parser.add_argument('--compression_surrogate_improvement_sign_weight', default=4.0, type=float, help='希少な改善教師の符号損失倍率')
+    parser.add_argument('--compression_surrogate_sign_scale', default=0.10, type=float, help='符号分類logitへ変換するpercent尺度')
+    parser.add_argument('--compression_surrogate_sign_deadband', default=1e-4, type=float, help='符号教師から除くActual 0近傍幅')
+    parser.add_argument('--compression_surrogate_reference_cache_entries', default=64, type=int, help='GT固定Surrogate特徴の厳密cache件数')
+    parser.add_argument('--compression_surrogate_weight_decay', default=1e-5, type=float, help='圧縮サロゲートのweight decay')
+    parser.add_argument('--compression_surrogate_train_steps', default=2, type=int, help='教師更新時にサロゲートを教師bitに合わせて更新する回数')
+    parser.add_argument('--compression_surrogate_warmup_steps', default=2, type=int, help='実ネットワーク更新前に行うSurrogate専用学習回数')
+    parser.add_argument('--compression_surrogate_refresh_interval', default=10, type=int, help='何train stepごとに実圧縮教師を再計測するか(0なら初回以外は再計測しない)')
+    parser.add_argument('--compression_surrogate_reuse_last_target', default=True, type=str2bool, help='同一train step内でのみ直近の実圧縮教師targetを再利用するか')
+    parser.add_argument('--compression_surrogate_target_cache_entries', default=256, type=int, help='Surrogate教師targetのLRUキャッシュ数（生成側targetは同一train step内のみ有効）')
+    parser.add_argument('--compression_surrogate_replay_steps', default=1, type=int, help='実圧縮を呼ばないstepでもreplay教師でSurrogateを更新する回数')
+    parser.add_argument('--compression_surrogate_replay_batch', default=8, type=int, help='Surrogate replay学習のbatch数')
+    parser.add_argument('--compression_surrogate_replay_entries', default=512, type=int, help='Surrogate replay bufferの最大件数')
+    parser.add_argument('--sparsepcgc_surrogate_local_proxy_on_target_miss', default=True, type=str2bool, help='SparsePCGC surrogateでactual教師を取れないstepはSparsePCGC aux proxyをlocal teacherとして使い、圧縮主損失が0に落ちるのを避ける')
+    parser.add_argument('--sparsepcgc_surrogate_local_proxy_rate_weight', default=1.0, type=float, help='target miss時local proxy teacherへ入れるrate proxy bit差分の重み')
+    parser.add_argument('--sparsepcgc_surrogate_local_proxy_aux_weight', default=0.25, type=float, help='target miss時local proxy teacherへ入れるSparsePCGC aux差分の重み')
+    parser.add_argument('--compression_surrogate_forward_mode', default='teacher_ste', type=str, help='surrogate損失のforward値(surrogate/teacher_ste)')
+    parser.add_argument(
+        '--detach_surrogate_from_network',
+        default=True,
+        type=str2bool,
+        help='TrueならSurrogate由来の勾配をNetwork側へ流さない。SurrogateはActual模倣・ログ・値比較専用にする',
+    )
+    parser.add_argument('--compression_surrogate_aux_node_weight', default=0.0, type=float, help='Surrogate debug用soft Octree node補助項の重み')
+    parser.add_argument('--compression_surrogate_aux_single_weight', default=0.0, type=float, help='Surrogate debug用soft単一子ノード補助項の重み')
+    parser.add_argument('--compression_surrogate_aux_in_objective', default=False, type=str2bool, help='soft Octree補助項を主圧縮objectiveへ混ぜるか。FalseならCompression Lossは実bit差分のみ')
+    parser.add_argument('--compression_surrogate_log_soft_aux', default=True, type=str2bool, help='soft Octree node/single差分を主objectiveに混ぜず常時計算・ログする')
+    parser.add_argument('--compression_soft_node_actuator_grad_weight', default=10.0, type=float, help='soft actuator rate proxyをnode項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_single_actuator_grad_weight', default=5.0, type=float, help='soft actuator rate proxyをsingle項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_bit_actuator_grad_weight', default=10.0, type=float, help='soft actuator rate proxyをbit proxy項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_node_grad_weight', default=0.025, type=float, help='soft prune node proxyをnode項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_single_grad_weight', default=0.2, type=float, help='soft prune single proxyをsingle項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_bit_grad_weight', default=0.03, type=float, help='soft prune bit proxyをbit proxy項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_rate_point_weight', default=0.25, type=float, help='soft rate proxy内のpoint数差分重み')
+    parser.add_argument('--compression_soft_rate_node_weight', default=0.10, type=float, help='soft rate proxy内のnode項重み')
+    parser.add_argument('--compression_soft_rate_single_weight', default=0.05, type=float, help='soft rate proxy内のsingle項重み')
+    parser.add_argument('--compression_soft_rate_sparsepcgc_weight', default=0.05, type=float, help='soft rate proxy内のSparsePCGC proxy重み')
+    parser.add_argument('--compression_soft_rate_add_weight', default=2.0, type=float, help='actuator soft rate proxy内のAdd操作量ペナルティ重み')
+    parser.add_argument('--compression_soft_rate_prune_weight', default=10.0, type=float, help='actuator soft rate proxy内のPrune操作量ペナルティ重み')
+    parser.add_argument('--compression_soft_rate_move_weight', default=0.5, type=float, help='actuator soft rate proxy内のMove操作量ペナルティ重み')
+    parser.add_argument('--compression_soft_rate_proxy_grad_weight', default=0.05, type=float, help='actual値forwardにsoft rate proxy勾配だけを足すSTE重み')
+    parser.add_argument('--compression_soft_prune_rate_proxy_grad_weight', default=1.0, type=float, help='actual値forwardにsoft prune proxy勾配だけを足すSTE重み')
+    parser.add_argument(
+        '--compression_soft_prune_where_proxy_grad_weight',
+        default=0.00002,
+        type=float,
+        help='L_comへPrune Where専用soft proxyをgradient-onlyで足す倍率。forward値は変えず、drop_headへの勾配だけを復帰する',
+    )
+    parser.add_argument(
+        '--compression_soft_prune_where_proxy_grad_max',
+        default=1.0,
+        type=float,
+        help='Prune Where専用soft proxy勾配倍率の上限。勾配爆発を防ぐ',
+    )
+    parser.add_argument(
+        '--compression_soft_prune_direct_grad_weight',
+        default=0.0,
+        type=float,
+        help='drop_prob_proxy平均をtarget_drop_ratioへ近づけるPrune Where補助勾配の重み',
+    )
+    parser.add_argument('--compression_octree_stat_depth', default=0, type=int, help='実圧縮debug用Octree統計の深さ(0なら点群から推定)')
+    parser.add_argument('--compression_surrogate_grad_clip', default=10.0, type=float, help='圧縮サロゲートの勾配クリップ')
+    parser.add_argument('--compression_surrogate_empty_cache_after_update', default=True, type=str2bool, help='Surrogate更新直後にCUDA cacheを解放してGPU使用量の山を抑える')
+    parser.add_argument('--compression_surrogate_empty_cache_threshold_mb', default=12288.0, type=float, help='CUDA cache解放を開始するreserved memory閾値(MB、0なら毎回)')
+    parser.add_argument('--compression_surrogate_pred_clip', default=0.0, type=float, help='サロゲートが予測する実圧縮bit差百分率のtanhクリップ（0で無効）')
+    parser.add_argument('--surrogate_pred_clip_percent', default=-1.0, type=float, help='compression_surrogate_pred_clipの明示alias。負値ならcompression_surrogate_pred_clipを使う')
+    parser.add_argument('--surrogate_target_clip_percent', default=0.0, type=float, help='実圧縮教師targetのclip幅。0で無効にしてraw percentを教師にする')
+    parser.add_argument('--surrogate_use_log_bit_ratio_target', default=False, type=str2bool, help='Trueならraw percentではなくlog(after/before)をSurrogate教師に使う')
+    parser.add_argument('--surrogate_log_bit_ratio_scale', default=100.0, type=float, help='log bit ratio教師を使う場合の倍率')
+    parser.add_argument('--compression_surrogate_occ_gain', default=1.0, type=float, help='Soft occupancy変換のゲイン')
+    parser.add_argument('--compression_surrogate_bit_weight', default=4.0, type=float, help='サロゲート教師損失のbit重み')
+    parser.add_argument('--sparsepcgc_aux_loss', default=True, type=str2bool, help='SparsePCGC向けactive coordinate/孤立proxy補助lossを使うか')
+    parser.add_argument('--sparsepcgc_aux_backprop', default=False, type=str2bool, help='SparsePCGC soft proxy補助項を主圧縮lossへ勾配として流すか。Falseなら補助値は別ログに残し、実bit Surrogate本体を最適化する')
+    parser.add_argument(
+        '--sparsepcgc_aux_with_actual_teacher',
+        default=False,
+        type=str2bool,
+        help='actual teacherが取れているstepでもSparsePCGC soft proxy補助項をbackpropへ使うか。Falseならactual圧縮値と競合させない',
+    )
+    parser.add_argument('--sparsepcgc_active_coord_weight', default=0.60, type=float, help='SparsePCGC補助loss内のactive coordinate削減項重み')
+    parser.add_argument('--sparsepcgc_isolated_proxy_weight', default=0.25, type=float, help='SparsePCGC補助loss内の孤立voxel proxy項重み')
+    parser.add_argument('--sparsepcgc_entropy_proxy_weight', default=0.15, type=float, help='SparsePCGC補助loss内のoccupancy entropy proxy項重み')
+    parser.add_argument('--sparsepcgc_density_proxy_weight', default=0.05, type=float, help='SparsePCGC補助loss内のactive density proxy項重み')
+    parser.add_argument('--sparsepcgc_aux_reward_clip', default=0.0, type=float, help='SparsePCGC補助lossのpercent項clip幅。0で無効')
+    parser.add_argument('--sparsepcgc_corr_window', default=100, type=int, help='SparsePCGC proxy-actual相関を計算する直近サンプル数')
+    parser.add_argument('--sparsepcgc_aux_gating', default=True, type=str2bool, help='proxy auxをbackpropする前にactual bitとのrolling一致度でgateする')
+    parser.add_argument('--sparsepcgc_aux_gate_mode', default='soft', type=str, help='SparsePCGC aux gateの方式(hard/soft)。softでは相関不足でも小さい安全重みを残す')
+    parser.add_argument('--sparsepcgc_aux_soft_min_weight', default=0.05, type=float, help='soft gate時にSparsePCGC auxへ残す最小backprop重み倍率')
+    parser.add_argument('--sparsepcgc_aux_min_corr', default=0.30, type=float, help='proxy aux backpropを許可する最小rolling相関')
+    parser.add_argument('--sparsepcgc_aux_min_sign_match', default=0.50, type=float, help='proxy aux backpropを許可する最小rolling符号一致率')
+    parser.add_argument('--sparsepcgc_aux_gating_window', default=100, type=int, help='proxy aux gateに使うrollingサンプル数')
+    parser.add_argument('--sparsepcgc_disable_add', default=False, type=str2bool, help='SparsePCGCでAddを止めるか。Heuristic-guided混合操作の既定はFalse')
+    parser.add_argument('--surrogate_step', default=0, type=int, help='main network更新前にSurrogateだけをactual teacherへfitさせるstep数')
+    parser.add_argument('--surrogate_pretrain_lr', default=1e-4, type=float, help='Surrogate pretrain中のlearning rate')
+    parser.add_argument('--surrogate_pretrain_actual_refresh_interval', default=10, type=int, help='Surrogate pretrain中のactual teacher refresh間隔')
+    parser.add_argument('--surrogate_pretrain_freeze_network', default=True, type=str2bool, help='Surrogate pretrain中にmain networkをfreezeするか')
+    parser.add_argument('--surrogate_pretrain_min_corr', default=-1.0, type=float, help='pretrain完了判定ログ用の最小actual/surrogate相関。負値で無効')
+    parser.add_argument('--surrogate_pretrain_min_sign_match', default=-1.0, type=float, help='pretrain完了判定ログ用の最小sign match率。負値で無効')
+    parser.add_argument('--surrogate_pretrain_min_fresh_samples', default=30, type=int, help='pretrain早期終了を判定する前に必要なfresh actual教師数')
+    parser.add_argument('--surrogate_pretrain_min_abs_error', default=-1.0, type=float, help='pretrain早期終了用の平均abs error上限。負値で無効')
+    parser.add_argument('--surrogate_pretrain_early_stop_patience', default=0, type=int, help='pretrain早期終了条件を連続で満たす必要step数。0で無効')
+    parser.add_argument('--surrogate_pretrain_log_interval', default=10, type=int, help='Surrogate pretrainログ出力間隔')
+    parser.add_argument('--surrogate_pretrain_print_interval', default=1, type=int, help='Surrogate pretrain進捗ログ出力間隔')
+    parser.add_argument('--surrogate_pretrain_checkpoint', default=True, type=str2bool, help='Surrogate pretrain後にSurrogate stateを保存するか')
+    parser.add_argument('--surrogate_pretrain_resume', default=True, type=str2bool, help='データセット別に保存済みのSurrogate事前学習stateを読み込むか')
+    parser.add_argument('--surrogate_pretrain_skip_if_loaded', default=False, type=str2bool, help='保存済みSurrogateを読めた場合に事前学習を省略するか')
+    parser.add_argument('--surrogate_pretrain_force_retrain', default=False, type=str2bool, help='保存済みSurrogateを無視して事前学習をやり直すか')
+    parser.add_argument('--surrogate_pretrain_cache_dir', default=str((_LOG_ROOT / "surrogate_pretrain_cache").resolve()), type=str, help='データセット別Surrogate事前学習stateの保存先')
+    parser.add_argument('--surrogate_registry_enabled', default=True, type=str2bool, help='指定形式の共有Surrogate重みを保存/読込するか')
+    parser.add_argument('--surrogate_pretrained_root', default=str((_DATA_ROOT / "pretrained_surrogate").resolve()), type=str, help='共有Surrogate重みの保存root')
+    parser.add_argument('--surrogate_data', default='', type=str, help='共有Surrogate重みファイル名に使うデータ名。空ならdataname_dataset_name')
+    parser.add_argument('--surrogate_date', default=surrogate_date, type=str, help='読込対象Surrogate重みの日付。{surrogate_date}_{surrogate_time}.pthで探す')
+    parser.add_argument('--surrogate_time', default=surrogate_time, type=str, help='読込対象Surrogate重みの時刻。{surrogate_date}_{surrogate_time}.pthで探す')
+    parser.add_argument('--surrogate_registry_load_latest_if_missing', default=False, type=str2bool, help='指定Surrogateが無い場合に同一method内の最新Surrogateを読むか')
+    parser.add_argument('--surrogate_pretrain_legacy_cache_fallback', default=False, type=str2bool, help='指定Surrogateが無い場合に旧fingerprint cacheを読むか')
+    parser.add_argument('--surrogate_pretrain_use_replay', default=True, type=str2bool, help='pretrain中のnon-refresh stepでreplay教師更新を使うか')
+    parser.add_argument('--surrogate_pretrain_replay_batch_size', default=16, type=int, help='pretrain replay更新のbatch size')
+    parser.add_argument('--surrogate_pretrain_replay_steps', default=4, type=int, help='pretrain中の1stepあたりreplay更新回数')
+    parser.add_argument('--surrogate_pretrain_replay_update_per_step', default=None, type=int, help='旧/明示alias: pretrain中の1stepあたりreplay更新回数')
+    parser.add_argument('--surrogate_pretrain_replay_buffer_size', default=256, type=int, help='pretrain replay buffer最大件数')
+    parser.add_argument('--surrogate_pretrain_replay_min_size', default=1, type=int, help='replay更新を開始する最小buffer件数')
+    parser.add_argument('--surrogate_pretrain_allow_stale_target', default=True, type=str2bool, help='pretrain中にfresh teacherがないstepで直近targetをstale教師として使うか')
+    parser.add_argument('--surrogate_pretrain_max_target_age', default=20, type=int, help='pretrain stale targetを使う最大step age')
+    parser.add_argument('--surrogate_pretrain_skip_on_target_miss', default=False, type=str2bool, help='pretrain中にtarget/replayがないstepのsurrogate更新をskip扱いにするか')
+    parser.add_argument('--surrogate_pretrain_sparsepcgc_debug_interval', default=10, type=int, help='pretrain中にSparsePCGC hard debug statsを取る間隔。0以下で無効')
+    parser.add_argument('--surrogate_pretrain_mode', default='subtree', choices=['full', 'subtree', 'hybrid'], type=str, help='Surrogate pretrain方式(full/subtree/hybrid)')
+    parser.add_argument('--surrogate_pretrain_subtree_depth_min', default=-1, type=int, help='pretrain subtree深さの最小値。負値ならtrain_subtree設定を使う')
+    parser.add_argument('--surrogate_pretrain_subtree_depth_max', default=-1, type=int, help='pretrain subtree深さの最大値。負値ならtrain_subtree設定を使う')
+    parser.add_argument('--surrogate_pretrain_subtree_depth_percent_min', default=0.0, type=float, help='pretrain subtree深さを全体Octree深さ比で選ぶ時の最小割合')
+    parser.add_argument('--surrogate_pretrain_subtree_depth_percent_max', default=0.50, type=float, help='pretrain subtree深さを全体Octree深さ比で選ぶ時の最大割合')
+    parser.add_argument('--surrogate_pretrain_subtree_random_depth', default=True, type=str2bool, help='pretrain subtree深さをランダム/coverage samplingするか')
+    parser.add_argument('--surrogate_pretrain_subtree_reuse_train_sampler', default=True, type=str2bool, help='通常trainのOctree subtree sampling helperをpretrainでも使うか')
+    parser.add_argument('--surrogate_pretrain_skip_min_points_miss', default=False, type=str2bool, help='pretrain subtreeがtrain_subtree_min_pointsを満たせない時に1点subtreeへ落とさずskipするか')
+    parser.add_argument('--surrogate_pretrain_subtree_steps_per_full', default=50, type=int, help='hybrid pretrainでfull校正1回あたりのsubtree step目安')
+    parser.add_argument('--surrogate_pretrain_full_calibration_interval', default=50, type=int, help='hybrid pretrainでfull actual校正を行う間隔')
+    parser.add_argument('--surrogate_pretrain_full_calibration_steps', default=1, type=int, help='hybrid pretrainの各calibration windowでfull actual校正に使うstep数')
+    parser.add_argument('--surrogate_pretrain_subtree_teacher_type', default='local_actual', choices=['local_actual', 'local_proxy', 'inherited_full', 'none'], type=str, help='subtree/hybrid pretrainのteacher種別')
+    parser.add_argument('--surrogate_pretrain_store_local_proxy_replay', default=False, type=str2bool, help='local_proxy pretrain targetをactual mimic用replayへ保存するか。scale混同を避けるためdefault False')
+    parser.add_argument('--surrogate_pretrain_max_wall_time_sec', default=0, type=float, help='pretrain最大実行秒数。0以下で無効')
+    parser.add_argument('--surrogate_update_during_training', default=True, type=str2bool, help='通常学習中もSurrogate online更新を続けるか')
+    parser.add_argument('--surrogate_update_interval', default=1, type=int, help='通常学習中のSurrogate optimizer更新間隔')
+    parser.add_argument('--surrogate_joint_lr_scale', default=0.5, type=float, help='pretrain後の通常学習中Surrogate LR倍率')
+    parser.add_argument('--surrogate_update_on_teacher_refresh_only', default=False, type=str2bool, help='Trueならteacher refresh時だけSurrogateを更新し、replay更新を止める')
+    parser.add_argument('--surrogate_full_cloud_calib_interval', default=0, type=int, help='subtree学習中にfull-cloud actual teacher校正を入れる間隔。0で無効')
+    parser.add_argument('--surrogate_realign_on_low_corr', default=False, type=str2bool, help='低相関時のSurrogate再整列を有効化する実験flag')
+    parser.add_argument('--surrogate_realign_min_corr', default=0.3, type=float, help='Surrogate再整列を検討する相関しきい値')
+    parser.add_argument('--surrogate_realign_steps', default=0, type=int, help='低相関時に追加するSurrogate再整列step数。0ならログのみ')
+    parser.add_argument('--surrogate_auto_freeze', default=False, type=str2bool, help='Surrogateが実bit教師に安定してfitしたらonline更新を一時停止する')
+    parser.add_argument('--surrogate_freeze_abs_error', default=1.0, type=float, help='auto freezeに必要なbit percent abs error上限')
+    parser.add_argument('--surrogate_freeze_train_loss', default=1.0, type=float, help='auto freezeに必要なSurrogate train loss上限')
+    parser.add_argument('--surrogate_freeze_patience', default=8, type=int, help='auto freeze条件を連続で満たすfresh teacher回数')
+    parser.add_argument('--surrogate_resume_abs_error', default=2.0, type=float, help='frozen Surrogateを再学習へ戻すbit percent abs error閾値')
+    parser.add_argument('--surrogate_resume_train_loss', default=2.0, type=float, help='frozen Surrogateを再学習へ戻すtrain loss閾値')
+    parser.add_argument('--compression_good_step_boost', default=False, type=str2bool, help='Surrogate安定後、実bitが改善したstepの主圧縮勾配を少し強める')
+    parser.add_argument('--compression_good_step_boost_scale', default=1.5, type=float, help='実bit改善stepの主圧縮勾配倍率')
+    parser.add_argument('--compression_good_step_prefreeze_scale', default=1.15, type=float, help='Surrogate freeze前でも十分fitした実bit改善stepだけに使う控えめな勾配倍率')
+    parser.add_argument('--compression_good_step_prefreeze_max_train_loss', default=4.0, type=float, help='prefreeze改善step倍率を許可するSurrogate train loss上限')
+    parser.add_argument('--compression_good_step_extra_surrogate_steps', default=4, type=int, help='実bit改善stepをSurrogateへ追加fitするstep数')
+    parser.add_argument('--loss_grad_probe_enabled', default=False, type=str2bool, help='損失項ごとのmodule/操作別勾配CSVを出力するか')
+    parser.add_argument('--loss_grad_probe_interval', default=1, type=int, help='損失項ごとの勾配CSVを何stepごとに出すか')
+    parser.add_argument('--step_grad_log', default=False, type=str2bool, help='train.py内蔵の損失項ごとのmodule/操作別勾配CSVを出力するか。複数回のautograd.gradが必要な診断専用のため既定はFalse')
+    parser.add_argument('--step_grad_log_interval', default=50, type=int, help='train.py内蔵step_grad CSVを何stepごとに出すか')
+    parser.add_argument('--step_grad_first_step_only', default=False, type=str2bool, help='step_grad CSVをglobal_step=0だけに制限するか')
+    parser.add_argument('--compression_bad_step_penalty_scale', default=1.25, type=float, help='実bit悪化stepの主圧縮勾配倍率')
+    parser.add_argument('--compression_boost_requires_surrogate_frozen', default=True, type=str2bool, help='good/bad勾配倍率をSurrogate frozen後だけ有効にする')
+    parser.add_argument('--compression_boost_max_abs_error', default=1.0, type=float, help='good/bad勾配倍率を許可するSurrogate abs error上限')
+    parser.add_argument('--sparsepcgc_enable_add_experiment', default=False, type=str2bool, help='SparsePCGCでもAddを実験的に許可する。Heuristic guidance有効時は後処理でTrueへ切り替える')
+    parser.add_argument('--sparsepcgc_add_only_when_compression_primary', default=True, type=str2bool, help='SparsePCGC Addをcompression_primary時だけに限定するか。Heuristic guidance有効時はFalseへ切り替える')
+    parser.add_argument('--sparsepcgc_add_target_ratio', default=0.005, type=float, help='SparsePCGC Add実験のtarget add ratio')
+    parser.add_argument('--sparsepcgc_add_max_ratio', default=0.50, type=float, help='SparsePCGC Add実験のmax add ratio')
+    parser.add_argument('--sparsepcgc_add_warmup_steps', default=0, type=int, help='SparsePCGC Add実験のratio warmup step数')
+    parser.add_argument('--sparsepcgc_add_use_candidate_score', default=True, type=str2bool, help='SparsePCGC Add実験で既存candidate scoreを使うか')
+    parser.add_argument('--sparsepcgc_move_existing_target_only', default=False, type=str2bool, help='SparsePCGCでmove targetを既存occupied voxelへ寄せる旧実験設定。点潰れを避けるため既定ではFalse')
+    parser.add_argument('--sparsepcgc_move_source_prior_weight', default=0.55, type=float, help='SparsePCGC時に原因診断scoreからAdjust source候補を起こす補助重み')
+    parser.add_argument('--enable_voxel_collision_log', default=False, type=str2bool, help='SparsePCGC互換量子化後のVoxel衝突率ログを有効化する。全点uniqueを3経路で再計算する診断専用のため既定はFalse')
+    parser.add_argument('--voxel_collision_log_interval', default=1, type=int, help='Voxel衝突率ログを記録するStep間隔')
+    parser.add_argument('--voxel_collision_max_points', default=300000, type=int, help='Voxel衝突率ログで1点群あたり処理する最大点数。超過時は間引く')
+    parser.add_argument('--voxel_collision_log_first_batch_only', default=True, type=str2bool, help='Voxel衝突率ログをBatch先頭だけに制限する')
+    parser.add_argument('--voxel_collision_log_stages', default='input_gt,model_output_raw,compression_input', type=str, help='Voxel衝突率ログ対象stageのカンマ区切り一覧')
+    parser.add_argument('--enable_sparsepcgc_empty_target_guard', default=True, type=str2bool, help='SparsePCGC互換量子化後に既存occupied targetへ入るAdjustをpreserveへ戻す')
+    parser.add_argument('--enable_sparsepcgc_target_duplicate_guard', default=True, type=str2bool, help='SparsePCGC互換量子化後に同じtarget voxelへ集まるAdjustを1点だけ残してpreserveへ戻す')
+    parser.add_argument(
+        '--repair_move_relax_duplicate_guard_when_starved',
+        default=False,
+        type=str2bool,
+        help='Adjust候補がduplicate guardで少なすぎる場合だけduplicate guardを緩める。empty target guardは維持する',
+    )
+    parser.add_argument('--sparsepcgc_empty_target_penalty_weight', default=0.0, type=float, help='既存occupied targetへ入るAdjustのsoft penalty重み')
+    parser.add_argument('--sparsepcgc_target_duplicate_penalty_weight', default=0.0, type=float, help='同じtarget voxelへ複数Adjustするsoft penalty重み')
+    parser.add_argument('--enable_sparsepcgc_occupancy_debug', default=False, type=str2bool, help='SparsePCGC本体の候補occupancy確率/label/bit推定ログをactual評価時だけ取得する')
+    parser.add_argument('--sparsepcgc_occupancy_low_prob_threshold', default=0.1, type=float, help='SparsePCGC候補occupancyのtrue側確率を低確率とみなす閾値')
+    parser.add_argument('--enable_sparsepcgc_exact_occupancy_teacher', default=False, type=str2bool, help='SparsePCGC本体定義のexact occupancy teacherログを有効化する')
+    parser.add_argument('--sparsepcgc_exact_occupancy_interval', default=1, type=int, help='exact occupancy teacherを呼ぶStep間隔。0以下なら無効')
+    parser.add_argument('--sparsepcgc_exact_teacher_mode', default='auto', type=str, help='exact teacherの基準(full_cloud/global_subtree/local_subtree/auto)')
+    parser.add_argument('--enable_sparsepcgc_exact_occupancy_loss', default=False, type=str2bool, help='exact occupancy teacher由来の追加loss候補を有効化する')
+    parser.add_argument('--sparsepcgc_exact_occupancy_loss_weight', default=0.0, type=float, help='exact occupancy NLL deltaのloss重み。既定0')
+    parser.add_argument('--sparsepcgc_exact_bits_loss_weight', default=0.0, type=float, help='exact estimated bits deltaのloss重み。既定0')
+
+    # proxyOctreeCompression
+    parser.add_argument('--proxy_max_depth',     default=12,    type=int,   help='Octreeの最大深さ')
+    parser.add_argument('--proxy_lambda_entropy', default=1,    type=float,   help='エントロピー項の重み')
+    parser.add_argument('--proxy_lambda_node_count',   default=1,  type=float,   help='ノード数項の重み')
+    parser.add_argument('--proxy_lambda_single_child', default=1,     type=float,   help='単一子ノード項の重み')
+    parser.add_argument('--proxy_round_tau', default=0.12, type=float, help='soft丸めの温度パラメータ')
+    parser.add_argument('--proxy_mass_to_occ_gain', default=1.0, type=float, help='質量→占有変換のスケール')
+    parser.add_argument('--octattention_teacher_device', default='auto', type=str, help='OctAttention teacherの実行先(auto/cuda/cpu/balanced)')
+    parser.add_argument('--compression_rate_metric', default='total_bits', type=str, help='圧縮率損失の基準(total_bits/bits_per_point/bits_per_input_point)')
+    parser.add_argument('--disable_output_noise', default=True, type=str2bool, help='Trueなら出力点群へ圧縮損失用ノイズを加えずclean点群のまま使う')
+    parser.add_argument('--use_uniform_noise', default=False, type=str2bool, help='train時のみ編集後・量子化前に加法的一様ノイズを入れるか')
+    parser.add_argument('--noise_delta', default=1.0, type=float, help='一様ノイズ幅delta。u~Uniform(-delta/2,delta/2)。0以下ならcodec固有量子化幅へフォールバック')
+    parser.add_argument('--log_step_time', default=True, type=str2bool, help='一定間隔でtrain/testの処理時間をログ出力するか')
+    parser.add_argument('--log_gpu_memory', default=True, type=str2bool, help='一定間隔でGPUメモリ使用量をログ出力するか')
+    parser.add_argument('--profile_interval', default=100, type=int, help='時間/GPU profileログの出力間隔')
+    parser.add_argument('--train_subtree_anchor_on_min_points_miss', default=False, type=str2bool, help='subtreeがmin_pointsを満たせないdepthでは1点subtree学習を避けfull-cloud anchorへ切り替える')
+    parser.add_argument('--for_better_log', default=False, type=str2bool, help='原因追跡用ForBetter.txtを通常ログとは別に出力するか。毎Step大量I/Oを避けるため既定False')
+    parser.add_argument('--for_better_log_interval', default=1, type=int, help='ForBetter.txtへtrain step診断を書く間隔')
+    parser.add_argument('--for_better_spike_ratio', default=2.0, type=float, help='ForBetter.txtの急増event判定倍率')
+    parser.add_argument('--for_better_spike_window', default=20, type=int, help='ForBetter.txtの急増event判定rolling window')
+    parser.add_argument('--actual_eval_interval', default=1, type=int, help='train時のactual codec教師refresh間隔。既定1で毎Step実圧縮する。0なら初回以外refreshしない')
+    parser.add_argument(
+        '--sparsepcgc_actual_every_step',
+        default=True,
+        type=str2bool,
+        help='SparsePCGC actual/actual_ste backendで、actual_eval_intervalに関わらず毎Step edited hard voxelを実圧縮する',
+    )
+    parser.add_argument('--disable_actual_codec_during_train', default=False, type=str2bool, help='train中のactual codec呼び出しをproxyへ置き換えて無効化するか')
+    parser.add_argument(
+        '--use_voxel_restored_points_for_actual',
+        default=True,
+        type=str2bool,
+        help='actual SparsePCGC評価にfinal_voxel_coordsから復元した点群を使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_use_actuator_voxel_state',
+        default=True,
+        type=str2bool,
+        help='SparsePCGC actual/proxy入力をActuatorのfinal_voxel_coords状態に統一する',
+    )
+    parser.add_argument(
+        '--use_voxel_restored_points_for_actual_debug',
+        default=False,
+        type=str2bool,
+        help='voxel復元actual入力のdebugログを出す。通常学習では既定False',
+    )
+    parser.add_argument(
+        '--voxel_restored_actual_require_state',
+        default=True,
+        type=str2bool,
+        help='final_voxel_coordsが無い場合にエラーにするかfallbackするか',
+    )
+    parser.add_argument('--actual_codec_fallback_to_proxy_on_error', default=False, type=str2bool, help='actual/surrogate teacherがtimeout等で失敗した場合にproxy lossへfallbackしてtrainを継続するか。毎Step actual保証を優先して既定False')
+    parser.add_argument('--skip_optimizer_on_actual_fallback', default=True, type=str2bool, help='actual/surrogate teacher失敗でproxy fallbackしたstepはoptimizer更新をスキップする')
+    parser.add_argument('--actual_compression_guard', default=True, type=str2bool, help='episode平均のfresh actual圧縮損失が悪化し続けたらbestへ戻してLRを下げる')
+    parser.add_argument('--actual_guard_patience', default=2, type=int, help='actual圧縮悪化を何episode連続で許容するか')
+    parser.add_argument('--actual_guard_tolerance', default=0.25, type=float, help='best actual圧縮損失から何percentage pointの悪化まで許容するか')
+    parser.add_argument(
+        '--actual_guard_autonomy_compression_target',
+        default=-3.5,
+        type=float,
+        help='Network候補再順位の裁量を広げる前に固定validationで必要なActual圧縮率[%%]',
+    )
+    parser.add_argument('--actual_guard_autonomy_min_improvement', default=0.01, type=float, help='候補再順位付け裁量を一段広げるのに必要な、前回拡張時からの固定Actual圧縮率改善幅[percentage point]')
+    parser.add_argument('--actual_guard_decay_lr', default=False, type=str2bool, help='ActualCompressionGuard発火時にLRも下げるか。StepLRとの二重低下を避けるため既定False')
+    parser.add_argument('--actual_guard_lr_decay', default=0.5, type=float, help='actual guard発動時のoptimizer LR倍率')
+    parser.add_argument('--actual_guard_min_fresh', default=1, type=int, help='actual guardを判定する最低fresh actual計測数')
+    parser.add_argument('--actual_guard_restore_best', default=True, type=str2bool, help='actual guard発動時にbest episode checkpointへ戻す')
+    parser.add_argument('--actual_guard_require_fixed_validation', default=True, type=str2bool, help='Trueなら同一full-cloud validationだけでguardを判定し、移動する訓練窓の平均ではrollbackしない')
+    parser.add_argument('--actual_guard_require_full_state_restore', default=True, type=str2bool, help='Trueならmodelだけでなくoptimizer/scheduler/scalerも保存済みの場合だけrollbackする')
+    parser.add_argument('--actual_guard_max_restores', default=1, type=int, help='1訓練run中に重みを巻き戻す最大回数。周期的なrollbackを防ぐ。0なら巻き戻さない')
+    parser.add_argument('--actual_guard_max_restore_age_episodes', default=16, type=int, help='このEpisode数より古いbestへのrollbackを禁止する。0なら無制限')
+    parser.add_argument('--actual_guard_rebase_stale_best', default=True, type=str2bool, help='古すぎるbestでGuardが発火した場合、現Episodeを新しい局所Guard基準として継続する')
+    parser.add_argument('--actual_guard_improvement_epsilon', default=1e-6, type=float, help='actual guardのbest更新に必要な最小改善幅')
+    parser.add_argument('--checkpoint_actual_source', default='auto', type=str, help='actual checkpoint/guardの主指標(auto/fresh/full_cloud)')
+    parser.add_argument('--checkpoint_full_cloud_min_count', default=1, type=int, help='full_cloud actualをcheckpoint主指標に使う最低件数')
+    parser.add_argument('--checkpoint_min_optimizer_step_ratio', default=0.20, type=float, help='この割合未満しかoptimizer更新できないepisodeはbest/guard対象外')
+    parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
+    parser.add_argument('--sparsepcgc_matched_frame_repeats', default=2, type=int, choices=[1, 2], help='SparsePCGC ana_den6学習だけで同一frameのanchor/比較を連続処理する。1は従来順、2は1回ずつencodeする2-view。評価・他codecは変更しない')
+    parser.add_argument('--save_good_bad_cases', default=False, type=str2bool, help='actual deltaが大きく改善/悪化したstepのdebug summaryをCSV保存する')
+    parser.add_argument('--save_proxy_actual_bad_cases', default=True, type=str2bool, help='proxy/cause scoreとactual bitの符号が逆のcaseをCSV保存する')
+    parser.add_argument('--proxy_actual_bad_case_threshold', default=0.0, type=float, help='proxy-actual逆方向caseを保存する最小絶対値しきい値')
+    parser.add_argument('--good_case_delta_threshold', default=-5.0, type=float, help='good caseとして保存するactual compression delta[%%]の閾値')
+    parser.add_argument('--bad_case_delta_threshold', default=20.0, type=float, help='bad caseとして保存するactual compression delta[%%]の閾値')
+    parser.add_argument('--max_saved_cases', default=64, type=int, help='good/bad case debug summaryの最大保存件数')
+    parser.add_argument('--save_compression_metric_csv', default=True, type=str2bool, help='actual/surrogate/proxy圧縮metricを分離したstep CSVを保存する')
+    parser.add_argument('--save_operation_metric_csv', default=True, type=str2bool, help='Add/Prune/Adjustのsoft/hard/effective統計step CSVを保存する')
+    parser.add_argument('--save_step_metric_csv', default=False, type=str2bool, help='詳細なStep単位CSVを保存するか。通常はEpisode CSVだけを保存する')
+    parser.add_argument('--plot_step_average_window', default=100, type=int, help='Step平均PNGの集計Step数。100なら横軸1目盛りが100 Step')
+    parser.add_argument('--operation_dead_grad_warn_threshold', default=1e-12, type=float, help='operation branch/amount勾配が死んだとみなすnormしきい値')
+    parser.add_argument('--operation_dead_grad_warn_patience', default=20, type=int, help='operation勾配が低い状態が何step続いたらwarningを出すか')
+    parser.add_argument('--repair_add_ratio_floor', default=0.0, type=float, help='Add操作が完全に死なないための弱いratio下限。0で無効')
+    parser.add_argument('--save_checkpoint_metric_csv', default=True, type=str2bool, help='checkpoint判定に使うepisode metric CSVを保存する')
+    parser.add_argument('--checkpoint_geom_gate', default=True, type=str2bool, help='actual-delta improved best保存時にgeometry gateを使う')
+    parser.add_argument('--checkpoint_safety_gate', default=True, type=str2bool, help='actual-delta improved best保存時にrepair/node/single/operation safety gateを使う')
+    parser.add_argument('--checkpoint_geom_rel_factor', default=1.5, type=float, help='stage内初回geometry lossに対するbest保存許容倍率')
+    parser.add_argument('--checkpoint_geom_abs_max', default=0.0, type=float, help='best保存時のgeometry loss絶対上限。0以下で無効')
+    parser.add_argument('--checkpoint_repair_rel_factor', default=0.0, type=float, help='stage内初回repair lossに対するbest保存許容倍率。0以下で無効')
+    parser.add_argument('--checkpoint_repair_abs_max', default=10.0, type=float, help='best保存時のstructure repair loss絶対上限。0以下で無効')
+    parser.add_argument('--checkpoint_node_abs_max', default=100.0, type=float, help='best保存時のnode loss絶対上限。0以下で無効')
+    parser.add_argument('--checkpoint_single_abs_max', default=100.0, type=float, help='best保存時のsingle-child loss絶対上限。0以下で無効')
+    parser.add_argument('--checkpoint_operation_ratio_max', default=100.0, type=float, help='best保存時のAdd/Prune/Adjust ratio[%%]上限。負値で無効')
+
+    """Test"""
+    parser.add_argument('--checkpoint', default=None, type=str, help='test.py用alias: 読み込む学習済みcheckpoint。指定時は--ckptを上書き')
+    parser.add_argument('--data_dir', default=None, type=str, help='test.py用alias: 推論入力点群ディレクトリ。指定時は--input_dir_testを上書き')
+    parser.add_argument('--output_log', default=None, type=str, help='test.pyの推論profile/点操作統計CSV保存先')
+    parser.add_argument('--save_output_points', default=None, type=str2bool, help='test.py用alias: 編集後点群を保存するか。指定時は--save_test_plyを上書き')
+    parser.add_argument('--output_dir', default=None, type=str, help='test.py用alias: 編集後点群保存先。指定時は--save_ply_dirを上書き')
+    parser.add_argument('--max_test_samples', default=0, type=int, help='test.pyで処理する最大sample数。0以下なら全件')
+    parser.add_argument('--input_dir_test', default=str(_data_subset_dir("ground")), type=str, help='テスト用入力点群のパス')
+    parser.add_argument('--max_files_test', default=10, type=int, help='テスト時に読み込む最大ファイル数')
+    parser.add_argument('--save_ply_dir', default=str(_data_subset_dir("test", dataname, dataset_name)), type=str, help='出力点群の保存先')
+    parser.add_argument('--test_compute_loss', default=True, type=str2bool, help='test.pyで幾何・圧縮統計をログ出力するか')
+    parser.add_argument('--skip_actual_codec', default=True, type=str2bool, help='test.pyではactual codec評価を省きproxy統計だけで高速評価するか')
+    parser.add_argument('--codec_eval_interval', default=0, type=int, help='test.pyでactual codec評価を行う間隔。0なら無効、1なら全sample')
+    parser.add_argument('--save_test_ply', default=True, type=str2bool, help='test.pyで編集後PLYを保存するか')
+    parser.add_argument('--test_apply_post_hardening', default=False, type=str2bool, help='Trueならtest.pyで旧来のfinal_w後処理hardeningを追加適用する。既定Falseでtrain出力フローに合わせる')
+    parser.add_argument('--test_drop_threshold', default=0.50, type=float, help='test.pyで点削除ゲートをhard化するしきい値。全点keep/全点dropになる場合はsum(final_w)ベースのexpected_keepへ自動フォールバック')
+    parser.add_argument('--test_adjust_threshold', default=1e-6, type=float, help='test.pyで点が調整されたと数える最小移動距離')
+    parser.add_argument('--test_inference_mode', default='full_cloud', type=str, help='推論方法(auto/full_cloud/subtree_merge/patch/direct/legacy/verified)')
+    parser.add_argument('--test_allow_subtree_merge', default=False, type=str2bool, help='Trueの時だけtest.pyでsubtree_merge推論を許可する')
+    parser.add_argument('--test_subtree_level', default=6, type=int, help='subtree_merge時に使うSubtree深さ(0ならtrain_subtree_level/repair_unit_level)')
+    parser.add_argument('--test_subtree_batch_size', default=8, type=int, help='subtree_merge時に複数Subtreeをまとめて推論する数(Add有効時は安全のため1)')
+    parser.add_argument('--test_subtree_min_points', default=4, type=int, help='subtree_merge時に各Subtreeへ最低限含めたい点数')
+    parser.add_argument('--test_compute_quality_metrics', default=True, type=str2bool, help='test.pyでCD/D1/D2品質指標を計算するか')
+
+    """設定"""
+    parser.add_argument('--seed', default=21, type=float, help='乱数シード')
+    parser.add_argument('--deterministic', default=False, type=str2bool, help='再現性のためCUDAを固定するか')
+    parser.add_argument('--num_points', default=8192, type=int, help='1パッチあたりの点数')
+    parser.add_argument('--max_input_points', default=0, type=int, help='入力点数の上限（0で安全上限を使用）')
+    parser.add_argument('--safe_max_input_points', default=0, type=int, help='max_input_points=0時にも適用する安全上限')
+    parser.add_argument('--allow_unbounded_input', default=True, type=str2bool, help='Trueならmax_input_points=0で全点入力を許可する')
+    parser.add_argument('--input_sampling', default='random', type=str, help='サンプリング方法')
+    parser.add_argument('--split2patch', default=True, type=str2bool, help='点群をパッチ分割するか')
+    parser.add_argument('--patch_rate', default=1.0, type=float, help='パッチ重なり率')
+    parser.add_argument('--batch_size', default=1, type=int, help='バッチサイズ')
+    parser.add_argument('--patch_batch_size', default=2, type=int, help='パッチ単位のバッチサイズ')
+    parser.add_argument('--patch_parallel_mode', default='auto', type=str, help='パッチ並列化モード(auto/fixed/all)')
+    parser.add_argument('--patch_parallel_points_budget_train', default=16384, type=int, help='train時に同時処理する総点数の目安')
+    parser.add_argument('--patch_parallel_points_budget_test', default=16384, type=int, help='test時に同時処理する総点数の目安')
+    parser.add_argument('--patch_cover_retry', default=4, type=int, help='カバーできない点を再試行する回数')
+    parser.add_argument('--patch_build_mode', default='spatial_sort', type=str, help='パッチ構築方法(spatial_sort/fps_cover)')
+    parser.add_argument('--patch_owned_ratio', default=0.9375, type=float, help='各パッチで固有に担当する点の割合')
+    parser.add_argument('--patch_sort_grid_size', default=1024, type=int, help='spatial_sort時の粗い空間グリッド分解能')
+    parser.add_argument('--train_patch_subset_enable', default=True, type=str2bool, help='train時にpatch subsetではなくOctree subtree subset学習を使うか')
+    parser.add_argument('--train_subtree_level', default=4, type=int, help='train subtree深さ(0ならrepair_unit_levelを使う)')
+    parser.add_argument('--train_subtree_randomize_level', default=True, type=str2bool, help='train時にsubtree深さを一定範囲でランダム化するか')
+    parser.add_argument('--train_subtree_level_jitter', default=1, type=int, help='train_subtree_levelの前後に何段までランダム化を許すか')
+    parser.add_argument('--train_subtree_level_min', default=4, type=int, help='train時subtree深さの最小値(0ならbase-jitter)')
+    parser.add_argument('--train_subtree_level_max', default=0, type=int, help='train時subtree深さの最大値(0ならbase+jitter)')
+    parser.add_argument('--train_subtree_random_full_range', default=False, type=str2bool, help='min/max未指定時にデータから推定した全Octree深さ範囲からランダムに選ぶ')
+    parser.add_argument('--train_subtree_level_sampling', default='uniform_random', type=str, help='subtree深さサンプリング方法(uniform_random/coverage_cycle)')
+    parser.add_argument('--train_subtree_level_curriculum', default=True, type=str2bool, help='学習中にsubtree深さ範囲を徐々に変える')
+    parser.add_argument('--train_subtree_curriculum_fraction', default=1.0, type=float, help='全学習stepのうちsubtree深さcurriculumに使う割合（1.0なら全stepで徐々に変化）')
+    parser.add_argument('--train_subtree_curriculum_direction', default='deep_to_shallow', type=str, help='subtree深さcurriculumの向き(deep_to_shallow/shallow_to_deep)')
+    parser.add_argument('--train_subtree_depth_percent_curriculum', default=True, type=str2bool, help='全体Octree深さに対する割合でsubtree深さ範囲を決める')
+    parser.add_argument('--train_subtree_depth_percent_start', default='0.0,0.50', type=str, help='学習開始時のsubtree深さ割合範囲(min,max)')
+    parser.add_argument('--train_subtree_depth_percent_end', default='0.0,0.50', type=str, help='学習終了時のsubtree深さ割合範囲(min,max)')
+    parser.add_argument('--train_subtree_min_points', default=5, type=int, help='train時に優先的に選ぶsubtreeの最小点数（満たす候補が無ければフォールバック）')
+    parser.add_argument('--train_patch_subset_patches_per_step', default=1, type=int, help='1 stepで処理するsubtree数')
+    parser.add_argument('--train_patch_subset_anchor_interval', default=32, type=int, help='subtree subset学習時に何stepごとにfull-cloud anchor学習を挟むか(0なら間隔指定なし)')
+    parser.add_argument('--train_full_cloud_actual_interval', default=0, type=int, help='subtree学習中にfull-cloud actual圧縮損失で学習する間隔。0で無効')
+    parser.add_argument('--train_full_cloud_val_frames', default=5, type=int, help='episode末にfull-cloud actual validationへ使う最大フレーム数。0で無効')
+    parser.add_argument('--train_subtree_full_cloud_prob', default=0.03, type=float, help='subtree subset学習時に確率的にfull-cloud anchorへ切り替える確率')
+    parser.add_argument('--train_patch_subset_sampling', default='coverage_cycle', type=str, help='subtree subset学習の選択方法(coverage_cycle)')
+    parser.add_argument('--num_workers', default=4, type=int, help='データローダのワーカー数')
+    parser.add_argument('--pin_memory', default=True, type=str2bool, help='CPU→GPU転送高速化のためメモリ固定するか')
+    parser.add_argument('--persistent_workers', default=True, type=str2bool, help='ワーカーを維持するか')
+    parser.add_argument('--dataset_cache', default=False, type=str2bool, help='データセットをメモリにキャッシュするか')
+    parser.add_argument('--dataset_cache_max_entries', default=64, type=int, help='PLY生点群LRUキャッシュの最大件数')
+    parser.add_argument('--dataset_cache_max_memory_mb', default=1024, type=int, help='PLY生点群LRUキャッシュのCPUメモリ上限(MB)')
+    parser.add_argument('--episode_input_common_cache', default=True, type=str2bool, help='同じ入力データをEpisodeごとに繰り返すとき、入力依存の共通前処理をCPUキャッシュして再利用するか')
+    parser.add_argument('--episode_input_common_cache_enable_dataset_cache', default=True, type=str2bool, help='episode_input_common_cache=True時にPLY dataset_cacheも自動で有効化するか')
+    parser.add_argument('--episode_input_common_cache_max_entries', default=0, type=int, help='Episode共通前処理キャッシュの最大件数(0なら学習ファイル数まで自動設定)')
+    parser.add_argument('--episode_input_common_cache_max_memory_mb', default=512, type=int, help='Episode共通前処理キャッシュのCPUメモリ上限(MB, 0で無制限)')
+    parser.add_argument('--streaming_cache_auto_policy', default=True, type=str2bool, help='巡回frame数がRAM LRU容量を超えるときhit=0の巨大RAM cacheを自動停止し、固定Tensor disk cacheを使う')
+    parser.add_argument('--streaming_cache_hot_entries', default=4, type=int, help='巡回学習時にCPUへ残す固定Tensorの直近frame数')
+    parser.add_argument('--ply_loader', default='numpy', type=str, help='PLY読み込み方法(numpy/open3d/auto)')
+    parser.add_argument('--mp_start_method', default='auto', type=str, help='マルチプロセス起動方法')
+    parser.add_argument('--weight_decay', default=0, type=float, help='重み減衰')
+    parser.add_argument('--bptt', default=1024, type=float, help='（内部用パラメータ）')
+    parser.add_argument('--module_bn_use_running_stats', default=False, type=str2bool, help='Encoder以外のBatchNormでrunning statsを使うか')
+    parser.add_argument('--use_tf32', default=True, type=str2bool, help='TF32を使用するか')
+    parser.add_argument('--use_amp', default=True, type=str2bool, help='混合精度学習を使うか')
+    parser.add_argument('--amp_dtype', default='auto', type=str, help='AMPのデータ型')
+    parser.add_argument('--full_cloud_activation_checkpoint', default=False, type=str2bool, help='full-cloud headの中間activationをbackward時に再計算して単一StepのGPU peakを削減する。追加計算とPyTorch 1.11でのStep間activation残留を避けるため既定はFalse')
+    parser.add_argument('--full_cloud_head_chunk_size', default=131072, type=int, help='点単位full-cloud headを厳密分割する最大点数（0で無効、小さいほどforwardピークGPUメモリを削減）')
+    parser.add_argument(
+        '--full_cloud_saved_tensor_cpu_offload_mb',
+        default=0.0,
+        type=float,
+        help='full-cloud backward用saved Tensorを可逆CPU退避する最小サイズMB（0で無効）。PyTorch 1.11では長時間実行時にCPU allocatorが増え続けるため既定は無効',
+    )
+    parser.add_argument('--full_cloud_saved_tensor_pin_memory', default=False, type=str2bool, help='save_on_cpu退避をpinned memoryに置くか。長時間学習では共有メモリ増加を避けるため既定False')
+    parser.add_argument('--training_allocator_cleanup_interval', default=100, type=int, help='saved-tensor offload無効時にgc/malloc_trim/CUDA empty_cacheを実行するStep間隔（0で定期実行なし）')
+    parser.add_argument('--structure_neighbor_query_chunk', default=32768, type=int, help='26近傍occupancyを完全一致のまま分割検索する点数（小さいほど一時GPUメモリを削減）')
+    parser.add_argument('--structure_fixed_cache_max_entries', default=64, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ最大件数')
+    parser.add_argument('--structure_fixed_cache_max_memory_mb', default=1024, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ上限(MB)')
+    parser.add_argument('--structure_fixed_disk_cache', default=True, type=str2bool, help='固定GTの26近傍・parent分割Tensorをfingerprint付きでディスクへ保存する')
+    parser.add_argument('--structure_fixed_disk_cache_dir', default='', type=str, help='固定Octree Tensorの保存先。空ならden6 online cache配下')
+    parser.add_argument('--den6_online_release_cuda_cache_before_actuator', default=True, type=str2bool, help='構造解析終了後に不要となったCUDA検索workspace cacheをActuator前に返却する')
+    parser.add_argument('--den6_online_release_cuda_cache_before_actual', default=True, type=str2bool, help='ana_den6_onlineの実圧縮worker起動直前に未使用CUDA allocator cacheだけを返却し、2プロセス重複時のGPU使用量を抑える')
+    parser.add_argument('--amp_init_scale', default=1.0, type=float, help='GradScaler初期値')
+    parser.add_argument('--amp_overflow_patience', default=2, type=int, help='オーバーフロー許容回数')
+    parser.add_argument('--cache_frozen_inputs', default=True, type=str2bool, help='Encoder出力をキャッシュするか')
+    parser.add_argument('--cache_gt_loss', default=True, type=str2bool, help='GT側損失をキャッシュするか')
+    parser.add_argument('--cache_max_entries', default=64, type=int, help='キャッシュ最大数')
+    parser.add_argument('--cache_max_memory_mb', default=512, type=int, help='固定Node CPUキャッシュ最大メモリ（MB）')
+    parser.add_argument(
+        '--static_node_cache_cpu',
+        default=True,
+        type=str2bool,
+        help='固定Node/Voxel入力をFP32のままCPUへ保持し、使用frameだけGPUへ戻す',
+    )
+    parser.add_argument('--auto_disable_partial_frozen_cache', default=True, type=str2bool, help='キャッシュ不足時に自動無効化するか')
+    parser.add_argument('--clear_main_ply_cache_for_workers', default=True, type=str2bool, help='メモリ重複を防ぐためキャッシュ削除')
+    parser.add_argument('--warmup_frozen_cache', default=False, type=str2bool, help='事前にキャッシュを作るか')
+    parser.add_argument('--warmup_gt_cache', default=False, type=str2bool, help='GTキャッシュを事前生成するか')
+    parser.add_argument('--warmup_max_files', default=0, type=int, help='ウォームアップ対象ファイル数')
+    parser.add_argument('--warmup_max_seconds', default=0, type=float, help='ウォームアップ最大時間')
+    parser.add_argument('--warmup_log_rate', default=8, type=int, help='ウォームアップログ間隔')
+    parser.add_argument('--log_flush_every', default=32, type=int, help='ログ書き込みフラッシュ間隔')
+    parser.add_argument('--log_sync_every', default=0, type=int, help='ログ同期間隔')
+    parser.add_argument('--verbose_step_logs', default=False, type=str2bool, help='詳細ログを出すか。通常学習ではGPU同期と大量I/Oを避けるため既定False')
+    parser.add_argument('--compact_step_text_log', default=True, type=str2bool, help='train.txtのStep本文ログを要点だけの短い行へ絞る')
+    parser.add_argument('--network_only_audit_verbose', default=False, type=str2bool, help='Network-only監査の全Tensor辞書を本文へ出すか。counter検証とCSV/図には影響しない')
+    parser.add_argument('--network_only_head_audit_interval', default=10, type=int, help='Network-only head更新normを計測するStep間隔')
+    parser.add_argument('--full_cloud_empty_cache_threshold_mb', default=8192.0, type=float, help='backward前にCUDA allocator cacheを返すmain process reserved memory閾値')
+    parser.add_argument('--plot_max_points', default=512, type=int, help='1枚のグラフに描画する最大点数（超過時は等間隔に間引く）')
+    parser.add_argument('--plot_skip_outlier_steps', default=True, type=str2bool, help='Trueなら極端に大きいstep値をプロット履歴から除外する')
+    parser.add_argument('--plot_outlier_abs_threshold', default=1e6, type=float, help='この絶対値を超えるstep値をプロットから除外する閾値（0以下で無効）')
+    parser.add_argument('--plot_outlier_rel_factor', default=100.0, type=float, help='直近履歴の中央値に対する倍率閾値（0以下で無効）')
+    parser.add_argument('--plot_outlier_min_history', default=4, type=int, help='相対外れ値判定を始めるまでに必要な履歴数')
+    parser.add_argument('--plot_outlier_history_window', default=64, type=int, help='相対外れ値判定で参照する直近履歴数（0で全履歴）')
+    parser.add_argument('--plot_outlier_min_scale', default=1.0, type=float, help='相対外れ値判定で使う中央値の下限値')
+    parser.add_argument('--plot_ylim_margin_ratio', default=0.15, type=float, help='loss図の観測済み最小・最大へ加える縦軸余白（観測幅に対する片側比率）')
+    parser.add_argument('--plot_ylim_min_margin', default=1e-3, type=float, help='loss図の縦軸に確保する片側の最小絶対余白')
+    parser.add_argument('--plot_ylim_update_interval', default=5, type=int, help='Episode loss図の縦軸を再計算するEpisode間隔（範囲外の新値は即時拡張）')
+    parser.add_argument('--retain_debug_tensors', default=False, type=str2bool, help='中間勾配を保持するか')
+    parser.add_argument('--debug_grad_flow', default=False, type=str2bool, help='勾配ノルムをログ出力するか')
+    parser.add_argument('--debug_grad_flow_rate', default=1, type=int, help='勾配ログの出力間隔')
+    parser.add_argument('--train_grad_clip', default=0.0, type=float, help='学習時の勾配クリップ値（0で無効）')
+    parser.add_argument('--skip_optimizer_on_nonfinite_grad', default=True, type=str2bool, help='Lossが有限でも勾配にNaN/Infがあるstepはoptimizer更新をスキップする')
+    parser.add_argument('--nonfinite_grad_log_param_limit', default=8, type=int, help='非有限勾配を検出したときにログへ出すパラメータ名の最大数')
+    parser.add_argument('--debug_timing', default=False, type=str2bool, help='ステップ内の時間内訳をログ出力するか')
+    parser.add_argument('--sparsepcgc_hard_debug_interval', default=0, type=int, help='SparsePCGCの重いhard統計を何Stepごとに収集するか(0で無効)')
+    parser.add_argument('--sparsepcgc_hard_debug_on_log', default=False, type=str2bool, help='Trueなら通常Stepログ時にもSparsePCGC hard統計を収集する')
+    parser.add_argument('--mail_notify', default=False, type=str2bool, help='学習イベントをメール通知するか')
+    parser.add_argument('--mail_to', default='maeshu0619@gmail.com', type=str, help='通知メールの宛先')
+    parser.add_argument('--mail_from', default='maeshu0619@gmail.com', type=str, help='通知メールの送信元')
+    parser.add_argument('--mail_smtp_host', default='smtp.gmail.com', type=str, help='SMTPホスト。空ならsendmailを試す')
+    parser.add_argument('--mail_smtp_port', default=587, type=int, help='SMTPポート')
+    parser.add_argument('--mail_smtp_user', default='', type=str, help='SMTPユーザ')
+    parser.add_argument('--mail_smtp_password_env', default='MYNET_MAIL_PASSWORD', type=str, help='SMTPパスワードを読む環境変数名')
+    parser.add_argument('--mail_use_tls', default=True, type=str2bool, help='SMTP STARTTLSを使うか')
+    parser.add_argument('--mail_timeout', default=10.0, type=float, help='メール送信タイムアウト秒')
+    parser.add_argument('--mail_sendmail_path', default='/usr/sbin/sendmail', type=str, help='sendmailコマンドのパス')
+
+    args = parser.parse_args()
+    args.train_all_datasets = bool(getattr(args, "train_all_datasets", False))
+    raw_all_dataset_names = str(
+        getattr(args, "train_all_dataset_names", "8i,MVUB,UVG")
+    ).split(",")
+    canonical_dataset_names = {"8i": "8i", "mvub": "MVUB", "uvg": "UVG"}
+    normalized_dataset_names = []
+    for raw_name in raw_all_dataset_names:
+        key = raw_name.strip().lower()
+        if not key:
+            continue
+        if key not in canonical_dataset_names:
+            raise ValueError(
+                "--train_all_dataset_namesは8i,MVUB,UVGのみ指定できる: "
+                f"{raw_name}"
+            )
+        canonical_name = canonical_dataset_names[key]
+        if canonical_name not in normalized_dataset_names:
+            normalized_dataset_names.append(canonical_name)
+    if args.train_all_datasets and not normalized_dataset_names:
+        raise ValueError("--train_all_datasets=Trueだが対象datasetが空である")
+    args.train_all_dataset_names = tuple(normalized_dataset_names)
+    if args.train_all_datasets:
+        # model初期化もEpisode内の最初のdataset条件へ合わせる。
+        args.dataname = args.train_all_dataset_names[0]
+    # ============================================================
+    # Phase5:
+    # 構造経路監査設定の正規化
+    # ============================================================
+    args.phase5_structure_guard = bool(
+        getattr(args, "phase5_structure_guard", True)
+    )
+    args.phase5_structure_guard_raise = bool(
+        getattr(args, "phase5_structure_guard_raise", True)
+    )
+    args.phase5_forbid_local_recompute = bool(
+        getattr(args, "phase5_forbid_local_recompute", True)
+    )
+    args.phase5_warn_unit_collapse = bool(
+        getattr(args, "phase5_warn_unit_collapse", True)
+    )
+    args.phase5_guard_unit_collapse_as_error = bool(
+        getattr(args, "phase5_guard_unit_collapse_as_error", False)
+    )
+    # more_training=True のときに読む追加学習用checkpointパスを確定する
+    # グローバル設定値をログで確認しやすいようにargsへ保存する
+    args.method_com = _compress_display_name(args.compress)
+    args.model_name = model_name
+    # pretrained_*はCLI既定が空文字なので、more_training pathを組み立てる前に
+    # 現在選択中のmodel日時へ正規化する。後段だけで補完すると空ディレクトリを
+    # 指したままtrain.pyが開始前に失敗する。
+    args.pretrained_date = (
+        str(getattr(args, "pretrained_date", pretrained_date)).strip()
+        or str(model_date).strip()
+    )
+    args.pretrained_time = (
+        str(getattr(args, "pretrained_time", pretrained_time)).strip()
+        or str(model_time).strip()
+    )
+    if bool(getattr(args, "more_training", False)):
+        if not str(getattr(args, "more_training_ckpt", "")).strip():
+            args.more_training_ckpt = _pretrained_checkpoint_path(
+                args.pretrained_date,
+                args.pretrained_time,
+                args.compress,
+                model_stem=model_name,
+            )
+        else:
+            args.more_training_ckpt = str(Path(os.path.expanduser(args.more_training_ckpt)).resolve())
+    else:
+        args.more_training_ckpt = ""
+
+    # ============================================================
+    # Phase5:
+    # 構造経路監査設定の正規化
+    # ============================================================
+    args.phase5_structure_guard = bool(
+        getattr(args, "phase5_structure_guard", True)
+    )
+    args.phase5_structure_guard_raise = bool(
+        getattr(args, "phase5_structure_guard_raise", True)
+    )
+    args.phase5_forbid_local_recompute = bool(
+        getattr(args, "phase5_forbid_local_recompute", True)
+    )
+    args.phase5_warn_unit_collapse = bool(
+        getattr(args, "phase5_warn_unit_collapse", True)
+    )
+
+    args.repair_operation_amount_logit_weight = max(float(getattr(args, "repair_operation_amount_logit_weight", 0.05)), 0.0)
+    args.repair_operation_amount_logit_scale = max(float(getattr(args, "repair_operation_amount_logit_scale", 6.0)), 1e-6)
+    args.repair_operation_amount_target_prob_max = min(
+        max(float(getattr(args, "repair_operation_amount_target_prob_max", 0.98)), 0.50),
+        1.0 - 1e-4,
+    )
+    args.grad_scale_prune_where_compression = max(
+        float(getattr(args, "grad_scale_prune_where_compression", 0.17)),
+        0.0,
+    )
+    args.grad_scale_prune_where_actuator = max(
+        float(getattr(args, "grad_scale_prune_where_actuator", 1.0)),
+        0.0,
+    )
+    args.grad_scale_operation_amount = max(
+        float(getattr(args, "grad_scale_operation_amount", 200.0)),
+        0.0,
+    )
+    args.grad_scale_prune_where_head = max(
+        float(getattr(args, "grad_scale_prune_where_head", 1.0 / 6.0)),
+        0.0,
+    )
+    args.w_com = max(float(getattr(args, "w_com", 10.0)), 0.0)
+    args.repair_drop_where_actuator_weight = max(float(getattr(args, "repair_drop_where_actuator_weight", 0.1)), 0.0)
+    args.repair_add_where_actuator_weight = max(float(getattr(args, "repair_add_where_actuator_weight", 0.3)), 0.0)
+    args.repair_move_where_actuator_weight = max(float(getattr(args, "repair_move_where_actuator_weight", 0.3)), 0.0)
+    args.repair_operation_gate_oracle_weight = max(float(getattr(args, "repair_operation_gate_oracle_weight", 0.1)), 0.0)
+    args.repair_where_downstream_grad_min_scale = max(
+        float(getattr(args, "repair_where_downstream_grad_min_scale", 0.05)),
+        1e-4,
+    )
+    args.repair_where_downstream_grad_max_scale = max(
+        float(getattr(args, "repair_where_downstream_grad_max_scale", 8.0)),
+        args.repair_where_downstream_grad_min_scale,
+    )
+
+    args.repair_where_downstream_grad_scale = min(
+        max(
+            float(getattr(args, "repair_where_downstream_grad_scale", 1.0)),
+            args.repair_where_downstream_grad_min_scale,
+        ),
+        args.repair_where_downstream_grad_max_scale,
+    )
+    args.repair_drop_where_downstream_grad_scale = min(
+        max(
+            float(getattr(args, "repair_drop_where_downstream_grad_scale", args.repair_where_downstream_grad_scale)),
+            args.repair_where_downstream_grad_min_scale,
+        ),
+        args.repair_where_downstream_grad_max_scale,
+    )
+    args.repair_add_where_downstream_grad_scale = min(
+        max(
+            float(getattr(args, "repair_add_where_downstream_grad_scale", args.repair_where_downstream_grad_scale)),
+            args.repair_where_downstream_grad_min_scale,
+        ),
+        args.repair_where_downstream_grad_max_scale,
+    )
+    args.repair_move_where_downstream_grad_scale = min(
+        max(
+            float(getattr(args, "repair_move_where_downstream_grad_scale", args.repair_where_downstream_grad_scale)),
+            args.repair_where_downstream_grad_min_scale,
+        ),
+        args.repair_where_downstream_grad_max_scale,
+    )
+
+    def _scale_if_not_cli(option_name: str, attr_name: str, multiplier: float):
+        if not _cli_option_was_provided(option_name):
+            setattr(args, attr_name, float(getattr(args, attr_name)) * float(multiplier))
+
+    # 勾配数値: prune_where compression side
+    _scale_if_not_cli(
+        "--compression_soft_prune_node_grad_weight",
+        "compression_soft_prune_node_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_single_grad_weight",
+        "compression_soft_prune_single_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_bit_grad_weight",
+        "compression_soft_prune_bit_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_rate_prune_weight",
+        "compression_soft_rate_prune_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_rate_proxy_grad_weight",
+        "compression_soft_rate_proxy_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_rate_proxy_grad_weight",
+        "compression_soft_prune_rate_proxy_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_where_proxy_grad_weight",
+        "compression_soft_prune_where_proxy_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_logit_direct_grad_weight",
+        "compression_soft_prune_logit_direct_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_direct_grad_weight",
+        "compression_soft_prune_direct_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+
+    # 勾配数値: prune_where actuator side
+    _scale_if_not_cli(
+        "--repair_prune_where_ste_grad_scale",
+        "repair_prune_where_ste_grad_scale",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_prune_where_direct_grad_scale",
+        "repair_prune_where_direct_grad_scale",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_where_proxy_raw_grad_eps",
+        "repair_drop_where_proxy_raw_grad_eps",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_where_actuator_weight",
+        "repair_drop_where_actuator_weight",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_add_where_actuator_weight",
+        "repair_add_where_actuator_weight",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_move_where_actuator_weight",
+        "repair_move_where_actuator_weight",
+        args.grad_scale_prune_where_actuator,
+    )
+
+    # 勾配数値: operation amount
+    _scale_if_not_cli(
+        "--repair_amount_downstream_grad_scale",
+        "repair_amount_downstream_grad_scale",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_amount_downstream_grad_scale",
+        "repair_drop_amount_downstream_grad_scale",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_add_amount_downstream_grad_scale",
+        "repair_add_amount_downstream_grad_scale",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_move_amount_downstream_grad_scale",
+        "repair_move_amount_downstream_grad_scale",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_operation_amount_logit_weight",
+        "repair_operation_amount_logit_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_operation_amount_consistency_weight",
+        "repair_operation_amount_consistency_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_operation_amount_direct_weight",
+        "repair_operation_amount_direct_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_amount_supervision_weight",
+        "repair_drop_amount_supervision_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_amount_soft_consistency_weight",
+        "repair_drop_amount_soft_consistency_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_move_amount_supervision_weight",
+        "repair_move_amount_supervision_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_move_amount_soft_consistency_weight",
+        "repair_move_amount_soft_consistency_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_add_amount_supervision_weight",
+        "repair_add_amount_supervision_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_add_amount_soft_consistency_weight",
+        "repair_add_amount_soft_consistency_weight",
+        args.grad_scale_operation_amount,
+    )
+
+    args._add_cli_provided = _cli_option_was_provided("--add")
+    args._use_amp_cli_provided = _cli_option_was_provided("--use_amp")
+    if not _cli_option_was_provided("--input_dir_test"):
+        args.input_dir_test = str(_data_subset_dir("ground", args.dataname, args.dataset_name))
+    if not _cli_option_was_provided("--save_ply_dir"):
+        args.save_ply_dir = str(_data_subset_dir("test", args.dataname, args.dataset_name).resolve())
+    if getattr(args, "checkpoint", None):
+        args.ckpt = args.checkpoint
+    if getattr(args, "data_dir", None):
+        args.input_dir_test = args.data_dir
+    if getattr(args, "output_dir", None):
+        args.save_ply_dir = args.output_dir
+    if getattr(args, "save_output_points", None) is not None:
+        args.save_test_ply = bool(args.save_output_points)
+    if getattr(args, "output_log", None) is None:
+        args.output_log = str((_LOG_ROOT / args.date / "MyNetwork_test" / "profile" / f"{args.time}.csv").resolve())
+
+    args.octree_ctx_dim = max(int(args.octree_ctx_dim), 1)
+    if _cli_option_was_provided("--w_prun") and not _cli_option_was_provided("--w_attr"):
+        args.w_attr = float(args.w_prun)
+    if _cli_option_was_provided("--w_add") and not _cli_option_was_provided("--w_policy"):
+        args.w_policy = float(args.w_add)
+    if _cli_option_was_provided("--w_dis") and not _cli_option_was_provided("--w_actuator"):
+        args.w_actuator = float(args.w_dis)
+    args.compression_loss_delta = bool(getattr(args, "compression_loss_delta", True))
+    args.minimal_loss_objective = bool(getattr(args, "minimal_loss_objective", True))
+    args.direct_octree_structure_targets = bool(
+        getattr(args, "direct_octree_structure_targets", True)
+    )
+    args.geometry_fit_weight = max(float(getattr(args, "geometry_fit_weight", 0.05)), 0.0)
+    args.geometry_fit_normal_radius = min(max(
+        int(getattr(args, "geometry_fit_normal_radius", 2)), 1
+    ), 4)
+    args.geometry_fit_min_neighbors = max(
+        int(getattr(args, "geometry_fit_min_neighbors", 3)), 3
+    )
+    args.geometry_use_d2 = bool(getattr(args, "geometry_use_d2", False))
+    args.w_attr = float(args.w_attr)
+    args.w_policy = float(args.w_policy)
+    if args.direct_octree_structure_targets:
+        # cause_targetsは入力Octreeだけから訓練・推論の両方で同じ値を計算できる。
+        # 同じ値を近似する補助headを主損失へ残さない。
+        args.loss_attr_scale = 0.0
+        args.loss_policy_scale = 0.0
+        args.w_attr = 0.0
+        args.w_policy = 0.0
+    args.w_actuator = float(args.w_actuator)
+    args.w_prun = args.w_attr
+    args.w_add = args.w_policy
+    args.w_dis = args.w_actuator
+    args.w_repair = args.w_actuator
+
+    args.loss_mode = str(getattr(args, "loss_mode", "legacy_total")).strip().lower()
+    if args.loss_mode not in {"legacy_total", "compression_primary"}:
+        raise ValueError("--loss_mode must be legacy_total or compression_primary")
+    args.compression_primary_warmup_steps = max(
+        int(getattr(args, "compression_primary_warmup_steps", 0)),
+        0,
+    )
+    for _name in (
+        "cp_lambda_geom",
+        "cp_lambda_single",
+        "cp_lambda_nodes",
+        "cp_lambda_actuator",
+        "cp_lambda_sparsepcgc",
+        "cp_lambda_op",
+    ):
+        setattr(args, _name, max(float(getattr(args, _name, 0.0)), 0.0))
+    for _name in (
+        "cp_tau_geom",
+        "cp_tau_single",
+        "cp_tau_nodes",
+        "cp_tau_actuator",
+        "cp_tau_sparsepcgc",
+    ):
+        setattr(args, _name, float(getattr(args, _name, 0.0)))
+    for _name in (
+        "compression_primary_aux_target_ratio",
+        "compression_primary_aux_balance_min_scale",
+        "compression_primary_aux_balance_max_scale",
+        "compression_primary_tail_target_ratio",
+        "compression_primary_tail_balance_min_scale",
+        "compression_primary_tail_balance_max_scale",
+        "compression_primary_total_support_target_ratio",
+    ):
+        setattr(args, _name, max(float(getattr(args, _name, 0.0)), 0.0))
+    args.compression_primary_aux_balance_max_scale = max(
+        float(getattr(args, "compression_primary_aux_balance_max_scale", 1.0)),
+        float(getattr(args, "compression_primary_aux_balance_min_scale", 0.0)),
+    )
+    args.compression_primary_tail_balance_max_scale = max(
+        float(getattr(args, "compression_primary_tail_balance_max_scale", 1.0)),
+        float(getattr(args, "compression_primary_tail_balance_min_scale", 0.0)),
+    )
+    args.cp_use_stage_factors = bool(getattr(args, "cp_use_stage_factors", False))
+    args.cp_force_joint_actuator = bool(getattr(args, "cp_force_joint_actuator", True))
+    args.cp_log_grad_terms = bool(getattr(args, "cp_log_grad_terms", True))
+
+    stage = str(args.training_stage).strip().lower()
+    if stage not in {"diagnosis", "joint"}:
+        raise ValueError(f"--training_stage must be diagnosis or joint (got {args.training_stage})")
+    args.training_stage = stage
+    args.diagnosis_episode_ratio = min(max(float(args.diagnosis_episode_ratio), 0.0), 1.0)
+    args.diagnosis_episodes = max(int(args.diagnosis_episodes), 0)
+
+    mode_alias = {
+        "hard_ste": "ste_hard",
+        "soft": "weighted_soft",
+        "legacy": "weighted_soft",
+    }
+    discrete_loss_mode = str(args.discrete_loss_mode).strip().lower()
+    args.discrete_loss_mode = mode_alias.get(discrete_loss_mode, discrete_loss_mode)
+    if args.discrete_loss_mode not in {"ste_hard", "hard", "weighted_soft"}:
+        raise ValueError(
+            "--discrete_loss_mode must be one of: ste_hard, hard, weighted_soft "
+            f"(got {args.discrete_loss_mode})"
+        )
+
+    args.compression_rate_metric = str(args.compression_rate_metric).strip().lower()
+    if args.compression_rate_metric not in {"total_bits", "bits_per_point", "bits_per_input_point"}:
+        raise ValueError(
+            "--compression_rate_metric must be one of: total_bits, bits_per_point, "
+            f"bits_per_input_point (got {args.compression_rate_metric})"
+        )
+
+    args.compress = str(args.compress).strip()
+    compress_key = _compress_key(args.compress)
+    if compress_key == "sparsepcgc":
+        args.compress = "SparsePCGC"
+    elif compress_key == "gpcc":
+        args.compress = "G-PCC"
+    elif compress_key == "octattention":
+        args.compress = "OctAttention"
+
+    args.compression_loss_backend = str(args.compression_loss_backend).strip().lower()
+    if compress_key in {"gpcc", "octattention"} and not _cli_option_was_provided("--compression_loss_backend"):
+        args.compression_loss_backend = compress_key + "_surrogate"
+    if bool(args.surrogate):
+        if compress_key == "sparsepcgc":
+            args.compression_loss_backend = "sparsepcgc_surrogate"
+        elif compress_key == "gpcc":
+            args.compression_loss_backend = "gpcc_surrogate"
+        elif compress_key == "draco":
+            args.compression_loss_backend = "draco_surrogate"
+        elif compress_key == "octattention":
+            args.compression_loss_backend = "octattention_surrogate"
+        else:
+            raise ValueError(
+                "--surrogate=True currently supports --compress OctAttention, SparsePCGC, or G-PCC "
+                f"(got {args.compress})"
+            )
+    # ana_den6と同じm代表設定を実圧縮teacherへ固定する。
+    # native bit depth=10, AE=0, m=8ならSR=2となる。
+    args.sparsepcgc_scale_m = int(getattr(args, "sparsepcgc_scale_m", 8))
+    args.sparsepcgc_scale_ae = int(getattr(args, "sparsepcgc_scale_ae", 0))
+    requested_native_bit_depth = int(getattr(args, "sparsepcgc_native_bit_depth", 0))
+    dataset_key_for_m = str(getattr(args, "dataname", "8i")).strip().lower()
+    if requested_native_bit_depth <= 0:
+        # den6の実測設定に合わせ、UVGは9-bit、8i/MVUBは10-bitを使う。
+        requested_native_bit_depth = 9 if dataset_key_for_m == "uvg" else 10
+    args.sparsepcgc_native_bit_depth = max(requested_native_bit_depth, 1)
+    if not _cli_option_was_provided("--sparsepcgc_psnr_resolution"):
+        args.sparsepcgc_psnr_resolution = 511 if dataset_key_for_m == "uvg" else 1023
+    derived_sparsepcgc_scale_sr = (
+        args.sparsepcgc_native_bit_depth
+        - args.sparsepcgc_scale_m
+        - args.sparsepcgc_scale_ae
+    )
+    requested_sparsepcgc_scale_sr = getattr(args, "sparsepcgc_scale_sr", None)
+    sparsepcgc_scale_sr = (
+        derived_sparsepcgc_scale_sr
+        if requested_sparsepcgc_scale_sr is None
+        else int(requested_sparsepcgc_scale_sr)
+    )
+    if sparsepcgc_scale_sr < 0:
+        raise ValueError(
+            "SparsePCGC dense lossy設定が不正である: "
+            f"bit_depth={args.sparsepcgc_native_bit_depth}, AE={args.sparsepcgc_scale_ae}, "
+            f"SR={sparsepcgc_scale_sr}, m={args.sparsepcgc_scale_m}"
+        )
+    if sparsepcgc_scale_sr != derived_sparsepcgc_scale_sr:
+        raise ValueError(
+            "SparsePCGC dense lossy設定のscaleが不整合である: "
+            f"AE({args.sparsepcgc_scale_ae})+SR({sparsepcgc_scale_sr})"
+            f"+m({args.sparsepcgc_scale_m})="
+            f"{args.sparsepcgc_scale_ae + sparsepcgc_scale_sr + args.sparsepcgc_scale_m}, "
+            f"native_bit_depth={args.sparsepcgc_native_bit_depth}"
+        )
+    args.sparsepcgc_scale_sr = int(sparsepcgc_scale_sr)
+    if not _cli_option_was_provided("--sparsepcgc_dense_scale_ae_list"):
+        args.sparsepcgc_dense_scale_ae_list = str(args.sparsepcgc_scale_ae)
+    if not _cli_option_was_provided("--sparsepcgc_dense_scale_sr_list"):
+        args.sparsepcgc_dense_scale_sr_list = str(args.sparsepcgc_scale_sr)
+    args.heuristic_guidance_enabled = bool(getattr(args, "heuristic_guidance_enabled", True))
+    args.heuristic_guidance_network_only_inference = bool(
+        getattr(args, "heuristic_guidance_network_only_inference", False)
+    )
+    args.heuristic_guidance_mode = str(
+        getattr(args, "heuristic_guidance_mode", "ana_den6_online")
+    ).strip().lower()
+    valid_guidance_modes = {
+        "single_plan_student",
+        "network_k_proposal_policy",
+        "network_only_codec_policy",
+        "proxy_prior",
+        "ana_den6_online",
+        "ana_den6_residual",
+        "ana_den6_reproduce",
+        "ana_den6_reference_ply",
+    }
+    if args.heuristic_guidance_mode not in valid_guidance_modes:
+        raise ValueError(f"未知のheuristic_guidance_mode: {args.heuristic_guidance_mode}")
+    args.single_plan_student_hidden_dim = max(
+        int(getattr(args, "single_plan_student_hidden_dim", 48)), 16
+    )
+    args.single_plan_local_tile_size = max(
+        int(getattr(args, "single_plan_local_tile_size", 0)), 0
+    )
+    args.single_plan_training_stage = str(
+        getattr(args, "single_plan_training_stage", "actual_calibration")
+    ).strip().lower()
+    args.single_plan_amount_learning_enabled = bool(
+        getattr(args, "single_plan_amount_learning_enabled", False)
+    )
+    args.single_plan_fixed_total_ratio = min(max(
+        float(getattr(args, "single_plan_fixed_total_ratio", 0.0025)), 1e-6
+    ), 0.0099)
+    fixed_shares = [
+        max(float(getattr(args, "single_plan_fixed_prune_share", 0.40)), 0.0),
+        max(float(getattr(args, "single_plan_fixed_add_share", 0.40)), 0.0),
+        max(float(getattr(args, "single_plan_fixed_adjust_share", 0.20)), 0.0),
+    ]
+    fixed_share_sum = max(sum(fixed_shares), 1e-12)
+    (
+        args.single_plan_fixed_prune_share,
+        args.single_plan_fixed_add_share,
+        args.single_plan_fixed_adjust_share,
+    ) = tuple(value / fixed_share_sum for value in fixed_shares)
+    if (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "single_plan_student"
+        and args.single_plan_training_stage == "representation"
+        and bool(getattr(args, "single_plan_stage1_train_encoder", True))
+    ):
+        args.encoder_0grad = False
+        args.single_plan_student_unfreeze_upstream = True
+    args.single_plan_student_max_total_ratio = min(max(
+        float(getattr(args, "single_plan_student_max_total_ratio", 0.0099)), 1e-5
+    ), 0.0099)
+    args.single_plan_distillation_weight = max(
+        float(getattr(args, "single_plan_distillation_weight", 1.0)), 0.0
+    )
+    args.single_plan_shadow_target_ratio = max(
+        float(getattr(args, "single_plan_shadow_target_ratio", 0.10)), 0.0
+    )
+    args.single_plan_shadow_balance_min_scale = min(max(
+        float(getattr(args, "single_plan_shadow_balance_min_scale", 0.01)), 0.0
+    ), 1.0)
+    args.single_plan_shadow_balance_max_scale = min(max(
+        float(getattr(args, "single_plan_shadow_balance_max_scale", 1.0)),
+        args.single_plan_shadow_balance_min_scale,
+    ), 1.0)
+    args.single_plan_shadow_distillation = bool(
+        getattr(args, "single_plan_shadow_distillation", True)
+    )
+    args.test_force_single_plan_student = bool(
+        getattr(args, "test_force_single_plan_student", True)
+    )
+    args.test_require_trained_single_plan_student = bool(
+        getattr(args, "test_require_trained_single_plan_student", True)
+    )
+    args.single_plan_policy_gradient_weight = max(
+        float(getattr(args, "single_plan_policy_gradient_weight", 0.0)), 0.0
+    )
+    args.network_only_policy_hidden_dim = max(
+        int(getattr(args, "network_only_policy_hidden_dim", 48)), 16
+    )
+    args.network_k_proposal_count = min(max(
+        int(getattr(args, "network_k_proposal_count", 8)), 2
+    ), 16)
+    args.network_k_proposal_hidden_dim = max(
+        int(getattr(args, "network_k_proposal_hidden_dim", 48)), 16
+    )
+    args.network_k_proposal_shortlist_size = max(
+        int(getattr(args, "network_k_proposal_shortlist_size", 32768)), 256
+    )
+    args.network_k_actor_lr_scale = max(
+        float(getattr(args, "network_k_actor_lr_scale", 0.1)), 1e-4
+    )
+    args.network_k_critic_lr_scale = max(
+        float(getattr(args, "network_k_critic_lr_scale", 1.0)), 1e-4
+    )
+    args.network_k_target_domain = str(
+        getattr(args, "network_k_target_domain", "neighbor26_empty")
+    ).strip().lower()
+    if args.network_k_target_domain not in {"neighbor26_empty", "child_slot"}:
+        raise ValueError("network_k_target_domain must be neighbor26_empty/child_slot")
+    ratio_text = str(getattr(
+        args, "network_k_ratio_values", "0.0005,0.0010,0.0025,0.0050,0.0100"
+    ))
+    args.network_k_ratio_values = tuple(
+        sorted({float(value.strip()) for value in ratio_text.split(",") if value.strip()})
+    )
+    if not args.network_k_ratio_values or any(
+        value <= 0.0 or value > 0.05 for value in args.network_k_ratio_values
+    ):
+        raise ValueError("network_k_ratio_values must contain positive ratios <= 0.05")
+    args.network_k_share_lattice_step = min(max(
+        float(getattr(args, "network_k_share_lattice_step", 0.05)), 0.0
+    ), 0.5)
+    args.network_k_critic_lambda_geometry = max(
+        float(getattr(args, "network_k_critic_lambda_geometry", 1.0)), 0.0
+    )
+    args.network_k_critic_lambda_uncertainty = max(
+        float(getattr(args, "network_k_critic_lambda_uncertainty", 0.05)), 0.0
+    )
+    args.network_k_critic_gain_scale = max(
+        float(getattr(args, "network_k_critic_gain_scale", 5.0)), 1e-6
+    )
+    args.network_k_critic_geometry_scale = max(
+        float(getattr(args, "network_k_critic_geometry_scale", 1.0)), 1e-6
+    )
+    args.network_k_critic_huber_beta = max(
+        float(getattr(args, "network_k_critic_huber_beta", 0.05)), 1e-4
+    )
+    args.network_k_critic_sign_loss_weight = max(
+        float(getattr(args, "network_k_critic_sign_loss_weight", 0.25)), 0.0
+    )
+    args.network_k_critic_improvement_sign_weight = max(
+        float(getattr(args, "network_k_critic_improvement_sign_weight", 4.0)), 1.0
+    )
+    args.network_k_critic_sign_scale = max(
+        float(getattr(args, "network_k_critic_sign_scale", 0.10)), 1e-4
+    )
+    args.network_k_critic_selection_temperature = max(
+        float(getattr(args, "network_k_critic_selection_temperature", 0.10)), 1e-3
+    )
+    args.network_k_all_actual_enabled = bool(
+        getattr(args, "network_k_all_actual_enabled", False)
+    )
+    args.network_k_all_actual_temperature = max(
+        float(getattr(args, "network_k_all_actual_temperature", 1.25)), 0.05
+    )
+    args.network_k_all_actual_temperature_min = min(max(
+        float(getattr(args, "network_k_all_actual_temperature_min", 0.50)), 0.01
+    ), args.network_k_all_actual_temperature)
+    args.network_k_all_actual_anneal_steps = max(
+        int(getattr(args, "network_k_all_actual_anneal_steps", 5000)), 1
+    )
+    args.network_k_min_positive_before_anneal = max(
+        int(getattr(args, "network_k_min_positive_before_anneal", 8)), 0
+    )
+    args.network_k_freeze_negative_theta_until_positive = bool(getattr(
+        args, "network_k_freeze_negative_theta_until_positive", True
+    ))
+    args.network_k_all_actual_coefficient_std = max(
+        float(getattr(args, "network_k_all_actual_coefficient_std", 0.15)), 1e-4
+    )
+    args.network_k_all_actual_direction_std = max(
+        float(getattr(args, "network_k_all_actual_direction_std", 0.10)), 1e-4
+    )
+    for name, default in (
+        ("network_k_all_actual_actor_weight", 1.0),
+        ("network_k_all_actual_critic_weight", 0.5),
+        ("network_k_all_actual_ranking_weight", 0.25),
+        ("network_k_all_actual_local_value_weight", 0.5),
+        ("network_k_all_actual_critic_selection_weight", 1.0),
+        ("network_k_all_actual_entropy_weight", 0.01),
+        ("network_k_entropy_floor_weight", 1.0),
+        ("network_k_all_actual_reward_scale_percent", 1.0),
+        ("network_k_all_actual_absolute_advantage_weight", 1.0),
+        ("network_k_all_actual_relative_advantage_weight", 0.25),
+        ("network_k_coverage_positive_actor_weight", 1.0),
+        ("network_k_coverage_spatial_actor_weight", 1.0),
+        ("network_k_coverage_pair_ranking_weight", 0.5),
+        ("network_k_coverage_pair_where_contrast_weight", 0.5),
+        ("network_k_all_actual_diversity_weight", 0.02),
+        ("network_k_all_actual_selected_surrogate_weight", 0.1),
+        ("network_k_elite_replay_weight", 1.0),
+        ("network_k_elite_where_weight", 0.25),
+        ("network_k_elite_direction_weight", 0.25),
+        ("network_k_elite_min_gain_percent", 1e-6),
+        ("network_k_offline_bootstrap_loss_weight", 1.0),
+    ):
+        setattr(args, name, max(float(getattr(args, name, default)), 0.0))
+    args.network_k_entropy_floor_target = min(max(
+        float(getattr(args, "network_k_entropy_floor_target", 0.60)), 0.0
+    ), 1.0)
+    args.network_k_shortlist_exploration_fraction = min(max(float(getattr(
+        args, "network_k_shortlist_exploration_fraction", 0.5
+    )), 0.0), 0.9)
+    args.network_k_replay_shortlist_plan_limit = max(int(getattr(
+        args, "network_k_replay_shortlist_plan_limit", 8
+    )), 1)
+    args.network_k_replay_shortlist_point_limit = max(int(getattr(
+        args, "network_k_replay_shortlist_point_limit", 8192
+    )), 1)
+    if args.network_k_all_actual_enabled:
+        if args.heuristic_guidance_mode != "network_k_proposal_policy":
+            raise ValueError(
+                "network_k_all_actual_enabledはnetwork_k_proposal_policy専用である"
+            )
+        if int(args.network_k_proposal_count) not in {8, 16}:
+            raise ValueError("K all-Actualのproposal数は8または16に限定する")
+    args.network_k_elite_replay_capacity = max(
+        int(getattr(args, "network_k_elite_replay_capacity", 256)), 8
+    )
+    args.network_k_elite_replay_count = min(max(
+        int(getattr(args, "network_k_elite_replay_count", 8)), 1
+    ), int(args.network_k_proposal_count))
+    args.network_k_offline_bootstrap_steps = max(
+        int(getattr(args, "network_k_offline_bootstrap_steps", 0)), 0
+    )
+    args.network_k_offline_dataset = str(
+        getattr(args, "network_k_offline_dataset", "") or ""
+    ).strip()
+    args.network_k_coverage_slots = min(max(
+        int(getattr(args, "network_k_coverage_slots", 6)), 0
+    ), int(args.network_k_proposal_count))
+    args.network_k_coverage_share_stride = max(
+        int(getattr(args, "network_k_coverage_share_stride", 37)), 1
+    )
+    if (
+        bool(getattr(args, "network_k_require_cache_free_training", True))
+        and args.heuristic_guidance_mode == "network_k_proposal_policy"
+        and (args.network_k_offline_dataset or args.network_k_offline_bootstrap_steps > 0)
+    ):
+        raise ValueError(
+            "Network-only訓練ではoffline候補/cache/teacherを使用できない。"
+            "診断時だけ--network_k_require_cache_free_training falseを明示すること"
+        )
+    args.network_k_offline_split = str(
+        getattr(args, "network_k_offline_split", "train") or "train"
+    ).strip().lower()
+    if args.network_k_offline_split not in {"train", "validation", "test"}:
+        raise ValueError("network_k_offline_split must be train/validation/test")
+    args.network_k_offline_loss_weight = max(
+        float(getattr(args, "network_k_offline_loss_weight", 0.1)), 0.0
+    )
+    args.network_only_max_total_ratio = min(max(
+        float(getattr(args, "network_only_max_total_ratio", 0.0099)), 1e-5
+    ), 0.0099)
+    args.network_only_action_exploration_floor = min(max(
+        float(getattr(args, "network_only_action_exploration_floor", 0.05)), 0.0
+    ), 0.25)
+    args.network_only_where_gumbel_scale = max(
+        float(getattr(args, "network_only_where_gumbel_scale", 1.0)), 0.0
+    )
+    args.network_only_exploration_steps = max(
+        int(getattr(args, "network_only_exploration_steps", 100)), 0
+    )
+    args.network_only_exploration_anneal_steps = max(
+        int(getattr(args, "network_only_exploration_anneal_steps", 200)), 1
+    )
+    args.network_only_plan_gain_loss_weight = max(
+        float(getattr(args, "network_only_plan_gain_loss_weight", 0.25)), 0.0
+    )
+    args.network_only_actual_surrogate_loss_weight = max(
+        float(getattr(args, "network_only_actual_surrogate_loss_weight", 1.0)), 0.0
+    )
+    args.network_only_diagnostic_repeat_single_frame = max(
+        int(getattr(args, "network_only_diagnostic_repeat_single_frame", 0)), 0
+    )
+    manifest_file = str(getattr(args, "heuristic_guidance_den6_plan_manifest", "")).strip()
+    manifest_dir = str(getattr(args, "heuristic_guidance_den6_manifest_dir", "")).strip()
+    if (
+        args.heuristic_guidance_enabled
+        and args.heuristic_guidance_mode in {"ana_den6_residual", "ana_den6_reproduce"}
+        and not manifest_file
+        and not manifest_dir
+    ):
+        raise ValueError(
+            "ana_den6_residual/reproduceにはv2 manifestファイルまたはmanifestディレクトリが必要である。"
+            "proxy_priorで代替せず、tools/ana_den6_reproduce.pyで各frameのmanifestを生成すること。"
+        )
+    if args.heuristic_guidance_mode in {"ana_den6_reproduce", "ana_den6_reference_ply"}:
+        # 保存済みden6 hard voxel集合をActuatorへ適用する厳密anchorでは、
+        # proxy操作で最終集合を上書きさせない。
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = True
+    args.heuristic_guidance_anchor_steps = max(
+        int(getattr(args, "heuristic_guidance_anchor_steps", 200)),
+        0,
+    )
+    args.heuristic_guidance_amount_expansion = max(
+        float(getattr(args, "heuristic_guidance_amount_expansion", 4.0)),
+        1.0,
+    )
+    args.heuristic_guidance_teacher_bootstrap_steps = max(
+        int(getattr(args, "heuristic_guidance_teacher_bootstrap_steps", 0)),
+        0,
+    )
+    args.heuristic_guidance_teacher_distill_weight = max(
+        float(getattr(args, "heuristic_guidance_teacher_distill_weight", 0.50)),
+        0.0,
+    )
+    args.heuristic_guidance_distill_max_points = max(
+        int(getattr(args, "heuristic_guidance_distill_max_points", 65536)), 1
+    )
+    args.heuristic_guidance_distill_max_direction_sources = max(
+        int(getattr(args, "heuristic_guidance_distill_max_direction_sources", 4096)), 1
+    )
+    args.heuristic_guidance_exact_anchor_steps = max(
+        int(getattr(args, "heuristic_guidance_exact_anchor_steps", 0)),
+        0,
+    )
+    args.heuristic_guidance_final_prior_strength = min(max(
+        float(getattr(args, "heuristic_guidance_final_prior_strength", 0.10)), 0.0
+    ), 1.0)
+    args.heuristic_guidance_final_where_weight = max(
+        float(getattr(args, "heuristic_guidance_final_where_weight", 0.25)), 0.0
+    )
+    args.heuristic_guidance_network_residual_weight = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.25)), 0.0
+    )
+    args.heuristic_guidance_network_residual_weight_max = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 1.0)),
+        args.heuristic_guidance_network_residual_weight,
+    )
+    args.heuristic_guidance_network_to_heuristic_std_cap = max(float(getattr(
+        args, "heuristic_guidance_network_to_heuristic_std_cap", 1.0
+    )), 0.0)
+    args.heuristic_guidance_network_residual_weight_increment = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.05)),
+        0.0,
+    )
+    args.heuristic_guidance_network_score_scale = max(
+        float(getattr(args, "heuristic_guidance_network_score_scale", 1.0)),
+        1e-6,
+    )
+    args.heuristic_guidance_network_score_temperature = max(float(getattr(
+        args, "heuristic_guidance_network_score_temperature", 1.0
+    )), 1e-6)
+    args.heuristic_guidance_network_score_init_std = max(
+        float(getattr(args, "heuristic_guidance_network_score_init_std", 0.001)),
+        0.0,
+    )
+    args.heuristic_guidance_online_amount_residual_scale = min(max(
+        float(getattr(args, "heuristic_guidance_online_amount_residual_scale", 0.35)),
+        0.0,
+    ), 0.50)
+    args.heuristic_guidance_outside_pool_logit_penalty = max(
+        float(getattr(args, "heuristic_guidance_outside_pool_logit_penalty", 20.0)), 0.0
+    )
+    args.heuristic_guidance_target_direction_weight = max(
+        float(getattr(args, "heuristic_guidance_target_direction_weight", 12.0)), 0.0
+    )
+    args.heuristic_guidance_tensor_cache_entries = max(
+        int(getattr(args, "heuristic_guidance_tensor_cache_entries", 8)), 1
+    )
+    args.heuristic_guidance_disable_full_cloud_amount_override = bool(
+        getattr(args, "heuristic_guidance_disable_full_cloud_amount_override", True)
+    )
+    args.sparsepcgc_actual_every_step = bool(
+        getattr(args, "sparsepcgc_actual_every_step", True)
+    )
+    args.heuristic_guidance_where_weight = max(float(getattr(args, "heuristic_guidance_where_weight", 1.0)), 0.0)
+    args.heuristic_guidance_action_strength = min(max(float(getattr(args, "heuristic_guidance_action_strength", 0.50)), 0.0), 1.0)
+    args.heuristic_guidance_amount_residual_fraction = max(float(getattr(args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
+    args.heuristic_guidance_amount_min_residual = max(float(getattr(args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
+    args.heuristic_guidance_amount_grad_scale = max(float(getattr(args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
+    args.heuristic_guidance_online_compact_reserve_factor = min(max(
+        float(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 4.0)), 1.0
+    ), 4.0)
+    args.heuristic_guidance_online_fast_pool_reserve_factor = min(max(float(getattr(
+        args, "heuristic_guidance_online_fast_pool_reserve_factor", 2.0
+    )), 1.0), 8.0)
+    args.heuristic_guidance_online_fast_pool_max_per_operation = max(int(getattr(
+        args, "heuristic_guidance_online_fast_pool_max_per_operation", 8192
+    )), 0)
+    args.heuristic_guidance_online_memory_entries = max(
+        int(getattr(args, "heuristic_guidance_online_memory_entries", 64)), 1
+    )
+    args.heuristic_guidance_online_prefetch_workers = max(
+        int(getattr(args, "heuristic_guidance_online_prefetch_workers", 2)), 0
+    )
+    args.heuristic_guidance_online_prefetch_lookahead = max(
+        int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 4)), 0
+    )
+    args.heuristic_guidance_online_max_total_ratio = min(max(
+        float(getattr(args, "heuristic_guidance_online_max_total_ratio", 0.0099)), 3e-6
+    ), 0.0099)
+    args.heuristic_guidance_online_max_changed_ratio = min(max(
+        float(getattr(args, "heuristic_guidance_online_max_changed_ratio", 0.0099)), 3e-6
+    ), 0.0099)
+    args.heuristic_guidance_online_where_temperature = max(
+        float(getattr(args, "heuristic_guidance_online_where_temperature", 0.75)), 0.05
+    )
+    args.heuristic_guidance_online_candidate_pairwise_weight = max(
+        float(getattr(args, "heuristic_guidance_online_candidate_pairwise_weight", 0.01)),
+        0.0,
+    )
+    args.heuristic_guidance_online_candidate_pairwise_max_pairs = max(
+        int(getattr(args, "heuristic_guidance_online_candidate_pairwise_max_pairs", 256)),
+        0,
+    )
+    args.heuristic_guidance_network_confidence_floor = min(max(
+        float(getattr(args, "heuristic_guidance_network_confidence_floor", 0.05)),
+        0.0,
+    ), 0.25)
+    args.rd_geometry_weight_multiplier = min(max(
+        float(getattr(args, "rd_geometry_weight_multiplier", 1.10)), 0.0
+    ), 4.0)
+    args.heuristic_guidance_online_gumbel_scale = max(
+        float(getattr(args, "heuristic_guidance_online_gumbel_scale", 1.0)), 0.0
+    )
+    args.heuristic_guidance_online_gumbel_logit_floor = max(float(getattr(
+        args, "heuristic_guidance_online_gumbel_logit_floor", 0.10
+    )), 0.0)
+    args.heuristic_guidance_online_exploration_tail_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_exploration_tail_fraction", 1.0
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_exploration_candidate_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_exploration_candidate_fraction", 0.50
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
+        args, "heuristic_guidance_online_actor_proxy_weight", 0.0
+    )), 0.0)
+    args.heuristic_guidance_online_actor_rate_proxy_scale = min(max(float(getattr(
+        args, "heuristic_guidance_online_actor_rate_proxy_scale", 0.0
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_actor_geometry_proxy_scale = min(max(float(getattr(
+        args, "heuristic_guidance_online_actor_geometry_proxy_scale", 0.25
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_local_geometry_weight = max(float(getattr(
+        args, "heuristic_guidance_online_local_geometry_weight", 0.50
+    )), 0.0)
+    args.heuristic_guidance_online_actor_use_rank_feature = bool(getattr(
+        args, "heuristic_guidance_online_actor_use_rank_feature", False
+    ))
+    args.heuristic_guidance_exploration_min_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_exploration_min_fraction", 0.25
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_exploration_max_candidate_changes = int(getattr(
+        args, "heuristic_guidance_online_exploration_max_candidate_changes", 0
+    ))
+    args.heuristic_guidance_online_exploration_full_safe_pool = bool(getattr(
+        args, "heuristic_guidance_online_exploration_full_safe_pool", True
+    ))
+    args.heuristic_guidance_online_post_window_exploration_floor = min(max(float(getattr(
+        args, "heuristic_guidance_online_post_window_exploration_floor", 0.0
+    )), 0.0), 0.10)
+    args.heuristic_guidance_online_where_exploration_share = min(max(float(getattr(
+        args, "heuristic_guidance_online_where_exploration_share", 0.60
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_where_coverage_weight = max(float(getattr(
+        args, "heuristic_guidance_online_where_coverage_weight", 1.0
+    )), 0.0)
+    args.heuristic_guidance_online_where_evidence_balance_weight = max(float(getattr(
+        args, "heuristic_guidance_online_where_evidence_balance_weight", 1.0
+    )), 0.0)
+    args.heuristic_guidance_online_group_evidence_target = max(int(getattr(
+        args, "heuristic_guidance_online_group_evidence_target", 64
+    )), 1)
+    args.heuristic_guidance_online_group_need_weight = max(float(getattr(
+        args, "heuristic_guidance_online_group_need_weight", 0.75
+    )), 0.0)
+    args.heuristic_guidance_online_noop_prior_offset = min(max(float(getattr(
+        args, "heuristic_guidance_online_noop_prior_offset", -1.5
+    )), -8.0), 0.0)
+    args.heuristic_guidance_online_learned_proposal = bool(getattr(
+        args, "heuristic_guidance_online_learned_proposal", True
+    ))
+    args.heuristic_guidance_online_proposal_max_candidates = int(getattr(
+        args, "heuristic_guidance_online_proposal_max_candidates", 2048
+    ))
+    args.heuristic_guidance_online_proposal_reserve_factor = max(float(getattr(
+        args, "heuristic_guidance_online_proposal_reserve_factor", 2.0
+    )), 1.0)
+    args.heuristic_guidance_online_proposal_coverage_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_proposal_coverage_fraction", 0.40
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_actual_lcb_kappa = max(float(getattr(
+        args, "heuristic_guidance_online_actual_lcb_kappa", 1.0
+    )), 0.0)
+    args.heuristic_guidance_online_fixed_guard_tolerance = max(float(getattr(
+        args, "heuristic_guidance_online_fixed_guard_tolerance", 0.0
+    )), 0.0)
+    args.heuristic_guidance_online_fixed_guard_retry_evidence = min(max(float(getattr(
+        args, "heuristic_guidance_online_fixed_guard_retry_evidence", 0.10
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_proposal_uncertainty_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_proposal_uncertainty_fraction", 0.20
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_entropy_min_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_entropy_min_fraction", 0.10
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_source_grad_probe = bool(getattr(
+        args, "heuristic_guidance_online_source_grad_probe", True
+    ))
+    args.heuristic_guidance_online_source_grad_probe_interval = max(int(getattr(
+        args, "heuristic_guidance_online_source_grad_probe_interval", 10
+    )), 0)
+    args.heuristic_guidance_online_actual_actor_replay_weight = max(float(getattr(
+        args, "heuristic_guidance_online_actual_actor_replay_weight", 0.20
+    )), 0.0)
+    args.heuristic_guidance_online_actual_candidate_critic_replay_weight = max(float(getattr(
+        args, "heuristic_guidance_online_actual_candidate_critic_replay_weight", 0.20
+    )), 0.0)
+    args.heuristic_guidance_online_actual_actor_replay_entries = max(int(getattr(
+        args, "heuristic_guidance_online_actual_actor_replay_entries", 512
+    )), 1)
+    args.heuristic_guidance_online_matched_anchor_memory_entries = max(int(getattr(
+        args, "heuristic_guidance_online_matched_anchor_memory_entries", 512
+    )), 1)
+    args.heuristic_guidance_online_pending_matched_frames = max(int(getattr(
+        args, "heuristic_guidance_online_pending_matched_frames", 1024
+    )), 1)
+    args.heuristic_guidance_online_matched_anchor_max_age_steps = max(int(getattr(
+        args, "heuristic_guidance_online_matched_anchor_max_age_steps", 1600
+    )), 1)
+    args.heuristic_guidance_online_completed_matched_entries = max(int(getattr(
+        args, "heuristic_guidance_online_completed_matched_entries", 4096
+    )), 1)
+    args.heuristic_guidance_online_actual_evidence_target_pairs = max(int(getattr(
+        args, "heuristic_guidance_online_actual_evidence_target_pairs", 128
+    )), 1)
+    args.heuristic_guidance_online_group_authority_pairs = max(int(getattr(
+        args, "heuristic_guidance_online_group_authority_pairs", 8
+    )), 1)
+    args.heuristic_guidance_online_proposal_coverage_entries = max(int(getattr(
+        args, "heuristic_guidance_online_proposal_coverage_entries", 4096
+    )), 1)
+    args.heuristic_guidance_online_actual_actor_replay_batch = max(int(getattr(
+        args, "heuristic_guidance_online_actual_actor_replay_batch", 16
+    )), 1)
+    args.heuristic_guidance_online_actual_actor_min_delta = max(float(getattr(
+        args, "heuristic_guidance_online_actual_actor_min_delta", 0.01
+    )), 0.0)
+    args.heuristic_guidance_online_actual_actor_cross_frame_weight = min(max(float(getattr(
+        args, "heuristic_guidance_online_actual_actor_cross_frame_weight", 0.25
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_diagnostic_policy = str(getattr(
+        args, "heuristic_guidance_online_diagnostic_policy", "normal"
+    )).strip().lower()
+    args.heuristic_guidance_online_amount_log_sigma = min(max(
+        float(getattr(args, "heuristic_guidance_online_amount_log_sigma", 0.08)), 0.0
+    ), 0.50)
+    args.heuristic_guidance_online_amount_gumbel_scale = max(
+        float(getattr(args, "heuristic_guidance_online_amount_gumbel_scale", 2.0)),
+        0.0,
+    )
+    args.heuristic_guidance_online_efficiency_direct_grad_scale = max(float(getattr(
+        args, "heuristic_guidance_online_efficiency_direct_grad_scale", 0.10
+    )), 0.0)
+    args.heuristic_guidance_online_factorized_max_consecutive_steps = max(int(getattr(
+        args, "heuristic_guidance_online_factorized_max_consecutive_steps", 8
+    )), 1)
+    args.heuristic_guidance_online_amount_logit_std_cap = max(float(getattr(
+        args, "heuristic_guidance_online_amount_logit_std_cap", 0.35
+    )), 0.0)
+    args.heuristic_guidance_online_amount_authority_floor = min(max(float(getattr(
+        args, "heuristic_guidance_online_amount_authority_floor", 0.75
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_factorized_min_share = min(max(float(getattr(
+        args, "heuristic_guidance_online_factorized_min_share", 0.10
+    )), 0.0), 1.0 / 6.0)
+    args.heuristic_guidance_online_policy_weight = max(
+        float(getattr(args, "heuristic_guidance_online_policy_weight", 0.1)), 0.0
+    )
+    args.heuristic_guidance_online_candidate_local_credit_weight = max(
+        float(getattr(
+            args,
+            "heuristic_guidance_online_candidate_local_credit_weight",
+            1.0,
+        )),
+        0.0,
+    )
+    args.heuristic_guidance_online_operation_local_credit_weight = max(float(getattr(
+        args,
+        "heuristic_guidance_online_operation_local_credit_weight",
+        0.02,
+    )), 0.0)
+    args.heuristic_guidance_online_amount_local_credit_weight = max(float(getattr(
+        args, "heuristic_guidance_online_amount_local_credit_weight", 0.05
+    )), 0.0)
+    args.heuristic_guidance_online_fine_local_credit_weight = max(float(getattr(
+        args, "heuristic_guidance_online_fine_local_credit_weight", 0.005
+    )), 0.0)
+    args.heuristic_guidance_online_global_actual_credit_weight = max(
+        float(getattr(
+            args,
+            "heuristic_guidance_online_global_actual_credit_weight",
+            0.05,
+        )),
+        0.0,
+    )
+    args.heuristic_guidance_online_actual_set_credit_weight = max(
+        float(getattr(
+            args,
+            "heuristic_guidance_online_actual_set_credit_weight",
+            0.50,
+        )),
+        0.0,
+    )
+    args.heuristic_guidance_online_actual_set_relative_scale = max(
+        float(getattr(
+            args,
+            "heuristic_guidance_online_actual_set_relative_scale",
+            0.02,
+        )),
+        0.0,
+    )
+    args.heuristic_guidance_online_decision_lr_scale = max(float(getattr(
+        args, "heuristic_guidance_online_decision_lr_scale", 0.1
+    )), 0.0)
+    args.heuristic_guidance_online_amount_lr_scale = max(float(getattr(
+        args, "heuristic_guidance_online_amount_lr_scale", 0.01
+    )), 0.0)
+    args.heuristic_guidance_online_policy_backward_scale = max(
+        float(getattr(
+            args, "heuristic_guidance_online_policy_backward_scale", 10.0
+        )),
+        0.0,
+    )
+    args.heuristic_guidance_online_entropy_weight = max(
+        float(getattr(args, "heuristic_guidance_online_entropy_weight", 0.001)), 0.0
+    )
+    args.heuristic_guidance_online_reward_ema = min(max(
+        float(getattr(args, "heuristic_guidance_online_reward_ema", 0.10)), 1e-4
+    ), 1.0)
+    args.heuristic_guidance_online_reward_scale = max(
+        float(getattr(args, "heuristic_guidance_online_reward_scale", 1.0)), 0.0
+    )
+    args.heuristic_guidance_online_advantage_clip = max(
+        float(getattr(args, "heuristic_guidance_online_advantage_clip", 5.0)), 0.0
+    )
+    args.heuristic_guidance_online_grad_audit = bool(
+        getattr(args, "heuristic_guidance_online_grad_audit", False)
+    )
+    args.heuristic_guidance_online_grad_audit_interval = max(
+        int(getattr(args, "heuristic_guidance_online_grad_audit_interval", 1)), 0
+    )
+    args.heuristic_guidance_require_exact_single_plan_teacher = bool(
+        getattr(args, "heuristic_guidance_require_exact_single_plan_teacher", True)
+    )
+    args.heuristic_guidance_auto_build_exact_single_plan_teacher = bool(
+        getattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", True)
+    )
+    if args.heuristic_guidance_mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
+        # Explicit Network-only full-cloud path.  No legacy selector/oracle or
+        # den6 prefetch is allowed to participate in action selection.
+        args.heuristic_guidance_enabled = False
+        args.train_patch_subset_enable = False
+        args.sparsepcgc_training_mode = "legacy"
+        args.sparsepcgc_legacy_direct_actuator_train = True
+        args.sparsepcgc_algorithmic_proposal_selector = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+        args.sparsepcgc_full_cloud_actual_primary = False
+        args.sparsepcgc_require_full_cloud_actual_teacher = False
+        args.train_full_cloud_actual_interval = 0
+        args.full_cloud_anchor_allow_grad = True
+        args.full_cloud_anchor_grad_node_limit = max(
+            int(getattr(args, "full_cloud_anchor_grad_node_limit", 50000)), 2000000
+        )
+        args.sparsepcgc_actual_every_step = True
+        args.actual_eval_interval = 1
+        args.disable_actual_codec_during_train = False
+        args.sparsepcgc_actual_result_cache = False
+        args.compression_surrogate_target_cache_entries = 0
+        args.compression_surrogate_replay_entries = 0
+        args.compression_surrogate_replay_steps = 0
+        args.compression_surrogate_reuse_last_target = False
+        args.compression_surrogate_refresh_interval = 1
+        args.heuristic_guidance_online_prefetch_workers = 0
+        args.batch_size = 1
+        args.sparsepcgc_actual_gate_prune = False
+        args.sparsepcgc_actual_gate_non_prune = False
+        args.sparsepcgc_disable_add = False
+        args.sparsepcgc_enable_add_experiment = True
+        args.sparsepcgc_add_only_when_compression_primary = False
+        args.sparsepcgc_codec_prune_prior = False
+        args.repair_amount_target_mode = "none"
+        args.repair_operation_gate_hard_forward = True
+        args.repair_operation_gate_random_mix_start = 0.0
+        args.repair_operation_gate_random_mix_end = 0.0
+        args.repair_add_amount_random_mix_start = 0.0
+        args.repair_add_amount_random_mix_end = 0.0
+        args.repair_move_amount_random_mix_start = 0.0
+        args.repair_move_amount_random_mix_end = 0.0
+        args.repair_drop_amount_random_mix_start = 0.0
+        args.repair_drop_amount_random_mix_end = 0.0
+        args.repair_add_ratio_floor = 0.0
+        args.repair_drop_ratio_floor = 0.0
+        args.repair_move_ratio_floor = 0.0
+        args.repair_force_min_add_voxels = False
+        args.repair_force_min_move_voxels = False
+        args.repair_force_min_drop_voxels = False
+        args.heuristic_guidance_teacher_bootstrap_steps = 0
+        args.heuristic_guidance_teacher_distill_weight = 0.0
+        args.heuristic_guidance_exact_anchor_steps = 0
+        if not _cli_option_was_provided("--more_training"):
+            # Single-Planへ移行するときは、既存checkpoint内で既に蒸留された
+            # Student重みを捨てず、そこからNetwork planのActual校正を続ける。
+            # 他のNetwork-only比較modeは従来どおりfresh開始にする。
+            args.more_training = args.heuristic_guidance_mode == "single_plan_student"
+    if args.heuristic_guidance_enabled and args.heuristic_guidance_mode == "ana_den6_online":
+        # 063943互換のden6 edit-unit順位から、全点群の1%未満を1つの複合planへまとめる。
+        # 完成planの複数Actual比較は行わず、Network residualを加えた最終1 planだけを
+        # そのStepのActual/Surrogate教師対象にする。
+        # 旧subtree oracleやfull-cloud Amount多候補評価を併走させない。
+        args.train_patch_subset_enable = False
+        args.sparsepcgc_training_mode = "legacy"
+        args.sparsepcgc_legacy_direct_actuator_train = True
+        args.sparsepcgc_algorithmic_proposal_selector = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+        args.sparsepcgc_full_cloud_actual_primary = False
+        args.sparsepcgc_require_full_cloud_actual_teacher = False
+        args.train_full_cloud_actual_interval = 0
+        # ana_den6 online主経路では未使用のLocalPrune/Subtree/大量debugログを停止する。
+        args.phase7_debug = False
+        args.phase7_grad_debug = False
+        args.network_voxel_node_debug = False
+        args.leaf_pattern_diagnosis_debug = False
+        args.print_actuator_hard_soft_compare = False
+        args.save_operation_metric_csv = False
+        args.save_operation_metrics_csv = False
+        args.save_compression_metric_csv = False
+        # 通常online学習のhot pathから、方策とcodec結果に関係しない
+        # CSV/診断同期を除外する。必要な1-plan auditは専用の短いtext行で残す。
+        args.save_good_bad_cases = False
+        args.save_proxy_actual_bad_cases = False
+        args.phase7_eval_summary = False
+        args.phase7_metric_columns = False
+        args.loss_grad_probe_enabled = False
+        # Heavy gradient diagnostics stay off by default on the online hot
+        # path, but an explicit CLI request must not be silently discarded.
+        if not _cli_option_was_provided("--step_grad_log"):
+            args.step_grad_log = False
+        elif bool(args.step_grad_log):
+            args.save_step_metric_csv = True
+        if not _cli_option_was_provided("--compression_grad_probe"):
+            args.compression_grad_probe = False
+        if not _cli_option_was_provided("--debug_grad_flow"):
+            args.debug_grad_flow = False
+        args.for_better_log = False
+        args.enable_voxel_collision_log = False
+        args.sparsepcgc_hard_debug_interval = 0
+        args.sparsepcgc_hard_debug_on_log = False
+        # online Policy Gradientにはfull-cloud Actuator headのgraphが必要である。
+        # no-grad anchorへ落ちるとlog-probがdetachされ学習不能になる。
+        args.full_cloud_anchor_allow_grad = True
+        if not _cli_option_was_provided("--full_cloud_anchor_grad_node_limit"):
+            args.full_cloud_anchor_grad_node_limit = max(
+                int(getattr(args, "full_cloud_anchor_grad_node_limit", 50000)),
+                2000000,
+            )
+        args.sparsepcgc_actual_every_step = True
+        args.actual_eval_interval = 1
+        args.disable_actual_codec_during_train = False
+        args.sparsepcgc_actual_result_cache = False
+        args.compression_surrogate_target_cache_entries = 0
+        args.compression_surrogate_replay_entries = 0
+        args.compression_surrogate_replay_steps = 0
+        args.compression_surrogate_reuse_last_target = False
+        args.compression_surrogate_refresh_interval = 1
+        args.heuristic_guidance_online_prefetch_workers = 0
+        args.batch_size = 1
+        if not _cli_option_was_provided("--heuristic_guidance_final_where_weight"):
+            # 20260914/155928で実測された構成を再現する。den6の順位を
+            # 安全な初期方策として残し、NetworkはRD整合confidenceで制限した
+            # residualとして候補順位を更新する。
+            args.heuristic_guidance_final_where_weight = 1.0
+        if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
+            # 完成済みden6 planを通常trainのStep 1へ混ぜると、そのActual値が
+            # 未学習Networkの性能として記録される。anchorはA/B監査用の明示的な
+            # opt-inに限定し、通常trainは最初からPoolをNetworkで再順位付けする。
+            args.heuristic_guidance_exact_anchor_steps = 0
+        if not _cli_option_was_provided("--heuristic_guidance_online_gumbel_scale"):
+            # 明示倍率1.0は従来のcombined-score std基準の初期挙動を保つ。
+            # 実効探索はcandidate順位学習品質によってのみ縮小し、Episode依存の
+            # annealは行わない。
+            args.heuristic_guidance_online_gumbel_scale = 1.0
+        if not _cli_option_was_provided("--repair_online_decision_grad_max_norm"):
+            # 004957後半の実測normはWhere≈0.049, Amount≈6.54,
+            # Action≈0.297であった。0.01上限は有効信号まで消したため、
+            # 小勾配を増幅せず、1を超えるspikeだけをclipする。
+            args.repair_online_decision_grad_max_norm = 1.0
+        # 旧5% Prune等で学習したheadを自動読込するとonline residual初期値を汚す。
+        # 明示指定時だけ再開を許可し、既定は新しい方策headから開始する。
+        if not _cli_option_was_provided("--more_training"):
+            args.more_training = False
+    if args.heuristic_guidance_enabled and compress_key == "sparsepcgc":
+        if args.heuristic_guidance_mode in {"ana_den6_online", "ana_den6_residual"}:
+            if (
+                args.heuristic_guidance_mode == "ana_den6_online"
+                and not _cli_option_was_provided("--heuristic_guidance_anchor_steps")
+            ):
+                # hard anchorはexact_anchor_steps=1が担当する。別の200-Step
+                # residual rampを重ねると同じNetwork出力の実行量が時刻で変わる。
+                args.heuristic_guidance_anchor_steps = 0
+            if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight"):
+                # 最大補正能力は残すが、実効値は各入力のRD alignment confidenceを
+                # 掛けて決める。したがってEpisode依存の権限移行は生じない。
+                args.heuristic_guidance_network_residual_weight = 1.0
+            if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight_max"):
+                args.heuristic_guidance_network_residual_weight_max = 1.0
+            if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight_increment"):
+                args.heuristic_guidance_network_residual_weight_increment = 0.0
+            # den6 Amountは全点群比0.05%～0.25%級である。旧3%/5%初期値を混入させない。
+            profile_amounts = {
+                ("8i", 8): (0.0010, 0.0010, 0.0005),
+                ("8i", 7): (0.000175, 0.000150, 0.000175),
+                ("mvub", 8): (0.00125, 0.00100, 0.00025),
+                ("mvub", 7): (0.00035, 0.00030, 0.00035),
+                ("uvg", 8): (0.00125, 0.00350, 0.00025),
+                ("uvg", 7): (0.00100, 0.00125, 0.00025),
+            }
+            profile_key = (
+                str(getattr(args, "dataname", "8i")).strip().lower(),
+                int(getattr(args, "sparsepcgc_scale_m", 8)),
+            )
+            add_init, prune_init, move_init = profile_amounts.get(
+                profile_key, (0.0010, 0.0010, 0.0005)
+            )
+            if not _cli_option_was_provided("--repair_init_add_ratio"):
+                args.repair_init_add_ratio = float(add_init)
+            if not _cli_option_was_provided("--repair_init_drop_ratio"):
+                args.repair_init_drop_ratio = float(prune_init)
+        if not _cli_option_was_provided("--repair_amount_target_mode"):
+            args.repair_amount_target_mode = "none"
+        if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_bins"):
+            args.sparsepcgc_algorithmic_amount_bins = (
+                "0.0015,0.002,0.0025,0.00275,0.003"
+            )
+        if not _cli_option_was_provided("--heuristic_guidance_online_amount_bins"):
+            args.heuristic_guidance_online_amount_bins = (
+                "0.0015,0.002,0.0025,0.00275,0.003"
+            )
+        if not _cli_option_was_provided("--sparsepcgc_full_cloud_amount_bins"):
+            # Exact-onlineのselector classと実行Amount binを1:1にする。
+            # class 0は既存のno-opで、Exact plan側では除外される。
+            args.sparsepcgc_full_cloud_amount_bins = (
+                "0.0," + str(args.heuristic_guidance_online_amount_bins)
+            )
+        if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_init_ratio"):
+            # 20260817の安定runと同じ初期中心を維持する。0.002へ直接
+            # 初期化すると離散Gumbel選択が別binへ固定されることを実測済み。
+            # これは初期biasのみで、Actual RD勾配による変更は妨げない。
+            args.sparsepcgc_algorithmic_amount_init_ratio = 0.0025
+            # actual Rateはden6と同じfull-cloud基準で毎Step確認する。
+        # Add/Prune/Adjustを同時候補として残す。各操作量はHeuristic prior周辺でNetworkが微調整する。
+        if not _cli_option_was_provided("--sparsepcgc_disable_add"):
+            args.sparsepcgc_disable_add = False
+        if not _cli_option_was_provided("--sparsepcgc_enable_add_experiment"):
+            args.sparsepcgc_enable_add_experiment = True
+        if not _cli_option_was_provided("--sparsepcgc_add_only_when_compression_primary"):
+            args.sparsepcgc_add_only_when_compression_primary = False
+
+    args.method_name = str(getattr(args, "method_name", method_name)).strip() or method_name
+    args.surrogate_name = _compress_display_name(args.compress)
+    args.run_name = str(getattr(args, "run_name", "")).strip()
+    if not args.run_name:
+        args.run_name = f"{args.time}_{args.surrogate_name}"
+    # 推論用checkpoint日時が未指定なら、現在選択中の学習model日時を使う。
+    # 空文字のままでは ".../Mynetwork_train/_SparsePCGC" へ誤解決される。
+    args.pretrained_date = (
+        str(getattr(args, "pretrained_date", pretrained_date)).strip()
+        or str(model_date).strip()
+    )
+    args.pretrained_time = (
+        str(getattr(args, "pretrained_time", pretrained_time)).strip()
+        or str(model_time).strip()
+    )
+    if not _cli_option_was_provided("--ckpt") and not getattr(args, "checkpoint", None):
+        args.ckpt = _pretrained_checkpoint_path(
+            args.pretrained_date,
+            args.pretrained_time,
+            args.compress,
+            model_stem=model_name,
+        )
+    if not _cli_option_was_provided("--out_path"):
+        args.out_path = str((_LOG_ROOT / args.date / "MyNetwork_train" / "pretrained" / args.run_name).resolve())
+    actual_bit_backends = {
+        "octattention_actual",
+        "octattention_actual_ste",
+        "octattention_surrogate",
+        "sparsepcgc_actual",
+        "sparsepcgc_actual_ste",
+        "sparsepcgc_surrogate",
+        "gpcc_actual",
+        "gpcc_actual_ste",
+        "gpcc_surrogate",
+        "draco_actual",
+        "draco_actual_ste",
+        "draco_surrogate",
+    }
+    if args.compression_loss_backend in actual_bit_backends:
+        args.compression_rate_metric = "total_bits"
+    args.plot_max_points = max(int(args.plot_max_points), 2)
+    args.plot_skip_outlier_steps = bool(getattr(args, "plot_skip_outlier_steps", True))
+    args.plot_outlier_abs_threshold = float(getattr(args, "plot_outlier_abs_threshold", 0.0))
+    args.plot_outlier_rel_factor = float(getattr(args, "plot_outlier_rel_factor", 0.0))
+    args.plot_outlier_min_history = max(int(getattr(args, "plot_outlier_min_history", 0)), 0)
+    args.plot_outlier_history_window = max(int(getattr(args, "plot_outlier_history_window", 0)), 0)
+    args.plot_outlier_min_scale = max(float(getattr(args, "plot_outlier_min_scale", 0.0)), 0.0)
+    args.plot_ylim_margin_ratio = max(float(getattr(args, "plot_ylim_margin_ratio", 0.15)), 0.0)
+    args.plot_ylim_min_margin = max(float(getattr(args, "plot_ylim_min_margin", 1e-3)), 0.0)
+    args.plot_ylim_update_interval = max(int(getattr(args, "plot_ylim_update_interval", 5)), 1)
+    args.save_compression_metric_csv = bool(getattr(args, "save_compression_metric_csv", True))
+    args.save_operation_metric_csv = bool(getattr(args, "save_operation_metric_csv", True))
+    args.save_step_metric_csv = bool(getattr(args, "save_step_metric_csv", False))
+    args.plot_step_average_window = max(
+        int(getattr(args, "plot_step_average_window", 100)), 1
+    )
+    args.save_checkpoint_metric_csv = bool(getattr(args, "save_checkpoint_metric_csv", True))
+    args.checkpoint_geom_gate = bool(getattr(args, "checkpoint_geom_gate", True))
+    args.checkpoint_safety_gate = bool(getattr(args, "checkpoint_safety_gate", True))
+    args.checkpoint_geom_rel_factor = max(float(getattr(args, "checkpoint_geom_rel_factor", 1.5)), 0.0)
+    args.checkpoint_geom_abs_max = max(float(getattr(args, "checkpoint_geom_abs_max", 0.0)), 0.0)
+    args.checkpoint_repair_rel_factor = max(float(getattr(args, "checkpoint_repair_rel_factor", 0.0)), 0.0)
+    args.checkpoint_repair_abs_max = max(float(getattr(args, "checkpoint_repair_abs_max", 10.0)), 0.0)
+    args.checkpoint_node_abs_max = max(float(getattr(args, "checkpoint_node_abs_max", 100.0)), 0.0)
+    args.checkpoint_single_abs_max = max(float(getattr(args, "checkpoint_single_abs_max", 100.0)), 0.0)
+    args.checkpoint_operation_ratio_max = float(getattr(args, "checkpoint_operation_ratio_max", 100.0))
+    args.operation_count_drop_threshold = min(
+        max(float(getattr(args, "operation_count_drop_threshold", 0.5)), 0.0),
+        1.0,
+    )
+    args.operation_count_adjust_threshold = max(
+        float(getattr(args, "operation_count_adjust_threshold", 1e-6)),
+        0.0,
+    )
+    valid_backends = {
+        "proxy",
+        "octattention_actual",
+        "octattention_actual_ste",
+        "octattention_surrogate",
+        "sparsepcgc_actual",
+        "sparsepcgc_actual_ste",
+        "sparsepcgc_surrogate",
+        "gpcc_actual",
+        "gpcc_actual_ste",
+        "gpcc_surrogate",
+        "draco_actual",
+        "draco_actual_ste",
+        "draco_surrogate",
+    }
+    if args.compression_loss_backend not in valid_backends:
+        raise ValueError(
+            "--compression_loss_backend must be one of: proxy, octattention_actual, "
+            "octattention_actual_ste, octattention_surrogate, sparsepcgc_actual, "
+            "sparsepcgc_actual_ste, sparsepcgc_surrogate, gpcc_actual, "
+            "gpcc_actual_ste, gpcc_surrogate, draco_actual, draco_actual_ste, "
+            f"draco_surrogate (got {args.compression_loss_backend})"
+        )
+
+    teacher_device = str(args.octattention_teacher_device).strip().lower()
+    valid_teacher_devices = {"auto", "cpu", "balanced", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3"}
+    if teacher_device not in valid_teacher_devices:
+        raise ValueError(
+            "--octattention_teacher_device must be one of: auto, cpu, balanced, cuda, cuda:0..cuda:3 "
+            f"(got {args.octattention_teacher_device})"
+        )
+    if teacher_device == "auto" and args.compression_loss_backend.startswith("octattention_"):
+        teacher_device = "balanced"
+    args.octattention_teacher_device = teacher_device
+
+    args.sparsepcgc_mode = str(getattr(args, "sparsepcgc_mode", "dense_lossless")).strip().lower()
+    valid_sparsepcgc_modes = {"dense_lossless", "dense_lossy", "sparse_lossless", "sparse_lossy_gpcc"}
+    if args.sparsepcgc_mode not in valid_sparsepcgc_modes:
+        raise ValueError(
+            "--sparsepcgc_mode must be one of: dense_lossless, dense_lossy, "
+            f"sparse_lossless, sparse_lossy_gpcc (got {args.sparsepcgc_mode})"
+        )
+    args.sparsepcgc_device = str(getattr(args, "sparsepcgc_device", "auto")).strip().lower()
+    args.sparsepcgc_timeout = max(float(getattr(args, "sparsepcgc_timeout", 600.0)), 1.0)
+    args.sparsepcgc_match_qs = bool(getattr(args, "sparsepcgc_match_qs", True))
+    if _compress_key(getattr(args, "compress", "")) == "sparsepcgc" and args.sparsepcgc_match_qs:
+        voxel_cli = _cli_option_was_provided("--sparsepcgc_voxel_size")
+        quant_cli = _cli_option_was_provided("--sparsepcgc_pos_quantscale")
+        if not voxel_cli and not quant_cli:
+            args.sparsepcgc_voxel_size = float(getattr(args, "qs", 1.0))
+            args.sparsepcgc_pos_quantscale = 1
+        elif not voxel_cli and quant_cli:
+            args.sparsepcgc_voxel_size = float(getattr(args, "qs", 1.0)) / max(float(getattr(args, "sparsepcgc_pos_quantscale", 1)), 1.0)
+    args.sparsepcgc_voxel_size = max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-12)
+    args.sparsepcgc_pos_quantscale = max(int(getattr(args, "sparsepcgc_pos_quantscale", 1)), 1)
+    args.sparsepcgc_effective_qs = float(args.sparsepcgc_voxel_size) * float(args.sparsepcgc_pos_quantscale)
+    args.heuristic_guidance_den6_codec_strict = bool(
+        getattr(args, "heuristic_guidance_den6_codec_strict", True)
+    )
+    if (
+        args.heuristic_guidance_enabled
+        and compress_key == "sparsepcgc"
+        and args.heuristic_guidance_den6_codec_strict
+        and args.heuristic_guidance_mode in {
+            "ana_den6_online", "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
+        }
+    ):
+        # den6の比較対象は指定されたAE/SR/mを含むsetting IDで分離されるため、
+        # qs連動や別modeを許すと同じhard voxel集合でもbitが一致しない。
+        expected_sr = args.sparsepcgc_native_bit_depth - args.sparsepcgc_scale_m - args.sparsepcgc_scale_ae
+        mismatches = []
+        if args.sparsepcgc_mode != "dense_lossy":
+            mismatches.append(f"mode={args.sparsepcgc_mode} (expected dense_lossy)")
+        if bool(args.sparsepcgc_match_qs):
+            mismatches.append("sparsepcgc_match_qs=True (expected False)")
+        if not math.isclose(args.sparsepcgc_voxel_size, 1.0, abs_tol=1e-12):
+            mismatches.append(f"voxel_size={args.sparsepcgc_voxel_size} (expected 1.0)")
+        if args.sparsepcgc_pos_quantscale != 1:
+            mismatches.append(f"pos_quantscale={args.sparsepcgc_pos_quantscale} (expected 1)")
+        if args.sparsepcgc_scale_sr != expected_sr:
+            mismatches.append(
+                f"AE/SR={args.sparsepcgc_scale_ae}/{args.sparsepcgc_scale_sr} "
+                f"(expected {args.sparsepcgc_scale_ae}/{expected_sr})"
+            )
+        expected_resolution = 511 if dataset_key_for_m == "uvg" else 1023
+        if int(args.sparsepcgc_psnr_resolution) != expected_resolution:
+            mismatches.append(
+                f"psnr_resolution={args.sparsepcgc_psnr_resolution} (expected {expected_resolution})"
+            )
+        if mismatches:
+            raise ValueError(
+                "ana_den6とactual bitを比較するHeuristic guidanceのcodec設定が不一致: "
+                + "; ".join(mismatches)
+            )
+        # den6はcodec bitのみをsaved percentとして比較する。編集記録は診断に残すが、
+        # forward objectiveへは加えない。
+        args.sparsepcgc_actual_bit_objective = "raw"
+    args.repair_voxel_edit_state = bool(getattr(args, "repair_voxel_edit_state", True))
+    args.repair_voxel_edit_require_empty_move_target = bool(
+        getattr(args, "repair_voxel_edit_require_empty_move_target", True)
+    )
+    args.sparsepcgc_dequantize_center = bool(getattr(args, "sparsepcgc_dequantize_center", False))
+    args.sparsepcgc_restore_points_debug = bool(getattr(args, "sparsepcgc_restore_points_debug", False))
+    args.sparsepcgc_restore_unique_voxels = bool(getattr(args, "sparsepcgc_restore_unique_voxels", True))
+    args.sparsepcgc_quant_mode = str(
+        getattr(args, "sparsepcgc_quant_mode", "round_voxel_then_pos")
+    ).strip().lower()
+    args.sparsepcgc_dense_scale_ae_list = _parse_csv_ints(args.sparsepcgc_dense_scale_ae_list)
+    args.sparsepcgc_dense_scale_sr_list = _parse_csv_ints(args.sparsepcgc_dense_scale_sr_list)
+    args.sparsepcgc_pos_quantscale_list = _parse_csv_ints(args.sparsepcgc_pos_quantscale_list)
+    args.gpcc_timeout = max(float(getattr(args, "gpcc_timeout", 120.0)), 1.0)
+    args.gpcc_match_qs = bool(getattr(args, "gpcc_match_qs", True))
+    args.gpcc_prequantize = bool(getattr(args, "gpcc_prequantize", True))
+    if _compress_key(getattr(args, "compress", "")) == "gpcc" and args.gpcc_match_qs:
+        if not _cli_option_was_provided("--gpcc_effective_qs"):
+            args.gpcc_effective_qs = float(getattr(args, "qs", 1.0))
+    args.gpcc_effective_qs = max(float(getattr(args, "gpcc_effective_qs", 1.0)), 1e-12)
+    args.gpcc_disable_attribute_coding = bool(getattr(args, "gpcc_disable_attribute_coding", True))
+    args.gpcc_merge_duplicated_points = bool(getattr(args, "gpcc_merge_duplicated_points", True))
+    args.draco_timeout = max(float(getattr(args, "draco_timeout", 120.0)), 1.0)
+    args.draco_match_qs = bool(getattr(args, "draco_match_qs", True))
+    args.draco_prequantize = bool(getattr(args, "draco_prequantize", True))
+    if _compress_key(getattr(args, "compress", "")) == "draco" and args.draco_match_qs:
+        if not _cli_option_was_provided("--draco_effective_qs"):
+            args.draco_effective_qs = float(getattr(args, "qs", 1.0))
+    args.draco_effective_qs = max(float(getattr(args, "draco_effective_qs", 1.0)), 1e-12)
+    if (
+        _compress_key(getattr(args, "compress", "")) == "draco"
+        and args.draco_prequantize
+        and not _cli_option_was_provided("--draco_position_quantization_bits")
+    ):
+        args.draco_position_quantization_bits = 0
+    args.draco_position_quantization_bits = int(getattr(args, "draco_position_quantization_bits", 0))
+    if args.draco_position_quantization_bits < 0:
+        raise ValueError("--draco_position_quantization_bits must be >= 0")
+    args.draco_compression_level = min(max(int(getattr(args, "draco_compression_level", 7)), 0), 10)
+    args.draco_skip_decode = bool(getattr(args, "draco_skip_decode", True))
+    args.draco_force_point_cloud = bool(getattr(args, "draco_force_point_cloud", True))
+    args.draco_merge_duplicated_points = bool(getattr(args, "draco_merge_duplicated_points", True))
+    args.compression_surrogate_train_steps = max(int(getattr(args, "compression_surrogate_train_steps", 0)), 0)
+    args.compression_surrogate_warmup_steps = max(
+        int(getattr(args, "compression_surrogate_warmup_steps", args.compression_surrogate_train_steps)),
+        0,
+    )
+    args.compression_surrogate_refresh_interval = max(
+        int(getattr(args, "compression_surrogate_refresh_interval", 0)),
+        0,
+    )
+    args.compression_surrogate_target_cache_entries = max(
+        int(getattr(args, "compression_surrogate_target_cache_entries", 0)),
+        0,
+    )
+    args.compression_surrogate_reuse_last_target = bool(
+        getattr(args, "compression_surrogate_reuse_last_target", True)
+    )
+    args.sparsepcgc_surrogate_local_proxy_on_target_miss = bool(
+        getattr(args, "sparsepcgc_surrogate_local_proxy_on_target_miss", True)
+    )
+    args.sparsepcgc_surrogate_local_proxy_rate_weight = max(
+        float(getattr(args, "sparsepcgc_surrogate_local_proxy_rate_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_surrogate_local_proxy_aux_weight = max(
+        float(getattr(args, "sparsepcgc_surrogate_local_proxy_aux_weight", 0.25)),
+        0.0,
+    )
+    args.compression_surrogate_replay_steps = max(
+        int(getattr(args, "compression_surrogate_replay_steps", 0)),
+        0,
+    )
+    args.compression_surrogate_replay_batch = max(
+        int(getattr(args, "compression_surrogate_replay_batch", 1)),
+        1,
+    )
+    args.compression_surrogate_replay_entries = max(
+        int(getattr(args, "compression_surrogate_replay_entries", 0)),
+        0,
+    )
+    args.compression_surrogate_empty_cache_after_update = bool(getattr(args, "compression_surrogate_empty_cache_after_update", True)) # Surrogate更新後のCUDA cache解放を有効化する
+    args.compression_surrogate_empty_cache_threshold_mb = max(float(getattr(args, "compression_surrogate_empty_cache_threshold_mb", 12288.0)), 0.0) # CUDA cache解放を始めるreserved memory閾値を正規化する
+    args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 0)
+    args.surrogate_pretrain_lr = max(float(getattr(args, "surrogate_pretrain_lr", 1e-4)), 0.0)
+    args.surrogate_pretrain_actual_refresh_interval = max(
+        int(getattr(args, "surrogate_pretrain_actual_refresh_interval", 10)),
+        0,
+    )
+    args.surrogate_pretrain_freeze_network = bool(getattr(args, "surrogate_pretrain_freeze_network", True))
+    args.surrogate_pretrain_min_corr = float(getattr(args, "surrogate_pretrain_min_corr", -1.0))
+    args.surrogate_pretrain_min_sign_match = float(getattr(args, "surrogate_pretrain_min_sign_match", -1.0))
+    args.surrogate_pretrain_min_fresh_samples = max(
+        int(getattr(args, "surrogate_pretrain_min_fresh_samples", 30)),
+        0,
+    )
+    args.surrogate_pretrain_min_abs_error = float(getattr(args, "surrogate_pretrain_min_abs_error", -1.0))
+    args.surrogate_pretrain_early_stop_patience = max(
+        int(getattr(args, "surrogate_pretrain_early_stop_patience", 0)),
+        0,
+    )
+    args.surrogate_pretrain_log_interval = max(int(getattr(args, "surrogate_pretrain_log_interval", 10)), 1)
+    args.surrogate_pretrain_print_interval = max(int(getattr(args, "surrogate_pretrain_print_interval", 1)), 1)
+    args.surrogate_pretrain_checkpoint = bool(getattr(args, "surrogate_pretrain_checkpoint", True))
+    # データセット別Surrogate stateを再利用し、SparsePCGC teacherを毎回ゼロから回す負担を避ける。
+    args.surrogate_pretrain_resume = bool(getattr(args, "surrogate_pretrain_resume", True))
+    args.surrogate_pretrain_skip_if_loaded = bool(getattr(args, "surrogate_pretrain_skip_if_loaded", False))
+    args.surrogate_pretrain_force_retrain = bool(getattr(args, "surrogate_pretrain_force_retrain", False))
+    args.surrogate_pretrain_cache_dir = str(getattr(args, "surrogate_pretrain_cache_dir", "")).strip()
+    args.surrogate_registry_enabled = bool(getattr(args, "surrogate_registry_enabled", True)) # 共有Surrogate重みの保存/読込を有効化する
+    args.surrogate_pretrained_root = str(getattr(args, "surrogate_pretrained_root", str((_DATA_ROOT / "pretrained_surrogate").resolve()))).strip() # 共有Surrogate rootを文字列化する
+    if not str(getattr(args, "surrogate_data", "")).strip():
+        args.surrogate_data = f"{getattr(args, 'dataname', 'data')}_{getattr(args, 'dataset_name', 'set')}" # 保存ファイル名用のデータ名を既定値で補完する
+    else:
+        args.surrogate_data = str(getattr(args, "surrogate_data", "")).strip() # 明示指定されたデータ名を使う
+    args.surrogate_date = str(getattr(args, "surrogate_date", surrogate_date)).strip() or str(getattr(args, "date", "run")).strip() # 読込対象Surrogateの日付を正規化する
+    args.surrogate_time = str(getattr(args, "surrogate_time", surrogate_time)).strip() or str(getattr(args, "time", "run")).strip() # 読込対象Surrogateの時刻を正規化する
+    args.surrogate_registry_load_latest_if_missing = bool(getattr(args, "surrogate_registry_load_latest_if_missing", False)) # 指定Surrogateが無い時の最新読込可否を設定する
+    args.surrogate_pretrain_legacy_cache_fallback = bool(getattr(args, "surrogate_pretrain_legacy_cache_fallback", False)) # 旧fingerprint cacheを読むかどうかを設定する
+    args.surrogate_pretrain_use_replay = bool(getattr(args, "surrogate_pretrain_use_replay", True))
+    args.surrogate_pretrain_replay_batch_size = max(
+        int(getattr(args, "surrogate_pretrain_replay_batch_size", 16)),
+        1,
+    )
+    args.surrogate_pretrain_replay_steps = max(
+        int(getattr(args, "surrogate_pretrain_replay_steps", 4)),
+        0,
+    )
+    replay_update_per_step = getattr(args, "surrogate_pretrain_replay_update_per_step", None)
+    if replay_update_per_step is not None:
+        args.surrogate_pretrain_replay_steps = max(int(replay_update_per_step), 0)
+    args.surrogate_pretrain_replay_update_per_step = int(args.surrogate_pretrain_replay_steps)
+    args.surrogate_pretrain_replay_buffer_size = max(
+        int(getattr(args, "surrogate_pretrain_replay_buffer_size", 256)),
+        0,
+    )
+    args.surrogate_pretrain_replay_min_size = max(
+        int(getattr(args, "surrogate_pretrain_replay_min_size", 4)),
+        0,
+    )
+    args.surrogate_pretrain_allow_stale_target = bool(
+        getattr(args, "surrogate_pretrain_allow_stale_target", True)
+    )
+    args.surrogate_pretrain_max_target_age = max(
+        int(getattr(args, "surrogate_pretrain_max_target_age", 20)),
+        0,
+    )
+    args.surrogate_pretrain_skip_on_target_miss = bool(
+        getattr(args, "surrogate_pretrain_skip_on_target_miss", False)
+    )
+    args.surrogate_pretrain_sparsepcgc_debug_interval = int(
+        getattr(args, "surrogate_pretrain_sparsepcgc_debug_interval", 10)
+    )
+    args.surrogate_pretrain_mode = str(getattr(args, "surrogate_pretrain_mode", "full")).strip().lower()
+    if args.surrogate_pretrain_mode not in {"full", "subtree", "hybrid"}:
+        raise ValueError("--surrogate_pretrain_mode must be one of: full, subtree, hybrid")
+    args.surrogate_pretrain_subtree_depth_min = int(
+        getattr(args, "surrogate_pretrain_subtree_depth_min", -1)
+    )
+    args.surrogate_pretrain_subtree_depth_max = int(
+        getattr(args, "surrogate_pretrain_subtree_depth_max", -1)
+    )
+    if args.surrogate_pretrain_subtree_depth_min < -1:
+        raise ValueError("--surrogate_pretrain_subtree_depth_min must be >= -1")
+    if args.surrogate_pretrain_subtree_depth_max < -1:
+        raise ValueError("--surrogate_pretrain_subtree_depth_max must be >= -1")
+    if (
+        args.surrogate_pretrain_subtree_depth_min > 0
+        and args.surrogate_pretrain_subtree_depth_max > 0
+        and args.surrogate_pretrain_subtree_depth_min > args.surrogate_pretrain_subtree_depth_max
+    ):
+        args.surrogate_pretrain_subtree_depth_min, args.surrogate_pretrain_subtree_depth_max = (
+            args.surrogate_pretrain_subtree_depth_max,
+            args.surrogate_pretrain_subtree_depth_min,
+        )
+    args.surrogate_pretrain_subtree_depth_percent_min = min(
+        max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", 0.0)), 0.0),
+        1.0,
+    )
+    args.surrogate_pretrain_subtree_depth_percent_max = min(
+        max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_max", 0.50)), 0.0),
+        1.0,
+    )
+    if args.surrogate_pretrain_subtree_depth_percent_min > args.surrogate_pretrain_subtree_depth_percent_max:
+        (
+            args.surrogate_pretrain_subtree_depth_percent_min,
+            args.surrogate_pretrain_subtree_depth_percent_max,
+        ) = (
+            args.surrogate_pretrain_subtree_depth_percent_max,
+            args.surrogate_pretrain_subtree_depth_percent_min,
+        )
+    args.surrogate_pretrain_subtree_random_depth = bool(
+        getattr(args, "surrogate_pretrain_subtree_random_depth", True)
+    )
+    args.surrogate_pretrain_subtree_reuse_train_sampler = bool(
+        getattr(args, "surrogate_pretrain_subtree_reuse_train_sampler", True)
+    )
+    args.surrogate_pretrain_subtree_steps_per_full = max(
+        int(getattr(args, "surrogate_pretrain_subtree_steps_per_full", 50)),
+        1,
+    )
+    args.surrogate_pretrain_full_calibration_interval = max(
+        int(getattr(args, "surrogate_pretrain_full_calibration_interval", 50)),
+        1,
+    )
+    if (
+        _cli_option_was_provided("--surrogate_pretrain_subtree_steps_per_full")
+        and not _cli_option_was_provided("--surrogate_pretrain_full_calibration_interval")
+    ):
+        args.surrogate_pretrain_full_calibration_interval = int(args.surrogate_pretrain_subtree_steps_per_full)
+    args.surrogate_pretrain_full_calibration_steps = max(
+        int(getattr(args, "surrogate_pretrain_full_calibration_steps", 1)),
+        1,
+    )
+    args.surrogate_pretrain_subtree_teacher_type = str(
+        getattr(args, "surrogate_pretrain_subtree_teacher_type", "local_actual")
+    ).strip().lower()
+    if args.surrogate_pretrain_subtree_teacher_type not in {"local_actual", "local_proxy", "inherited_full", "none"}:
+        raise ValueError(
+            "--surrogate_pretrain_subtree_teacher_type must be one of: "
+            "local_actual, local_proxy, inherited_full, none"
+        )
+    args.surrogate_pretrain_max_wall_time_sec = max(
+        float(getattr(args, "surrogate_pretrain_max_wall_time_sec", 0.0)),
+        0.0,
+    )
+    args.loss_grad_probe_enabled = bool(getattr(args, "loss_grad_probe_enabled", False))
+    args.loss_grad_probe_interval = max(int(getattr(args, "loss_grad_probe_interval", 1)), 0)
+    args.step_grad_log = bool(getattr(args, "step_grad_log", False))
+    args.step_grad_log_interval = max(int(getattr(args, "step_grad_log_interval", 1)), 1)
+    args.step_grad_first_step_only = bool(getattr(args, "step_grad_first_step_only", True))
+    args.skip_optimizer_on_nonfinite_grad = bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
+    args.nonfinite_grad_log_param_limit = max(int(getattr(args, "nonfinite_grad_log_param_limit", 8)), 0)
+    args.train_grad_clip = max(float(getattr(args, "train_grad_clip", 0.0)), 0.0)
+    args.surrogate_update_during_training = bool(getattr(args, "surrogate_update_during_training", True))
+    args.surrogate_update_interval = max(int(getattr(args, "surrogate_update_interval", 1)), 1)
+    args.surrogate_joint_lr_scale = max(float(getattr(args, "surrogate_joint_lr_scale", 0.5)), 0.0)
+    args.compression_surrogate_huber_beta = max(
+        float(getattr(args, "compression_surrogate_huber_beta", 0.05)), 1e-4
+    )
+    args.compression_surrogate_sign_loss_weight = max(
+        float(getattr(args, "compression_surrogate_sign_loss_weight", 0.25)), 0.0
+    )
+    args.compression_surrogate_improvement_sign_weight = max(
+        float(getattr(args, "compression_surrogate_improvement_sign_weight", 4.0)), 1.0
+    )
+    args.compression_surrogate_sign_scale = max(
+        float(getattr(args, "compression_surrogate_sign_scale", 0.10)), 1e-4
+    )
+    args.compression_surrogate_sign_deadband = max(
+        float(getattr(args, "compression_surrogate_sign_deadband", 1e-4)), 0.0
+    )
+    args.compression_surrogate_reference_cache_entries = max(
+        int(getattr(args, "compression_surrogate_reference_cache_entries", 64)), 1
+    )
+    args.surrogate_update_on_teacher_refresh_only = bool(
+        getattr(args, "surrogate_update_on_teacher_refresh_only", False)
+    )
+    args.surrogate_realign_on_low_corr = bool(getattr(args, "surrogate_realign_on_low_corr", False))
+    args.surrogate_realign_min_corr = float(getattr(args, "surrogate_realign_min_corr", 0.3))
+    args.surrogate_realign_steps = max(int(getattr(args, "surrogate_realign_steps", 0)), 0)
+    args.surrogate_auto_freeze = bool(getattr(args, "surrogate_auto_freeze", False))
+    args.surrogate_freeze_abs_error = max(float(getattr(args, "surrogate_freeze_abs_error", 1.0)), 0.0)
+    args.surrogate_freeze_train_loss = max(float(getattr(args, "surrogate_freeze_train_loss", 1.0)), 0.0)
+    args.surrogate_freeze_patience = max(int(getattr(args, "surrogate_freeze_patience", 8)), 1)
+    args.surrogate_resume_abs_error = max(float(getattr(args, "surrogate_resume_abs_error", 2.0)), 0.0)
+    args.surrogate_resume_train_loss = max(float(getattr(args, "surrogate_resume_train_loss", 2.0)), 0.0)
+    args.compression_good_step_boost = bool(getattr(args, "compression_good_step_boost", True))
+    args.compression_good_step_boost_scale = min(
+        max(float(getattr(args, "compression_good_step_boost_scale", 1.5)), 1.0),
+        4.0,
+    )
+    args.compression_good_step_prefreeze_scale = min(
+        max(float(getattr(args, "compression_good_step_prefreeze_scale", 1.15)), 1.0),
+        2.0,
+    )
+    args.compression_good_step_prefreeze_max_train_loss = max(
+        float(getattr(args, "compression_good_step_prefreeze_max_train_loss", 4.0)),
+        0.0,
+    )
+    args.compression_good_step_extra_surrogate_steps = max(
+        int(getattr(args, "compression_good_step_extra_surrogate_steps", 4)),
+        0,
+    )
+    args.compression_bad_step_penalty_scale = min(
+        max(float(getattr(args, "compression_bad_step_penalty_scale", 1.25)), 1.0),
+        4.0,
+    )
+    args.compression_boost_requires_surrogate_frozen = bool(
+        getattr(args, "compression_boost_requires_surrogate_frozen", True)
+    )
+    args.compression_boost_max_abs_error = max(float(getattr(args, "compression_boost_max_abs_error", 1.0)), 0.0)
+    args.compression_surrogate_forward_mode = str(
+        getattr(args, "compression_surrogate_forward_mode", "teacher_ste")
+    ).strip().lower()
+    if args.compression_surrogate_forward_mode not in {"surrogate", "teacher_ste"}:
+        raise ValueError("--compression_surrogate_forward_mode must be surrogate or teacher_ste")
+    # 出力ノイズを明示的に無効化し、cleanな出力点群を圧縮損失へ渡す既定にする。
+    args.disable_output_noise = bool(getattr(args, "disable_output_noise", True))
+    # disable_output_noise=Trueなら既存の一様ノイズflagも強制的に無効化する。
+    args.use_uniform_noise = bool(getattr(args, "use_uniform_noise", False)) and not args.disable_output_noise
+    # actual/surrogate圧縮目的で実bit直結項と内訳項を混ぜる比率を0-1へ収める。
+    args.actual_total_bit_objective_mix = min(max(float(getattr(args, "actual_total_bit_objective_mix", 0.5)), 0.0), 1.0)
+    # Add/Adjustの実行量をActuator特徴から学習するかをboolへ正規化する。
+    args.repair_learn_operation_amounts = bool(getattr(args, "repair_learn_operation_amounts", True))
+
+    # 学習された操作量を位置logitへ戻す強さを非負値へ正規化する。
+    args.repair_operation_amount_bias_scale = max(
+        float(getattr(args, "repair_operation_amount_bias_scale", 2.0)),
+        0.0,
+    )
+
+    # Amount ratioから下流の点操作へ向かう勾配だけを強める倍率を正規化する。
+    args.repair_amount_downstream_grad_max_scale = max(
+        float(getattr(args, "repair_amount_downstream_grad_max_scale", 20.0)),
+        1.0,
+    )
+    args.repair_amount_downstream_grad_scale = max(
+        float(getattr(args, "repair_amount_downstream_grad_scale", 6.0)),
+        1.0,
+    )
+    args.repair_drop_amount_downstream_grad_scale = max(
+        float(getattr(args, "repair_drop_amount_downstream_grad_scale", args.repair_amount_downstream_grad_scale)),
+        1.0,
+    )
+    args.repair_add_amount_downstream_grad_scale = max(
+        float(getattr(args, "repair_add_amount_downstream_grad_scale", args.repair_amount_downstream_grad_scale)),
+        1.0,
+    )
+    args.repair_move_amount_downstream_grad_scale = max(
+        float(getattr(args, "repair_move_amount_downstream_grad_scale", args.repair_amount_downstream_grad_scale)),
+        1.0,
+    )
+    args.repair_amount_downstream_grad_scale = min(args.repair_amount_downstream_grad_scale, args.repair_amount_downstream_grad_max_scale)
+    args.repair_drop_amount_downstream_grad_scale = min(args.repair_drop_amount_downstream_grad_scale, args.repair_amount_downstream_grad_max_scale)
+    args.repair_add_amount_downstream_grad_scale = min(args.repair_add_amount_downstream_grad_scale, args.repair_amount_downstream_grad_max_scale)
+    args.repair_move_amount_downstream_grad_scale = min(args.repair_move_amount_downstream_grad_scale, args.repair_amount_downstream_grad_max_scale)
+    args.repair_soft_normalizer_floor = max(float(getattr(args, "repair_soft_normalizer_floor", 1e-4)), 1e-8)
+
+    # 学習済み操作割合と実soft操作率を結ぶ補助損失の強さを非負値へ収める。
+    args.repair_operation_amount_consistency_weight = max(
+        float(getattr(args, "repair_operation_amount_consistency_weight", 1.0)),
+        0.0,
+    )
+    args.repair_operation_amount_direct_weight = max(
+        float(getattr(args, "repair_operation_amount_direct_weight", 0.01)),
+        0.0,
+    )
+    args.repair_drop_amount_supervision_weight = max(float(getattr(args, "repair_drop_amount_supervision_weight", 0.001)), 0.0)
+    args.repair_drop_amount_soft_consistency_weight = max(float(getattr(args, "repair_drop_amount_soft_consistency_weight", 0.0005)), 0.0)
+    args.repair_move_amount_supervision_weight = max(float(getattr(args, "repair_move_amount_supervision_weight", 0.001)), 0.0)
+    args.repair_move_amount_soft_consistency_weight = max(float(getattr(args, "repair_move_amount_soft_consistency_weight", 0.0005)), 0.0)
+    args.repair_add_amount_supervision_weight = max(float(getattr(args, "repair_add_amount_supervision_weight", 0.001)), 0.0)
+    args.repair_add_amount_soft_consistency_weight = max(float(getattr(args, "repair_add_amount_soft_consistency_weight", 0.0005)), 0.0)
+    # 学習初期のPrune/Add/Adjust実行量探索率を0-1へ収める。
+    args.repair_drop_amount_random_mix_start = min(max(float(getattr(args, "repair_drop_amount_random_mix_start", 0.35)), 0.0), 1.0)
+    args.repair_drop_amount_random_mix_end = min(max(float(getattr(args, "repair_drop_amount_random_mix_end", 0.0)), 0.0), 1.0)
+    args.repair_add_amount_random_mix_start = min(max(float(getattr(args, "repair_add_amount_random_mix_start", 0.35)), 0.0), 1.0)
+    args.repair_add_amount_random_mix_end = min(max(float(getattr(args, "repair_add_amount_random_mix_end", 0.0)), 0.0), 1.0)
+    args.repair_move_amount_random_mix_start = min(max(float(getattr(args, "repair_move_amount_random_mix_start", 0.35)), 0.0), 1.0)
+    args.repair_move_amount_random_mix_end = min(max(float(getattr(args, "repair_move_amount_random_mix_end", 0.0)), 0.0), 1.0)
+    # Adjust source scoreへ入れる探索ノイズ量を非負値へ正規化する。
+    args.repair_move_score_noise_start = max(float(getattr(args, "repair_move_score_noise_start", 0.0)), 0.0)
+    args.repair_move_score_noise_end = max(float(getattr(args, "repair_move_score_noise_end", 0.0)), 0.0)
+    args.noise_delta = float(getattr(args, "noise_delta", 1.0))
+    args.log_step_time = bool(getattr(args, "log_step_time", True))
+    args.log_gpu_memory = bool(getattr(args, "log_gpu_memory", True))
+    args.compact_step_text_log = bool(getattr(args, "compact_step_text_log", True))
+    args.network_only_audit_verbose = bool(getattr(
+        args, "network_only_audit_verbose", False
+    ))
+    args.network_only_head_audit_interval = max(int(getattr(
+        args, "network_only_head_audit_interval", 10
+    )), 1)
+    args.train_window_shuffle_each_cycle = bool(getattr(
+        args, "train_window_shuffle_each_cycle", True
+    ))
+    args.full_cloud_empty_cache_threshold_mb = max(float(getattr(
+        args, "full_cloud_empty_cache_threshold_mb", 8192.0
+    )), 0.0)
+    args.profile_interval = max(int(getattr(args, "profile_interval", 100)), 1)
+    args.lr_scheduler_enabled = bool(getattr(args, "lr_scheduler_enabled", False))
+    args.lr_scheduler_mode = str(getattr(args, "lr_scheduler_mode", "step")).strip().lower()
+    if args.lr_scheduler_mode not in {"step", "plateau"}:
+        raise ValueError("lr_scheduler_mode must be step or plateau")
+    args.lr_plateau_patience = max(int(getattr(args, "lr_plateau_patience", 60)), 1)
+    args.lr_plateau_min_delta = max(float(getattr(args, "lr_plateau_min_delta", 0.02)), 0.0)
+    args.lr_plateau_cooldown = max(int(getattr(args, "lr_plateau_cooldown", 15)), 0)
+    args.min_main_lr = max(float(getattr(args, "min_main_lr", 1e-5)), 0.0)
+    args.min_surrogate_lr = max(float(getattr(args, "min_surrogate_lr", 1e-6)), 0.0)
+    # SparsePCGC hard統計は重いため、既定ではprofile間隔と同じ頻度に制限する。
+    args.sparsepcgc_hard_debug_interval = max(int(getattr(args, "sparsepcgc_hard_debug_interval", args.profile_interval)), 0)
+    # 通常ログにhard統計を連動させるかをboolへ正規化する。
+    args.sparsepcgc_hard_debug_on_log = bool(getattr(args, "sparsepcgc_hard_debug_on_log", False))
+    args.actual_eval_interval = max(int(getattr(args, "actual_eval_interval", 1000)), 0)
+    args.sparsepcgc_inner_psnr = bool(getattr(args, "sparsepcgc_inner_psnr", False))
+    args.sparsepcgc_fast_binary_ply = bool(getattr(args, "sparsepcgc_fast_binary_ply", True))
+    release_worker = getattr(args, "sparsepcgc_release_worker_after_request", None)
+    if release_worker is None:
+        release_worker = False
+    args.sparsepcgc_release_worker_after_request = bool(release_worker)
+    args.sparsepcgc_warmup_worker_before_train = bool(
+        getattr(args, "sparsepcgc_warmup_worker_before_train", True)
+    )
+    args.sparsepcgc_binary_ply_fallback_ascii = bool(getattr(args, "sparsepcgc_binary_ply_fallback_ascii", True))
+    args.sparsepcgc_reuse_workspace = bool(getattr(args, "sparsepcgc_reuse_workspace", True))
+    args.sparsepcgc_actual_result_cache = bool(getattr(args, "sparsepcgc_actual_result_cache", True))
+    args.sparsepcgc_actual_result_cache_max_entries = max(int(getattr(args, "sparsepcgc_actual_result_cache_max_entries", 256)), 1)
+    args.sparsepcgc_omp_threads = max(int(getattr(args, "sparsepcgc_omp_threads", 12)), 1)
+    args.sparsepcgc_worker_cuda_cleanup_interval = max(int(getattr(
+        args, "sparsepcgc_worker_cuda_cleanup_interval", 1
+    )), 0)
+    args.sparsepcgc_cpu_actual_overlap = bool(
+        getattr(args, "sparsepcgc_cpu_actual_overlap", True)
+    )
+    args.sparsepcgc_gpu_min_free_mb = max(int(getattr(args, "sparsepcgc_gpu_min_free_mb", 4096)), 0)
+    args.sparsepcgc_host_min_available_mb = max(int(getattr(
+        args, "sparsepcgc_host_min_available_mb", 8192
+    )), 0)
+    args.sparsepcgc_host_wait_timeout = max(float(getattr(
+        args, "sparsepcgc_host_wait_timeout", 600.0
+    )), 0.0)
+    args.sparsepcgc_auto_cpu_fallback = bool(
+        getattr(args, "sparsepcgc_auto_cpu_fallback", True)
+    )
+    args.sparsepcgc_gpu_wait_timeout = max(float(getattr(args, "sparsepcgc_gpu_wait_timeout", 600.0)), 0.0)
+    args.sparsepcgc_gpu_wait_interval = max(float(getattr(args, "sparsepcgc_gpu_wait_interval", 2.0)), 0.1)
+    args.sparsepcgc_oom_retry_count = max(int(getattr(args, "sparsepcgc_oom_retry_count", 2)), 0)
+    args.sparsepcgc_worker_gpu_stats = bool(getattr(args, "sparsepcgc_worker_gpu_stats", False))
+    args.disable_actual_codec_during_train = bool(getattr(args, "disable_actual_codec_during_train", False))
+    args.actual_codec_fallback_to_proxy_on_error = bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", False))
+    args.skip_optimizer_on_actual_fallback = bool(getattr(args, "skip_optimizer_on_actual_fallback", True))
+    args.actual_compression_guard = bool(getattr(args, "actual_compression_guard", True))
+    args.train_until_converged = bool(getattr(args, "train_until_converged", False))
+    args.exploration_schedule_episodes = max(
+        int(getattr(args, "exploration_schedule_episodes", 0)), 0
+    )
+    args.convergence_min_episodes = max(int(getattr(args, "convergence_min_episodes", 0)), 0)
+    args.convergence_max_episodes = max(int(getattr(args, "convergence_max_episodes", 384)), 1)
+    args.convergence_window_episodes = max(int(getattr(args, "convergence_window_episodes", 16)), 4)
+    args.convergence_patience_episodes = max(int(getattr(args, "convergence_patience_episodes", 32)), 1)
+    args.convergence_guard_cooldown_episodes = max(int(getattr(args, "convergence_guard_cooldown_episodes", 16)), 0)
+    for _name in (
+        "convergence_total_loss_slope_max",
+        "convergence_total_loss_half_delta_max",
+        "convergence_compression_slope_max",
+        "convergence_compression_half_delta_max",
+        "convergence_fixed_objective_slope_max",
+        "convergence_fixed_objective_half_delta_max",
+        "convergence_geometry_relative_worsening_max",
+    ):
+        setattr(args, _name, max(float(getattr(args, _name)), 0.0))
+    convergence_minimum = max(args.convergence_min_episodes, int(args.episodes), 1)
+    if (
+        args.train_until_converged
+        and args.convergence_max_episodes
+        < convergence_minimum + args.convergence_patience_episodes
+    ):
+        raise ValueError(
+            "--convergence_max_episodes must leave at least "
+            "--convergence_patience_episodes after the minimum episode"
+        )
+    args.actual_guard_patience = max(int(getattr(args, "actual_guard_patience", 2)), 1)
+    args.actual_guard_tolerance = max(float(getattr(args, "actual_guard_tolerance", 0.25)), 0.0)
+    args.actual_guard_autonomy_compression_target = float(getattr(
+        args, "actual_guard_autonomy_compression_target", -3.5
+    ))
+    args.actual_guard_autonomy_min_improvement = max(float(getattr(
+        args, "actual_guard_autonomy_min_improvement", 0.01
+    )), 0.0)
+    args.actual_guard_decay_lr = bool(getattr(args, "actual_guard_decay_lr", False))
+    args.actual_guard_lr_decay = min(max(float(getattr(args, "actual_guard_lr_decay", 0.5)), 0.0), 1.0)
+    args.actual_guard_min_fresh = max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
+    args.actual_guard_restore_best = bool(getattr(args, "actual_guard_restore_best", True))
+    args.actual_guard_require_fixed_validation = bool(
+        getattr(args, "actual_guard_require_fixed_validation", True)
+    )
+    args.actual_guard_require_full_state_restore = bool(
+        getattr(args, "actual_guard_require_full_state_restore", True)
+    )
+    args.actual_guard_max_restores = max(int(getattr(
+        args, "actual_guard_max_restores", 1
+    )), 0)
+    args.actual_guard_max_restore_age_episodes = max(int(
+        getattr(args, "actual_guard_max_restore_age_episodes", 16)
+    ), 0)
+    args.actual_guard_rebase_stale_best = bool(
+        getattr(args, "actual_guard_rebase_stale_best", True)
+    )
+    args.actual_guard_improvement_epsilon = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
+    args.checkpoint_actual_source = str(
+        getattr(args, "checkpoint_actual_source", "auto")
+    ).strip().lower()
+    if args.checkpoint_actual_source not in {"auto", "fresh", "full_cloud"}:
+        raise ValueError("--checkpoint_actual_source must be one of: auto, fresh, full_cloud")
+    args.checkpoint_full_cloud_min_count = max(
+        int(getattr(args, "checkpoint_full_cloud_min_count", 1)),
+        0,
+    )
+    args.checkpoint_min_optimizer_step_ratio = min(
+        max(float(getattr(args, "checkpoint_min_optimizer_step_ratio", 0.20)), 0.0),
+        1.0,
+    )
+    args.max_train_steps = max(int(getattr(args, "max_train_steps", 0)), 0)
+    args.save_good_bad_cases = bool(getattr(args, "save_good_bad_cases", False))
+    args.save_proxy_actual_bad_cases = bool(getattr(args, "save_proxy_actual_bad_cases", True))
+    args.proxy_actual_bad_case_threshold = max(float(getattr(args, "proxy_actual_bad_case_threshold", 0.0)), 0.0)
+    args.good_case_delta_threshold = float(getattr(args, "good_case_delta_threshold", -5.0))
+    args.bad_case_delta_threshold = float(getattr(args, "bad_case_delta_threshold", 20.0))
+    args.max_saved_cases = max(int(getattr(args, "max_saved_cases", 64)), 0)
+    args.operation_dead_grad_warn_threshold = max(float(getattr(args, "operation_dead_grad_warn_threshold", 1e-12)), 0.0)
+    args.operation_dead_grad_warn_patience = max(int(getattr(args, "operation_dead_grad_warn_patience", 20)), 1)
+    args.repair_add_ratio_floor = min(max(float(getattr(args, "repair_add_ratio_floor", 0.0)), 0.0), 0.05)
+    args.repair_drop_ratio_floor = min(max(float(getattr(args, "repair_drop_ratio_floor", 0.0)), 0.0), 0.05)
+    args.repair_operation_gate_enabled = bool(getattr(args, "repair_operation_gate_enabled", True))
+    args.repair_operation_gate_temperature = max(float(getattr(args, "repair_operation_gate_temperature", 1.0)), 1e-6)
+    args.repair_operation_gate_hard_threshold = min(max(float(getattr(args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
+    args.repair_operation_gate_random_mix_start = min(max(float(getattr(args, "repair_operation_gate_random_mix_start", 0.0)), 0.0), 1.0)
+    args.repair_operation_gate_random_mix_end = min(max(float(getattr(args, "repair_operation_gate_random_mix_end", 0.0)), 0.0), 1.0)
+    args.repair_operation_gate_logit_scale = max(float(getattr(args, "repair_operation_gate_logit_scale", 6.0)), 1e-6)
+    args.repair_operation_gate_pool_std_weight = max(float(getattr(args, "repair_operation_gate_pool_std_weight", 0.50)), 0.0)
+    args.repair_operation_gate_pool_max_weight = max(float(getattr(args, "repair_operation_gate_pool_max_weight", 0.25)), 0.0)
+    args.repair_operation_gate_init_drop = min(max(float(getattr(args, "repair_operation_gate_init_drop", 0.50)), 1e-4), 1.0 - 1e-4)
+    args.repair_operation_gate_init_add = min(max(float(getattr(args, "repair_operation_gate_init_add", 0.50)), 1e-4), 1.0 - 1e-4)
+    args.repair_operation_gate_init_move = min(max(float(getattr(args, "repair_operation_gate_init_move", 0.50)), 1e-4), 1.0 - 1e-4)
+    args.repair_max_hard_drop_voxels = max(int(getattr(args, "repair_max_hard_drop_voxels", 0)), 0)
+    args.repair_max_hard_move_voxels = max(int(getattr(args, "repair_max_hard_move_voxels", 0)), 0)
+    args.sparsepcgc_actual_oracle_max_selected_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_candidate_where_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_candidate_where_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_direction_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_direction_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_direction_loss_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_direction_loss_weight", 0.01)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_candidate_logit_clip = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_candidate_logit_clip", 20.0)),
+        1.0,
+    )
+    args.sparsepcgc_actual_oracle_amount_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_amount_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_amount_logit_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_group_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_group_voxels", 4)),
+        2,
+    )
+    raw_oracle_group_sizes = getattr(args, "sparsepcgc_actual_oracle_group_size_list", "4,16")
+    if isinstance(raw_oracle_group_sizes, str):
+        oracle_group_sizes = []
+        for item in raw_oracle_group_sizes.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                oracle_group_sizes.append(int(float(item)))
+            except ValueError:
+                continue
+    elif isinstance(raw_oracle_group_sizes, (list, tuple)):
+        oracle_group_sizes = []
+        for item in raw_oracle_group_sizes:
+            try:
+                oracle_group_sizes.append(int(float(item)))
+            except (TypeError, ValueError):
+                continue
+    else:
+        oracle_group_sizes = []
+    if not oracle_group_sizes:
+        oracle_group_sizes = [args.sparsepcgc_actual_oracle_group_voxels]
+    args.sparsepcgc_actual_oracle_group_size_list = sorted(
+        {
+            min(
+                max(int(size), 2),
+                int(args.sparsepcgc_actual_oracle_group_voxels),
+            )
+            for size in oracle_group_sizes
+            if int(size) >= 2
+        }
+    ) or [int(args.sparsepcgc_actual_oracle_group_voxels)]
+    args.sparsepcgc_actual_oracle_macro_prune_min_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_macro_prune_min_voxels", 8)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_apply_full_override = bool(
+        getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False)
+    )
+    args.sparsepcgc_actual_oracle_apply_teacher_actions = bool(
+        getattr(args, "sparsepcgc_actual_oracle_apply_teacher_actions", False)
+    )
+    args.sparsepcgc_actual_oracle_local_max_drop_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_local_max_drop_ratio", 0.05)), 0.0),
+        0.10,
+    )
+    args.repair_balance_operation_head_grads = bool(
+        getattr(args, "repair_balance_operation_head_grads", True)
+    )
+    args.repair_operation_head_grad_target = max(
+        float(getattr(args, "repair_operation_head_grad_target", 1.0)),
+        0.0,
+    )
+    args.repair_operation_head_grad_min_scale = max(
+        float(getattr(args, "repair_operation_head_grad_min_scale", 1e-4)),
+        0.0,
+    )
+    args.repair_operation_head_grad_max_scale = max(
+        float(getattr(args, "repair_operation_head_grad_max_scale", 100000.0)),
+        args.repair_operation_head_grad_min_scale,
+    )
+    args.repair_online_decision_grad_max_norm = max(
+        float(getattr(args, "repair_online_decision_grad_max_norm", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_codec_prune_prior = bool(
+        getattr(args, "sparsepcgc_codec_prune_prior", False)
+    )
+    args.sparsepcgc_codec_prune_prior_block_size = max(
+        int(getattr(args, "sparsepcgc_codec_prune_prior_block_size", 0)),
+        0,
+    )
+    args.sparsepcgc_codec_prune_prior_ratio = min(
+        max(float(getattr(args, "sparsepcgc_codec_prune_prior_ratio", 0.05)), 0.0),
+        0.05,
+    )
+    args.sparsepcgc_codec_prune_prior_logit_weight = max(
+        float(getattr(args, "sparsepcgc_codec_prune_prior_logit_weight", 6.0)),
+        0.0,
+    )
+    args.sparsepcgc_codec_prune_prior_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_codec_prune_prior_warmup_steps", 0)),
+        0,
+    )
+    args.sparsepcgc_training_mode = str(
+        getattr(args, "sparsepcgc_training_mode", "subtree_selector")
+    ).strip().lower()
+    if args.sparsepcgc_training_mode not in {"subtree_selector", "full_cloud_amount", "legacy"}:
+        args.sparsepcgc_training_mode = "full_cloud_amount"
+    args.sparsepcgc_warmup_force_codec_prior_amount = bool(
+        getattr(args, "sparsepcgc_warmup_force_codec_prior_amount", True)
+    )
+    args.sparsepcgc_prune_after_prior_mode = str(
+        getattr(args, "sparsepcgc_prune_after_prior_mode", "network")
+    ).strip().lower()
+    if args.sparsepcgc_prune_after_prior_mode not in {"oracle", "network", "direct_network"}:
+        args.sparsepcgc_prune_after_prior_mode = "network"
+    args.sparsepcgc_network_prune_ratio_floor = min(
+        max(float(getattr(args, "sparsepcgc_network_prune_ratio_floor", 0.001)), 0.0),
+        0.95,
+    )
+    args.sparsepcgc_network_prune_min_hard_count = max(
+        int(getattr(args, "sparsepcgc_network_prune_min_hard_count", 1)),
+        0,
+    )
+    args.sparsepcgc_codec_prior_warmup_min_hard_count = max(
+        int(getattr(args, "sparsepcgc_codec_prior_warmup_min_hard_count", 1)),
+        0,
+    )
+    args.sparsepcgc_network_prune_floor_steps = max(
+        int(getattr(args, "sparsepcgc_network_prune_floor_steps", 20)),
+        0,
+    )
+    args.sparsepcgc_network_prune_floor_decay_steps = max(
+        int(getattr(args, "sparsepcgc_network_prune_floor_decay_steps", 100)),
+        0,
+    )
+    args.sparsepcgc_hybrid_prune_prior = bool(
+        getattr(args, "sparsepcgc_hybrid_prune_prior", True)
+    )
+    args.sparsepcgc_hybrid_prior_tail_alpha = min(
+        max(float(getattr(args, "sparsepcgc_hybrid_prior_tail_alpha", 0.35)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_hybrid_prior_tail_steps = max(
+        int(getattr(args, "sparsepcgc_hybrid_prior_tail_steps", 1200)),
+        0,
+    )
+    args.sparsepcgc_hybrid_prior_amount_blend = bool(
+        getattr(args, "sparsepcgc_hybrid_prior_amount_blend", False)
+    )
+    args.sparsepcgc_prune_monotonic_floor = bool(
+        getattr(args, "sparsepcgc_prune_monotonic_floor", False)
+    )
+    args.sparsepcgc_prune_gate_monotonic_floor = bool(
+        getattr(args, "sparsepcgc_prune_gate_monotonic_floor", False)
+    )
+
+    args.sparsepcgc_hybrid_amount_mode = str(
+        getattr(args, "sparsepcgc_hybrid_amount_mode", "network")
+    ).strip().lower()
+    if args.sparsepcgc_hybrid_amount_mode not in {"max", "blend", "network"}:
+        args.sparsepcgc_hybrid_amount_mode = "network"
+
+    args.sparsepcgc_hybrid_amount_min_network_keep = min(
+        max(float(getattr(args, "sparsepcgc_hybrid_amount_min_network_keep", 0.15)), 0.0),
+        1.0,
+    )
+
+    args.sparsepcgc_hybrid_hard_action = bool(
+        getattr(args, "sparsepcgc_hybrid_hard_action", True)
+    )
+    args.sparsepcgc_hybrid_hard_action_tail_alpha = min(
+        max(float(getattr(args, "sparsepcgc_hybrid_hard_action_tail_alpha", 0.85)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_hybrid_hard_action_tail_steps = max(
+        int(getattr(args, "sparsepcgc_hybrid_hard_action_tail_steps", 2000)),
+        0,
+    )
+    args.sparsepcgc_hybrid_hard_action_period = max(
+        int(getattr(args, "sparsepcgc_hybrid_hard_action_period", 20)),
+        1,
+    )
+    args.sparsepcgc_legacy_direct_actuator_train = bool(
+        getattr(args, "sparsepcgc_legacy_direct_actuator_train", False)
+    )
+    if args.sparsepcgc_training_mode == "legacy":
+        args.sparsepcgc_legacy_direct_actuator_train = True
+    args.sparsepcgc_algorithmic_proposal_selector = bool(
+        getattr(args, "sparsepcgc_algorithmic_proposal_selector", True)
+    )
+    if args.sparsepcgc_legacy_direct_actuator_train:
+        args.sparsepcgc_algorithmic_proposal_selector = False
+    if args.sparsepcgc_training_mode == "full_cloud_amount":
+        args.sparsepcgc_algorithmic_proposal_selector = True
+    default_algorithmic_amount_bins = (0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+    parsed_algorithmic_bins = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_algorithmic_amount_bins",
+            ",".join(str(v) for v in default_algorithmic_amount_bins),
+        ),
+        default_algorithmic_amount_bins,
+    )
+    normalized_algorithmic_bins = []
+    for ratio in parsed_algorithmic_bins:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.30)
+        except Exception:
+            continue
+        if ratio_value > 0.0:
+            normalized_algorithmic_bins.append(ratio_value)
+    if not normalized_algorithmic_bins:
+        normalized_algorithmic_bins = list(default_algorithmic_amount_bins)
+    normalized_algorithmic_bins = sorted(set(normalized_algorithmic_bins))
+    args.sparsepcgc_algorithmic_amount_bin_values = tuple(normalized_algorithmic_bins)
+    args.sparsepcgc_algorithmic_amount_bins = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".") for value in normalized_algorithmic_bins
+    )
+    args.sparsepcgc_algorithmic_amount_residual_scale = min(
+        max(float(getattr(args, "sparsepcgc_algorithmic_amount_residual_scale", 0.005)), 0.0),
+        0.05,
+    )
+    args.sparsepcgc_algorithmic_amount_selector_teacher_weight = max(
+        float(getattr(args, "sparsepcgc_algorithmic_amount_selector_teacher_weight", 0.08)),
+        0.0,
+    )
+    args.sparsepcgc_algorithmic_amount_init_ratio = min(
+        max(float(getattr(args, "sparsepcgc_algorithmic_amount_init_ratio", 0.03)), 0.0),
+        0.30,
+    )
+    default_proposal_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+    parsed_proposal_bins = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_proposal_amount_bins",
+            ",".join(str(v) for v in default_proposal_amount_bins),
+        ),
+        default_proposal_amount_bins,
+    )
+    normalized_proposal_bins = [0.0]
+    for ratio in parsed_proposal_bins:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.05)
+        except Exception:
+            continue
+        normalized_proposal_bins.append(ratio_value)
+    normalized_proposal_bins = sorted(set(normalized_proposal_bins))
+    args.sparsepcgc_proposal_amount_bin_values = tuple(normalized_proposal_bins)
+    args.sparsepcgc_proposal_amount_bins = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".") if value != 0.0 else "0.0"
+        for value in normalized_proposal_bins
+    )
+    default_full_cloud_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+    parsed_full_cloud_bins = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_bins",
+            ",".join(str(v) for v in default_full_cloud_amount_bins),
+        ),
+        default_full_cloud_amount_bins,
+    )
+    normalized_full_cloud_bins = [0.0]
+    for ratio in parsed_full_cloud_bins:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.05)
+        except Exception:
+            continue
+        normalized_full_cloud_bins.append(ratio_value)
+    normalized_full_cloud_bins = sorted(set(normalized_full_cloud_bins))
+    args.sparsepcgc_full_cloud_amount_bin_values = tuple(normalized_full_cloud_bins)
+    args.sparsepcgc_full_cloud_amount_bins = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".") if value != 0.0 else "0.0"
+        for value in normalized_full_cloud_bins
+    )
+    args.sparsepcgc_full_cloud_amount_hidden_dim = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_hidden_dim", 64)),
+        8,
+    )
+    args.sparsepcgc_full_cloud_amount_init_bias_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_init_bias_mode", "weak_center")
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_init_bias_mode not in {
+        "center",
+        "uniform",
+        "weak_center",
+    }:
+        args.sparsepcgc_full_cloud_amount_init_bias_mode = "weak_center"
+    if (
+        str(getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")).strip().lower()
+        == "network_selected_bandit"
+        and not _cli_option_was_provided("--sparsepcgc_full_cloud_amount_init_bias_mode")
+    ):
+        args.sparsepcgc_full_cloud_amount_init_bias_mode = "uniform"
+    args.sparsepcgc_full_cloud_amount_reset_heads_on_more_training = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_reset_heads_on_more_training", True)
+    )
+    args.sparsepcgc_full_cloud_amount_residual_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_residual_enable", True)
+    )
+    args.sparsepcgc_full_cloud_amount_residual_max = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_residual_max", 0.0025)), 0.0),
+        0.01,
+    )
+    args.sparsepcgc_full_cloud_amount_residual_loss_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_residual_loss_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_residual_probe_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_residual_probe_enable", True)
+    )
+    parsed_full_cloud_residual_probe_offsets = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_residual_probe_offsets",
+            "-1.0,0.0,1.0",
+        ),
+        (-1.0, 0.0, 1.0),
+    )
+    normalized_full_cloud_residual_probe_offsets = []
+    for offset in parsed_full_cloud_residual_probe_offsets:
+        try:
+            offset_value = float(offset)
+        except Exception:
+            continue
+        if math.isfinite(offset_value):
+            normalized_full_cloud_residual_probe_offsets.append(offset_value)
+    if not normalized_full_cloud_residual_probe_offsets:
+        normalized_full_cloud_residual_probe_offsets = [-1.0, 0.0, 1.0]
+    args.sparsepcgc_full_cloud_amount_residual_probe_offset_values = tuple(
+        normalized_full_cloud_residual_probe_offsets
+    )
+    args.sparsepcgc_full_cloud_amount_residual_probe_offsets = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".")
+        for value in normalized_full_cloud_residual_probe_offsets
+    )
+    args.sparsepcgc_full_cloud_amount_fine_ratio_probe_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_fine_ratio_probe_enable", True)
+    )
+    parsed_full_cloud_fine_ratios = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_fine_ratios",
+            "0.028,0.030,0.032,0.034",
+        ),
+        (0.028, 0.030, 0.032, 0.034),
+    )
+    normalized_full_cloud_fine_ratios = []
+    for ratio in parsed_full_cloud_fine_ratios:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.05)
+        except Exception:
+            continue
+        if math.isfinite(ratio_value):
+            normalized_full_cloud_fine_ratios.append(ratio_value)
+    normalized_full_cloud_fine_ratios = sorted(set(normalized_full_cloud_fine_ratios))
+    args.sparsepcgc_full_cloud_amount_fine_ratio_values = tuple(normalized_full_cloud_fine_ratios)
+    args.sparsepcgc_full_cloud_amount_fine_ratios = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".")
+        for value in normalized_full_cloud_fine_ratios
+    )
+    args.sparsepcgc_full_cloud_amount_fine_ratio_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_fine_ratio_warmup_steps", 200)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_residual_teacher_mode = str(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_residual_teacher_mode",
+            "candidate_ratio",
+        )
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_residual_teacher_mode not in {
+        "candidate_ratio",
+        "nearest_bin",
+    }:
+        args.sparsepcgc_full_cloud_amount_residual_teacher_mode = "candidate_ratio"
+    args.sparsepcgc_full_cloud_amount_fresh_actual_every_step = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_fresh_actual_every_step", True)
+    )
+    args.sparsepcgc_full_cloud_amount_actual_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_actual_interval", 1)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_warmup_actual_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_actual_interval", 1)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_steps", 20)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_max_actual_candidates_per_step = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_max_actual_candidates_per_step", 1)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_multi_actual_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_multi_actual_enable", False)
+    )
+    args.sparsepcgc_full_cloud_amount_actual_candidate_policy = str(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_actual_candidate_policy",
+            "selected_only",
+        )
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_actual_candidate_policy not in {
+        "selected_only",
+        "selected_plus_neighbors",
+        "selected_plus_surrogate_topk",
+        "selected_neighbors_memory_surrogate",
+        "all_bins",
+    }:
+        args.sparsepcgc_full_cloud_amount_actual_candidate_policy = "selected_only"
+    args.sparsepcgc_full_cloud_amount_actual_topk = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_actual_topk", 0)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step", 1)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_multi_actual_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_multi_actual_warmup_steps", 100)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_oracle_sweep_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_oracle_sweep_interval", 0)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_oracle_sweep_max_bins = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_oracle_sweep_max_bins", 8)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_enable", True)
+    )
+    parsed_full_cloud_wide_probe_ratios = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_wide_probe_ratios",
+            "0.005,0.010,0.015,0.020,0.025,0.030,0.035,0.040,0.045,0.050",
+        ),
+        (0.005, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.045, 0.050),
+    )
+    normalized_full_cloud_wide_probe_ratios = []
+    for ratio in parsed_full_cloud_wide_probe_ratios:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.05)
+        except Exception:
+            continue
+        if math.isfinite(ratio_value) and ratio_value > 0.0:
+            normalized_full_cloud_wide_probe_ratios.append(ratio_value)
+    normalized_full_cloud_wide_probe_ratios = sorted(set(normalized_full_cloud_wide_probe_ratios))
+    args.sparsepcgc_full_cloud_amount_wide_probe_ratio_values = tuple(
+        normalized_full_cloud_wide_probe_ratios
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_ratios = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".")
+        for value in normalized_full_cloud_wide_probe_ratios
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_interval", 50)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_sequence_head_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_sequence_head_steps", 2)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_max_actual = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_max_actual", 3)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_sequence_memory_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_enable", True)
+    )
+    args.sparsepcgc_full_cloud_amount_sequence_memory_topk = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_topk", 3)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_sequence_memory_momentum = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_momentum", 0.7)), 0.0),
+        0.9999,
+    )
+    args.sparsepcgc_reuse_where_ranking_for_amounts = bool(
+        getattr(args, "sparsepcgc_reuse_where_ranking_for_amounts", True)
+    )
+    args.sparsepcgc_actual_parallel_mode = str(
+        getattr(args, "sparsepcgc_actual_parallel_mode", "single")
+    ).strip().lower()
+    if args.sparsepcgc_actual_parallel_mode not in {"single", "worker_pool"}:
+        args.sparsepcgc_actual_parallel_mode = "single"
+    args.sparsepcgc_actual_parallel_candidates = max(
+        int(getattr(args, "sparsepcgc_actual_parallel_candidates", 1)),
+        1,
+    )
+    args.sparsepcgc_actual_parallel_fallback_to_single = bool(
+        getattr(args, "sparsepcgc_actual_parallel_fallback_to_single", True)
+    )
+    args.sparsepcgc_full_cloud_amount_teacher_actual_priority = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_teacher_actual_priority", True)
+    )
+    args.sparsepcgc_full_cloud_amount_entropy_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_entropy_weight", 0.01)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_entropy_decay_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_entropy_decay_steps", 2000)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_min_entropy_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_min_entropy_weight", 0.001)),
+        0.0,
+    )
+    args.sparsepcgc_actual_bit_objective = str(
+        getattr(args, "sparsepcgc_actual_bit_objective", "raw")
+    ).strip().lower()
+    if args.sparsepcgc_actual_bit_objective not in {"raw", "billed"}:
+        args.sparsepcgc_actual_bit_objective = "raw"
+    args.sparsepcgc_where_mode = str(
+        getattr(args, "sparsepcgc_where_mode", "block_only")
+    ).strip().lower()
+    if args.sparsepcgc_where_mode not in {
+        "block_only",
+        "macro_micro_heuristic",
+        "macro_micro_hybrid",
+    }:
+        args.sparsepcgc_where_mode = "block_only"
+    args.sparsepcgc_where_macro_max_ratio = min(
+        max(float(getattr(args, "sparsepcgc_where_macro_max_ratio", 0.01)), 0.0),
+        0.30,
+    )
+    args.sparsepcgc_where_macro_share = min(
+        max(float(getattr(args, "sparsepcgc_where_macro_share", 0.25)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_where_macro_max_blocks = max(
+        int(getattr(args, "sparsepcgc_where_macro_max_blocks", 1)),
+        0,
+    )
+    args.sparsepcgc_where_macro_min_total_ratio = min(
+        max(float(getattr(args, "sparsepcgc_where_macro_min_total_ratio", 0.015)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_where_micro_exclude_macro_blocks = bool(
+        getattr(args, "sparsepcgc_where_micro_exclude_macro_blocks", True)
+    )
+    args.sparsepcgc_where_micro_block_quota_fraction = min(
+        max(float(getattr(args, "sparsepcgc_where_micro_block_quota_fraction", 0.10)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_where_micro_min_selected_blocks = max(
+        int(getattr(args, "sparsepcgc_where_micro_min_selected_blocks", 8)),
+        1,
+    )
+    args.sparsepcgc_where_micro_round_robin = bool(
+        getattr(args, "sparsepcgc_where_micro_round_robin", True)
+    )
+    args.sparsepcgc_where_micro_use_delete_prior = bool(
+        getattr(args, "sparsepcgc_where_micro_use_delete_prior", True)
+    )
+    args.sparsepcgc_full_cloud_amount_learning_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_learning_mode not in {
+        "multi_actual_teacher",
+        "network_selected_bandit",
+    }:
+        args.sparsepcgc_full_cloud_amount_learning_mode = "network_selected_bandit"
+    args.sparsepcgc_full_cloud_amount_action_sample_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_action_sample_mode", "categorical")
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_action_sample_mode not in {
+        "argmax",
+        "categorical",
+        "gumbel",
+    }:
+        args.sparsepcgc_full_cloud_amount_action_sample_mode = "categorical"
+    args.train_8i_sequence_mode = str(
+        getattr(args, "train_8i_sequence_mode", "first3")
+    ).strip().lower()
+    if args.train_8i_sequence_mode not in {"first3", "all4"}:
+        args.train_8i_sequence_mode = "all4"
+    args.sparsepcgc_full_cloud_amount_exploration_temperature = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_exploration_temperature", 1.0)), 0.05),
+        10.0,
+    )
+    args.sparsepcgc_full_cloud_amount_temperature_decay_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_temperature_decay_steps", 3000)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_min_temperature = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_min_temperature", 0.3)), 0.01),
+        float(args.sparsepcgc_full_cloud_amount_exploration_temperature),
+    )
+    args.sparsepcgc_full_cloud_amount_diagnostic_sweep_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_diagnostic_sweep_interval", 0)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_bandit_aux_actual_teacher = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_bandit_aux_actual_teacher", True)
+    )
+    args.sparsepcgc_full_cloud_amount_geom_cost_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_geom_cost_weight", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_ratio_cost_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_cost_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_sequence_baseline_momentum = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_sequence_baseline_momentum", 0.9)), 0.0),
+        0.9999,
+    )
+    args.sparsepcgc_full_cloud_amount_noop_margin = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_noop_margin", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_policy_loss_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_policy_loss_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_geometry_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_geometry_mode", "sampled")
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_geometry_mode not in {"off", "sampled", "interval_full"}:
+        args.sparsepcgc_full_cloud_amount_geometry_mode = "sampled"
+    args.sparsepcgc_full_cloud_amount_geom_sample_points = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_geom_sample_points", 20000)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_geom_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_geom_interval", 20)),
+        1,
+    )
+    for _fc_amount_weight_name, _fc_amount_weight_default in (
+        ("sparsepcgc_full_cloud_amount_cls_loss_weight", 1.0),
+        ("sparsepcgc_full_cloud_amount_value_loss_weight", 0.5),
+        ("sparsepcgc_full_cloud_amount_rank_loss_weight", 0.2),
+        ("sparsepcgc_full_cloud_amount_geom_penalty_weight", 0.1),
+        ("sparsepcgc_full_cloud_amount_ratio_reg_weight", 0.05),
+        ("sparsepcgc_full_cloud_amount_noop_guard_weight", 0.5),
+    ):
+        setattr(
+            args,
+            _fc_amount_weight_name,
+            max(float(getattr(args, _fc_amount_weight_name, _fc_amount_weight_default)), 0.0),
+        )
+    args.sparsepcgc_full_cloud_amount_ratio_reg_target = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_target", 0.05)), 0.0),
+        0.05,
+    )
+    args.sparsepcgc_proposal_inference_mode = str(
+        getattr(args, "sparsepcgc_proposal_inference_mode", "fast")
+    ).strip().lower()
+    if args.sparsepcgc_proposal_inference_mode not in {"fast", "verified"}:
+        args.sparsepcgc_proposal_inference_mode = "fast"
+    args.sparsepcgc_proposal_accept_threshold = float(
+        getattr(args, "sparsepcgc_proposal_accept_threshold", 0.0)
+    )
+    args.sparsepcgc_proposal_selector_hidden_dim = max(
+        int(getattr(args, "sparsepcgc_proposal_selector_hidden_dim", 64)),
+        8,
+    )
+    # ============================================================
+    # Post-warmup Amount Hybrid 正規化
+    # ============================================================
+    args.sparsepcgc_post_warmup_amount_hybrid = bool(
+        getattr(args, "sparsepcgc_post_warmup_amount_hybrid", True)
+    )
+
+    args.sparsepcgc_post_warmup_amount_mode = str(
+        getattr(args, "sparsepcgc_post_warmup_amount_mode", "blend")
+    ).strip().lower()
+    if args.sparsepcgc_post_warmup_amount_mode not in {"blend", "max"}:
+        args.sparsepcgc_post_warmup_amount_mode = "blend"
+
+    args.sparsepcgc_post_warmup_amount_start_ratio = min(
+        max(float(getattr(args, "sparsepcgc_post_warmup_amount_start_ratio", 0.04)), 0.0),
+        0.05,
+    )
+    args.sparsepcgc_post_warmup_amount_end_ratio = min(
+        max(float(getattr(args, "sparsepcgc_post_warmup_amount_end_ratio", 0.006)), 0.0),
+        args.sparsepcgc_post_warmup_amount_start_ratio,
+    )
+    args.sparsepcgc_post_warmup_amount_tail_steps = max(
+        int(getattr(args, "sparsepcgc_post_warmup_amount_tail_steps", 5000)),
+        0,
+    )
+    args.sparsepcgc_post_warmup_amount_max_alpha = min(
+        max(float(getattr(args, "sparsepcgc_post_warmup_amount_max_alpha", 0.65)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_post_warmup_amount_min_network_keep = min(
+        max(float(getattr(args, "sparsepcgc_post_warmup_amount_min_network_keep", 0.30)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_post_warmup_amount_teacher_weight = max(
+        float(getattr(args, "sparsepcgc_post_warmup_amount_teacher_weight", 0.08)),
+        0.0,
+    )
+    args.sparsepcgc_post_warmup_amount_strategy = str(
+        getattr(args, "sparsepcgc_post_warmup_amount_strategy", "outcome_explore")
+    ).strip().lower()
+    if args.sparsepcgc_post_warmup_amount_strategy not in {"fixed_blend", "outcome_explore", "network"}:
+        args.sparsepcgc_post_warmup_amount_strategy = "outcome_explore"
+    if (
+        not _cli_option_was_provided("--sparsepcgc_post_warmup_amount_strategy")
+        and _cli_option_was_provided("--sparsepcgc_post_warmup_amount_hybrid")
+        and not args.sparsepcgc_post_warmup_amount_hybrid
+    ):
+        args.sparsepcgc_post_warmup_amount_strategy = "network"
+    default_explore_ratios = (0.005, 0.01, 0.02, 0.03, 0.04, 0.05)
+    parsed_explore_ratios = _parse_csv_float_list(
+        getattr(args, "sparsepcgc_amount_explore_ratios", ",".join(str(v) for v in default_explore_ratios)),
+        default_explore_ratios,
+    )
+    normalized_explore_ratios = []
+    for ratio in parsed_explore_ratios:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.95)
+        except Exception:
+            continue
+        normalized_explore_ratios.append(ratio_value)
+    if not normalized_explore_ratios:
+        normalized_explore_ratios = list(default_explore_ratios)
+    normalized_explore_ratios = sorted(set(normalized_explore_ratios))
+    args.sparsepcgc_amount_explore_ratio_values = tuple(normalized_explore_ratios)
+    args.sparsepcgc_amount_explore_ratios = ",".join(f"{value:.6f}".rstrip("0").rstrip(".") for value in normalized_explore_ratios)
+    args.sparsepcgc_amount_explore_start_prob = min(
+        max(float(getattr(args, "sparsepcgc_amount_explore_start_prob", 0.60)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_amount_explore_end_prob = min(
+        max(float(getattr(args, "sparsepcgc_amount_explore_end_prob", 0.20)), 0.0),
+        1.0,
+    )
+    if args.sparsepcgc_amount_explore_end_prob > args.sparsepcgc_amount_explore_start_prob:
+        args.sparsepcgc_amount_explore_end_prob = args.sparsepcgc_amount_explore_start_prob
+    args.sparsepcgc_amount_explore_decay_steps = max(
+        int(getattr(args, "sparsepcgc_amount_explore_decay_steps", 5000)),
+        0,
+    )
+    args.sparsepcgc_amount_explore_period = max(
+        int(getattr(args, "sparsepcgc_amount_explore_period", 10)),
+        1,
+    )
+    args.sparsepcgc_amount_explore_prefer_high_until_success = bool(
+        getattr(args, "sparsepcgc_amount_explore_prefer_high_until_success", True)
+    )
+    args.sparsepcgc_amount_outcome_memory = bool(
+        getattr(args, "sparsepcgc_amount_outcome_memory", True)
+    )
+    args.sparsepcgc_amount_outcome_memory_ema = min(
+        max(float(getattr(args, "sparsepcgc_amount_outcome_memory_ema", 0.20)), 1e-4),
+        1.0,
+    )
+    args.sparsepcgc_amount_outcome_good_margin = max(
+        float(getattr(args, "sparsepcgc_amount_outcome_good_margin", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_amount_outcome_bad_margin = max(
+        float(getattr(args, "sparsepcgc_amount_outcome_bad_margin", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_amount_memory_min_count_for_exploit = max(
+        int(getattr(args, "sparsepcgc_amount_memory_min_count_for_exploit", 1)),
+        1,
+    )
+    args.sparsepcgc_amount_success_teacher_weight = max(
+        float(getattr(args, "sparsepcgc_amount_success_teacher_weight", 0.08)),
+        0.0,
+    )
+    args.sparsepcgc_amount_success_teacher_max_alpha = min(
+        max(float(getattr(args, "sparsepcgc_amount_success_teacher_max_alpha", 0.50)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_codec_prior_distill_weight = max(
+        float(getattr(args, "sparsepcgc_codec_prior_distill_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_codec_prior_amount_distill_weight = max(
+        float(getattr(args, "sparsepcgc_codec_prior_amount_distill_weight", 0.0)),
+        0.0,
+    )
+    # ============================================================
+    # Multi-Subtree training 正規化
+    # ============================================================
+    args.sparsepcgc_multi_subtree_train = bool(
+        getattr(args, "sparsepcgc_multi_subtree_train", True)
+    )
+    args.sparsepcgc_multi_subtree_topk = max(
+        int(getattr(args, "sparsepcgc_multi_subtree_topk", 3)),
+        1,
+    )
+
+    # ============================================================
+    # Outcome Weighted Imitation 正規化
+    # ============================================================
+    args.sparsepcgc_outcome_imitation = bool(
+        getattr(args, "sparsepcgc_outcome_imitation", True)
+    )
+    args.sparsepcgc_subtree_actual_filter = bool(
+        getattr(args, "sparsepcgc_subtree_actual_filter", True)
+    )
+    args.sparsepcgc_anchor_success_teacher = bool(
+        getattr(args, "sparsepcgc_anchor_success_teacher", True)
+    )
+    args.sparsepcgc_anchor_success_margin = max(
+        float(getattr(args, "sparsepcgc_anchor_success_margin", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_anchor_success_ema = min(
+        max(float(getattr(args, "sparsepcgc_anchor_success_ema", 0.20)), 1e-4),
+        1.0,
+    )
+    args.sparsepcgc_stage_switch_guard = bool(
+        getattr(args, "sparsepcgc_stage_switch_guard", True)
+    )
+    args.sparsepcgc_min_compression_loss_factor = max(
+        float(getattr(args, "sparsepcgc_min_compression_loss_factor", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_max_policy_loss_factor_in_compression = max(
+        float(getattr(args, "sparsepcgc_max_policy_loss_factor_in_compression", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_surrogate_trust_gate = bool(
+        getattr(args, "sparsepcgc_surrogate_trust_gate", True)
+    )
+    args.sparsepcgc_surrogate_error_threshold = max(
+        float(getattr(args, "sparsepcgc_surrogate_error_threshold", 10.0)),
+        0.0,
+    )
+    args.sparsepcgc_surrogate_error_disable_threshold = max(
+        float(getattr(args, "sparsepcgc_surrogate_error_disable_threshold", 13.0)),
+        args.sparsepcgc_surrogate_error_threshold,
+    )
+    args.sparsepcgc_surrogate_min_trust = min(
+        max(float(getattr(args, "sparsepcgc_surrogate_min_trust", 0.0)), 0.0),
+        1.0,
+    )
+    args.prune_amount_soft_anchor_enable = bool(
+        getattr(args, "prune_amount_soft_anchor_enable", False)
+    )
+    args.prune_amount_soft_anchor_weight = max(
+        float(getattr(args, "prune_amount_soft_anchor_weight", 0.0)),
+        0.0,
+    )
+    args.prune_amount_bias_anchor_enable = bool(
+        getattr(args, "prune_amount_bias_anchor_enable", False)
+    )
+    # ============================================================
+    # Direct Network Prune 正規化
+    # ============================================================
+    # direct_network_pruneは診断専用である。
+    # defaultやmode文字列だけで勝手に有効化しない。
+    # CLIで明示された場合だけ有効にする。
+    # ============================================================
+    direct_mode_requested = (
+        (
+            _cli_option_was_provided("--direct_network_prune")
+            and bool(getattr(args, "direct_network_prune", False))
+        )
+        or (
+            _cli_option_was_provided("--sparsepcgc_prune_after_prior_mode")
+            and str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network"
+        )
+    )
+
+    args.direct_network_prune = bool(direct_mode_requested)
+
+    args.direct_prune_ratio_floor = min(
+        max(float(getattr(args, "direct_prune_ratio_floor", 0.05)), 0.0),
+        0.95,
+    )
+    args.direct_prune_min_hard_count = max(
+        int(getattr(args, "direct_prune_min_hard_count", 1)),
+        0,
+    )
+    args.direct_prune_use_raw_compression_loss = bool(
+        getattr(args, "direct_prune_use_raw_compression_loss", True)
+    )
+
+    if args.direct_network_prune:
+        args.sparsepcgc_prune_after_prior_mode = "direct_network"
+        args.sparsepcgc_policy_actual_noop_guard = False
+        args.sparsepcgc_full_cloud_actual_primary = False
+        args.full_cloud_actual_correction = False
+        args.full_cloud_actual_correction_loss_enable = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+        args.sparsepcgc_actual_gate_prune = False
+    else:
+        # 通常訓練ではdirect modeを必ず無効化する。
+        args.direct_network_prune = False
+        if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
+            args.sparsepcgc_prune_after_prior_mode = "network"
+    args.sparsepcgc_actual_gate_non_prune = bool(
+        getattr(args, "sparsepcgc_actual_gate_non_prune", True)
+    )
+    args.sparsepcgc_actual_gate_prune = bool(
+        getattr(args, "sparsepcgc_actual_gate_prune", True)
+    )
+    args.sparsepcgc_policy_actual_noop_guard = bool(
+        getattr(args, "sparsepcgc_policy_actual_noop_guard", False)
+    )
+    args.sparsepcgc_policy_actual_noop_guard_margin = max(
+        float(getattr(args, "sparsepcgc_policy_actual_noop_guard_margin", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels", 128)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_parent_prune_min_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_parent_prune_min_voxels", 2)),
+        1,
+    )
+    raw_subtree_move_shifts = getattr(args, "sparsepcgc_actual_oracle_subtree_move_level_shifts", "1")
+    if isinstance(raw_subtree_move_shifts, str):
+        subtree_move_shifts = []
+        for item in raw_subtree_move_shifts.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                subtree_move_shifts.append(int(float(item)))
+            except ValueError:
+                continue
+    elif isinstance(raw_subtree_move_shifts, (list, tuple)):
+        subtree_move_shifts = []
+        for item in raw_subtree_move_shifts:
+            try:
+                subtree_move_shifts.append(int(float(item)))
+            except (TypeError, ValueError):
+                continue
+    else:
+        subtree_move_shifts = []
+    args.sparsepcgc_actual_oracle_subtree_move_level_shifts = sorted(
+        {min(max(int(value), 1), 6) for value in subtree_move_shifts if int(value) >= 1}
+    ) or [1]
+    args.sparsepcgc_actual_oracle_subtree_move_min_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_min_voxels", 4)),
+        1,
+    )
+    args.repair_subtree_move_source_init_prob = min(
+        max(float(getattr(args, "repair_subtree_move_source_init_prob", 0.02)), 1e-4),
+        1.0 - 1e-4,
+    )
+    args.repair_subtree_move_source_prior_weight = max(
+        float(getattr(args, "repair_subtree_move_source_prior_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_bits_enabled = bool(
+        getattr(args, "sparsepcgc_edit_record_bits_enabled", True)
+    )
+    args.sparsepcgc_edit_record_bit_scale = max(
+        float(getattr(args, "sparsepcgc_edit_record_bit_scale", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_train_curriculum = bool(
+        getattr(args, "sparsepcgc_edit_record_train_curriculum", True)
+    )
+    args.sparsepcgc_edit_record_train_start_scale = max(
+        float(getattr(args, "sparsepcgc_edit_record_train_start_scale", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_train_end_scale = max(
+        float(getattr(args, "sparsepcgc_edit_record_train_end_scale", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_train_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_edit_record_train_warmup_steps", 3000)),
+        1,
+    )
+    args.sparsepcgc_edit_record_base_bits = max(
+        float(getattr(args, "sparsepcgc_edit_record_base_bits", 8.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_count_bits_min = max(
+        int(getattr(args, "sparsepcgc_edit_record_count_bits_min", 4)),
+        1,
+    )
+    args.sparsepcgc_edit_record_leaf_address_bits_min = max(
+        int(getattr(args, "sparsepcgc_edit_record_leaf_address_bits_min", 10)),
+        1,
+    )
+    args.sparsepcgc_edit_record_subtree_move_bits_min = max(
+        int(getattr(args, "sparsepcgc_edit_record_subtree_move_bits_min", 16)),
+        1,
+    )
+    args.repair_force_min_drop_voxels = bool(getattr(args, "repair_force_min_drop_voxels", False))
+    args.repair_force_min_add_voxels = bool(getattr(args, "repair_force_min_add_voxels", False))
+    args.repair_force_min_move_voxels = bool(getattr(args, "repair_force_min_move_voxels", False))
+    args.repair_add_min_expected_voxels = max(float(getattr(args, "repair_add_min_expected_voxels", 1.0)), 0.0)
+    args.cause_aggregation_learnable_refine = bool(getattr(args, "cause_aggregation_learnable_refine", True))
+    args.cause_aggregation_refine_hidden = max(int(getattr(args, "cause_aggregation_refine_hidden", 32)), 1)
+    args.cause_aggregation_refine_scale = max(float(getattr(args, "cause_aggregation_refine_scale", 0.10)), 0.0)
+    args.cause_aggregation_cause_dim = max(int(getattr(args, "cause_aggregation_cause_dim", 8)), 1)
+    args.sparsepcgc_actual_use_actuator_voxel_state = bool(getattr(args, "sparsepcgc_actual_use_actuator_voxel_state", True))
+    args.skip_actual_codec = bool(getattr(args, "skip_actual_codec", True))
+    args.codec_eval_interval = max(int(getattr(args, "codec_eval_interval", 0)), 0)
+    args.save_test_ply = bool(getattr(args, "save_test_ply", True))
+    args.max_test_samples = max(int(getattr(args, "max_test_samples", 0)), 0)
+    args.ply_loader = str(getattr(args, "ply_loader", "numpy")).strip().lower()
+    if args.ply_loader == "np":
+        args.ply_loader = "numpy"
+    elif args.ply_loader == "o3d":
+        args.ply_loader = "open3d"
+    if args.ply_loader not in {"numpy", "open3d", "auto"}:
+        raise ValueError("--ply_loader must be one of: numpy, open3d, auto")
+    args.compression_surrogate_aux_node_weight = max(
+        float(getattr(args, "compression_surrogate_aux_node_weight", 0.0)),
+        0.0,
+    )
+    args.compression_surrogate_aux_single_weight = max(
+        float(getattr(args, "compression_surrogate_aux_single_weight", 0.0)),
+        0.0,
+    )
+    args.compression_surrogate_aux_in_objective = bool(
+        getattr(args, "compression_surrogate_aux_in_objective", False)
+    )
+    args.compression_surrogate_log_soft_aux = bool(
+        getattr(args, "compression_surrogate_log_soft_aux", True)
+    )
+    args.com_sparsepcgc = max(float(getattr(args, "com_sparsepcgc", 0.0)), 0.0)
+    args.sparsepcgc_aux_loss = bool(getattr(args, "sparsepcgc_aux_loss", True))
+    args.sparsepcgc_aux_backprop = bool(getattr(args, "sparsepcgc_aux_backprop", False))
+    args.sparsepcgc_aux_with_actual_teacher = bool(
+        getattr(args, "sparsepcgc_aux_with_actual_teacher", False)
+    )
+    args.sparsepcgc_active_coord_weight = max(float(getattr(args, "sparsepcgc_active_coord_weight", 0.60)), 0.0)
+    args.sparsepcgc_isolated_proxy_weight = max(float(getattr(args, "sparsepcgc_isolated_proxy_weight", 0.25)), 0.0)
+    args.sparsepcgc_entropy_proxy_weight = max(float(getattr(args, "sparsepcgc_entropy_proxy_weight", 0.15)), 0.0)
+    args.sparsepcgc_density_proxy_weight = max(float(getattr(args, "sparsepcgc_density_proxy_weight", 0.05)), 0.0)
+    args.sparsepcgc_aux_reward_clip = max(float(getattr(args, "sparsepcgc_aux_reward_clip", 0.0)), 0.0)
+    args.sparsepcgc_corr_window = max(int(getattr(args, "sparsepcgc_corr_window", 100)), 2)
+    args.sparsepcgc_aux_gating = bool(getattr(args, "sparsepcgc_aux_gating", True))
+    args.sparsepcgc_aux_gate_mode = str(getattr(args, "sparsepcgc_aux_gate_mode", "soft")).strip().lower()
+    if args.sparsepcgc_aux_gate_mode not in {"hard", "soft"}:
+        raise ValueError("--sparsepcgc_aux_gate_mode must be hard or soft")
+    args.sparsepcgc_aux_soft_min_weight = min(max(float(getattr(args, "sparsepcgc_aux_soft_min_weight", 0.05)), 0.0), 1.0)
+    args.sparsepcgc_aux_min_corr = float(getattr(args, "sparsepcgc_aux_min_corr", 0.30))
+    args.sparsepcgc_aux_min_sign_match = min(max(float(getattr(args, "sparsepcgc_aux_min_sign_match", 0.50)), 0.0), 1.0)
+    args.sparsepcgc_aux_gating_window = max(int(getattr(args, "sparsepcgc_aux_gating_window", 100)), 2)
+    args.sparsepcgc_disable_add = bool(getattr(args, "sparsepcgc_disable_add", True))
+    args.surrogate_full_cloud_calib_interval = max(int(getattr(args, "surrogate_full_cloud_calib_interval", 0)), 0)
+    args.sparsepcgc_enable_add_experiment = bool(getattr(args, "sparsepcgc_enable_add_experiment", False))
+    args.sparsepcgc_add_only_when_compression_primary = bool(
+        getattr(args, "sparsepcgc_add_only_when_compression_primary", True)
+    )
+    args.sparsepcgc_add_target_ratio = min(
+        max(float(getattr(args, "sparsepcgc_add_target_ratio", 0.005)), 0.0),
+        0.10,
+    )
+    args.sparsepcgc_add_max_ratio = min(
+        max(float(getattr(args, "sparsepcgc_add_max_ratio", 0.10)), args.sparsepcgc_add_target_ratio),
+        0.10,
+    )
+    args.sparsepcgc_add_warmup_steps = max(int(getattr(args, "sparsepcgc_add_warmup_steps", 0)), 0)
+    args.sparsepcgc_add_use_candidate_score = bool(getattr(args, "sparsepcgc_add_use_candidate_score", True))
+    args.sparsepcgc_move_existing_target_only = bool(getattr(args, "sparsepcgc_move_existing_target_only", False))
+    args.compression_octree_stat_depth = max(int(getattr(args, "compression_octree_stat_depth", 0)), 0)
+    sparsepcgc_backend = compress_key == "sparsepcgc" or args.compression_loss_backend.startswith("sparsepcgc_")
+    if sparsepcgc_backend:
+        if not _cli_option_was_provided("--use_amp"):
+            # SparsePCGC actual/surrogate訓練はbit教師と点操作が大きく揺れるため、既定はfp32で安定性を優先する。
+            args.use_amp = False
+        if not _cli_option_was_provided("--checkpoint_actual_source"):
+            args.checkpoint_actual_source = "full_cloud"
+        if not _cli_option_was_provided("--actual_guard_require_fixed_validation"):
+            args.actual_guard_require_fixed_validation = True
+        if not _cli_option_was_provided("--actual_guard_require_full_state_restore"):
+            args.actual_guard_require_full_state_restore = True
+        if not _cli_option_was_provided("--actual_guard_decay_lr"):
+            # StepLRとguardの二重減衰で序盤にLRを枯らさない。rollback時も
+            # optimizerを含む完全stateへ戻すため、追加LR低下は既定で不要。
+            args.actual_guard_decay_lr = False
+        if not _cli_option_was_provided("--actual_guard_patience"):
+            # 1～2 Episodeの一時変動で探索を巻き戻さず、固定集合で連続して
+            # 悪化した場合だけ保護を発動する。
+            args.actual_guard_patience = max(int(args.actual_guard_patience), 4)
+        if not _cli_option_was_provided("--cp_tau_geom"):
+            # 実測L_geomは約0.003であり、旧0.06ではpenaltyが常に0だった。
+            args.cp_tau_geom = 0.0
+        if not _cli_option_was_provided("--heuristic_guidance_online_geometry_policy_weight"):
+            # Candidate-local、global policy、fixed validationでGeometryの
+            # 相対的重要度を同じ倍率だけ上げ、別々の目的へ乖離させない。
+            args.heuristic_guidance_online_geometry_policy_weight = (
+                0.50 * float(args.rd_geometry_weight_multiplier)
+            )
+        if not _cli_option_was_provided("--checkpoint_geom_rel_factor"):
+            # 1.5倍では最新runの後半劣化(0.0040 -> 0.0060)を通した。
+            # checkpoint/rollbackの安全gateだけを絞り、実行Amount自体は制限しない。
+            args.checkpoint_geom_rel_factor = 1.20
+        if not _cli_option_was_provided("--actual_guard_tolerance"):
+            # best -3.6から-3.5を割る劣化まで見逃した旧0.25を縮める。
+            args.actual_guard_tolerance = 0.10
+        if not _cli_option_was_provided("--train_full_cloud_actual_interval"):
+            # Full-cloud SparsePCGC teacher is already supplied by the splice-based
+            # actual oracle.  The no-grad full-cloud anchor only produced zero
+            # correction in the current logs while forcing an 800k-voxel forward
+            # every step, so keep it off unless explicitly requested.
+            args.train_full_cloud_actual_interval = 0
+        if not _cli_option_was_provided("--sparsepcgc_full_cloud_actual_primary"):
+            args.sparsepcgc_full_cloud_actual_primary = True
+        if not _cli_option_was_provided("--sparsepcgc_require_full_cloud_actual_teacher"):
+            args.sparsepcgc_require_full_cloud_actual_teacher = True
+        if not _cli_option_was_provided("--surrogate_step"):
+            args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 0)
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--disable_actual_codec_during_train"):
+            # SparsePCGC surrogateは実SparsePCGC bit教師が必要なので、既定ではactual teacherを止めない。
+            args.disable_actual_codec_during_train = False
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_update_on_teacher_refresh_only"):
+            # actual教師を毎Step更新し、Networkのhard voxel編集と同じ実測値を使う。
+            args.surrogate_update_on_teacher_refresh_only = True
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--compression_surrogate_replay_steps"):
+            # periodic actual teacherとlast targetを併用するため、追加replay更新は重複なので止める。
+            args.compression_surrogate_replay_steps = 0
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_pretrain_actual_refresh_interval"):
+            # 事前学習もactual教師を毎Step更新し、stale targetを使わない。
+            args.surrogate_pretrain_actual_refresh_interval = 1
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--actual_eval_interval"):
+            args.actual_eval_interval = 1
+        if args.compression_loss_backend in {"sparsepcgc_actual", "sparsepcgc_actual_ste"} and not _cli_option_was_provided("--actual_eval_interval"):
+            # SparsePCGC actual backendはNetworkのhard voxel編集を毎Step実測する。
+            args.actual_eval_interval = 1
+        if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
+            args.compression_surrogate_forward_mode = "teacher_ste"
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--detach_surrogate_from_network"):
+            # SparsePCGC actual bitと相関している主surrogate勾配をNetworkへ返す。
+            # forward値はteacher_steのactual bitを保ち、backwardだけsurrogate予測を使う。
+            args.detach_surrogate_from_network = False
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_target_clip_percent"):
+            # raw percentの外れ値(特にGT bitが0近傍のstep)でlossが爆発しないよう、既定で上限を入れる。
+            args.surrogate_target_clip_percent = 100.0
+        if not _cli_option_was_provided("--compression_surrogate_refresh_interval"):
+            # SparsePCGCのfresh教師はactual更新stepで測り、surrogateは毎stepの勾配を維持する。
+            args.compression_surrogate_refresh_interval = 1 if args.compression_loss_backend.endswith("_surrogate") else max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 50)
+        if not _cli_option_was_provided("--lr_scheduler_enabled"):
+            # ActualCompressionGuardとStepLRの二重LR低下を避けるため、SparsePCGC実験ではStepLRを既定で止める。
+            args.lr_scheduler_enabled = False
+        if not _cli_option_was_provided("--compression_surrogate_reuse_last_target"):
+            args.compression_surrogate_reuse_last_target = True
+        if not _cli_option_was_provided("--train_subtree_anchor_on_min_points_miss"):
+            args.train_subtree_anchor_on_min_points_miss = True
+        if not _cli_option_was_provided("--compression_surrogate_train_steps"):
+            args.compression_surrogate_train_steps = 1 if args.compression_loss_backend.endswith("_surrogate") else max(args.compression_surrogate_train_steps, 4)
+        if not _cli_option_was_provided("--compression_surrogate_warmup_steps"):
+            args.compression_surrogate_warmup_steps = 1 if args.compression_loss_backend.endswith("_surrogate") else max(args.compression_surrogate_warmup_steps, 4)
+        if not _cli_option_was_provided("--compression_surrogate_aux_node_weight"):
+            args.compression_surrogate_aux_node_weight = 0.0
+        if not _cli_option_was_provided("--compression_surrogate_aux_single_weight"):
+            args.compression_surrogate_aux_single_weight = 0.0
+        if not _cli_option_was_provided("--repair_move_require_empty_target"):
+            args.repair_move_require_empty_target = True
+        if not _cli_option_was_provided("--repair_move_prefer_occupied_target"):
+            args.repair_move_prefer_occupied_target = False
+        if not _cli_option_was_provided("--com_sparsepcgc"):
+            # SparsePCGC proxyは値と相関検証用に計算するが、backwardへ混ぜるかはgatingで別途決める。
+            args.com_sparsepcgc = max(float(getattr(args, "com_sparsepcgc", 0.0)), 0.75)
+        if not _cli_option_was_provided("--sparsepcgc_aux_backprop"):
+            # actual bitと相関・符号一致したSparsePCGC proxyだけを既存gating越しにbackwardへ混ぜる。
+            args.sparsepcgc_aux_backprop = True
+        if not _cli_option_was_provided("--surrogate_full_cloud_calib_interval"):
+            # subtree teacherとfull-cloud actualのズレを定期的に見られるよう、軽い校正anchorを入れる。
+            args.surrogate_full_cloud_calib_interval = 200 if args.compression_loss_backend.endswith("_surrogate") else 0
+        if not _cli_option_was_provided("--repair_add_ratio_floor"):
+            # Addの任意実行性をoperation gateへ移したため、ratio floorは既定では使わない。
+            args.repair_add_ratio_floor = 0.0
+        if not _cli_option_was_provided("--sparsepcgc_aux_gate_mode"):
+            args.sparsepcgc_aux_gate_mode = "soft"
+        if not _cli_option_was_provided("--actual_total_bit_objective_mix"):
+            args.actual_total_bit_objective_mix = 1.0
+        if not _cli_option_was_provided("--compression_boost_requires_surrogate_frozen"):
+            args.compression_boost_requires_surrogate_frozen = False
+        if not _cli_option_was_provided("--compression_good_step_boost"):
+            args.compression_good_step_boost = True
+        if not _cli_option_was_provided("--compression_bad_step_penalty_scale"):
+            args.compression_bad_step_penalty_scale = 2.0
+        if not _cli_option_was_provided("--compression_good_step_boost_scale"):
+            args.compression_good_step_boost_scale = 2.0
+        if not _cli_option_was_provided("--compression_good_step_prefreeze_scale"):
+            args.compression_good_step_prefreeze_scale = 1.5
+        if not _cli_option_was_provided("--compression_boost_max_abs_error"):
+            args.compression_boost_max_abs_error = max(float(getattr(args, "compression_boost_max_abs_error", 1.0)), 8.0)
+        if not _cli_option_was_provided("--compression_good_step_prefreeze_max_train_loss"):
+            args.compression_good_step_prefreeze_max_train_loss = max(
+                float(getattr(args, "compression_good_step_prefreeze_max_train_loss", 3.0)),
+                8.0,
+            )
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_start"):
+            args.repair_operation_gate_random_mix_start = 0.10
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
+            args.repair_operation_gate_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_operation_gate_min_forward"):
+            args.repair_operation_gate_min_forward = 0.06
+        if not _cli_option_was_provided("--repair_operation_gate_hard_forward"):
+            args.repair_operation_gate_hard_forward = False
+        if not _cli_option_was_provided("--repair_output_voxel_restored_points"):
+            args.repair_output_voxel_restored_points = True
+        if not _cli_option_was_provided("--leaf_pattern_operation_mask"):
+            # Heuristic Whereはsoft biasとして使うため、候補を消すhard maskは既定で無効にする。
+            args.leaf_pattern_operation_mask = not bool(args.heuristic_guidance_enabled)
+        if not _cli_option_was_provided("--leaf_pattern_target_direction_mask"):
+            # target方向もNetworkが微調整できるよう、Heuristic有効時はsoft priorだけを残す。
+            args.leaf_pattern_target_direction_mask = not bool(args.heuristic_guidance_enabled)
+        if not _cli_option_was_provided("--repair_add_pattern_prior_weight"):
+            args.repair_add_pattern_prior_weight = 1.75
+        if not _cli_option_was_provided("--repair_add_pair_pattern_prior_weight"):
+            args.repair_add_pair_pattern_prior_weight = 3.0
+        if not _cli_option_was_provided("--repair_move_pattern_prior_weight"):
+            args.repair_move_pattern_prior_weight = 1.75
+        if not _cli_option_was_provided("--repair_drop_pattern_prior_weight"):
+            args.repair_drop_pattern_prior_weight = 1.25
+        if not _cli_option_was_provided("--repair_drop_hard_threshold"):
+            args.repair_drop_hard_threshold = 0.02
+        if not _cli_option_was_provided("--repair_drop_ratio_floor"):
+            args.repair_drop_ratio_floor = 0.0
+        if not _cli_option_was_provided("--repair_max_hard_drop_voxels"):
+            args.repair_max_hard_drop_voxels = (
+                50000
+                if str(getattr(args, "dataname", "")).strip().lower() == "8i"
+                else 256
+            )
+        if not _cli_option_was_provided("--repair_max_hard_move_voxels"):
+            # den6初期割合を実行可能にする。0はratio上限のみで、無制限ではない。
+            args.repair_max_hard_move_voxels = 0 if args.heuristic_guidance_enabled else 1
+        if args.heuristic_guidance_enabled:
+            if not _cli_option_was_provided("--sparsepcgc_actual_gate_non_prune"):
+                args.sparsepcgc_actual_gate_non_prune = False
+            if not _cli_option_was_provided("--sparsepcgc_actual_gate_prune"):
+                args.sparsepcgc_actual_gate_prune = False
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_amount_weight"):
+            args.sparsepcgc_actual_oracle_amount_weight = 0.001
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_amount_logit_weight"):
+            args.sparsepcgc_actual_oracle_amount_logit_weight = 0.05
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_candidate_where_weight"):
+            args.sparsepcgc_actual_oracle_candidate_where_weight = 10.0
+        if not _cli_option_was_provided("--sparsepcgc_actual_gt_disk_cache"):
+            args.sparsepcgc_actual_gt_disk_cache = True
+        if not _cli_option_was_provided("--sparsepcgc_edit_record_train_start_scale"):
+            args.sparsepcgc_edit_record_train_start_scale = 1.0
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_apply_full_override"):
+            # Keep the actual-oracle as a teacher/diagnostic unless explicitly requested.
+            # Applying its full-cloud candidate makes the logged policy codec input an
+            # oracle action, not the network's own action.
+            args.sparsepcgc_actual_oracle_apply_full_override = False
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_geometry_lambda"):
+            args.sparsepcgc_actual_oracle_geometry_lambda = 0.05
+        if not _cli_option_was_provided("--sparsepcgc_codec_prune_prior"):
+            args.sparsepcgc_codec_prune_prior = (
+                str(getattr(args, "dataname", "")).strip().lower() == "8i"
+            )
+        if not _cli_option_was_provided("--repair_operation_entropy_weight"):
+            args.repair_operation_entropy_weight = 0.02
+        if not _cli_option_was_provided("--repair_operation_entropy_warmup_steps"):
+            args.repair_operation_entropy_warmup_steps = 500
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_selected_voxels"):
+            args.sparsepcgc_actual_oracle_max_selected_voxels = 64
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_group_voxels"):
+            args.sparsepcgc_actual_oracle_group_voxels = 16
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_group_size_list"):
+            args.sparsepcgc_actual_oracle_group_size_list = [4, 16]
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_min_voxels"):
+            args.sparsepcgc_actual_oracle_macro_prune_min_voxels = 8
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels"):
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels = 128
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_parent_prune_min_voxels"):
+            args.sparsepcgc_actual_oracle_parent_prune_min_voxels = 2
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_force_no_edit"):
+            args.sparsepcgc_actual_oracle_force_no_edit = False
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_prune_mode"):
+            args.sparsepcgc_fast_diagnostic_prune_mode = "axis_threshold"
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_subtree_move_level_shifts"):
+            args.sparsepcgc_actual_oracle_subtree_move_level_shifts = [1, 2]
+        if not _cli_option_was_provided("--repair_add_min_expected_voxels"):
+            args.repair_add_min_expected_voxels = 0.25
+        if not _cli_option_was_provided("--repair_move_min_hard_expected_voxels"):
+            args.repair_move_min_hard_expected_voxels = 0.25
+        if not _cli_option_was_provided("--compression_soft_rate_add_weight"):
+            args.compression_soft_rate_add_weight = 0.05
+        if not _cli_option_was_provided("--compression_soft_rate_move_weight"):
+            args.compression_soft_rate_move_weight = 0.05
+        if not _cli_option_was_provided("--compression_soft_rate_prune_weight"):
+            args.compression_soft_rate_prune_weight = 0.05
+        if not _cli_option_was_provided("--compression_soft_rate_proxy_grad_weight"):
+            args.compression_soft_rate_proxy_grad_weight = max(
+                float(getattr(args, "compression_soft_rate_proxy_grad_weight", 0.05)),
+                0.10,
+            )
+        if not _cli_option_was_provided("--compression_soft_rate_point_weight"):
+            args.compression_soft_rate_point_weight = max(
+                float(getattr(args, "compression_soft_rate_point_weight", 0.25)),
+                0.35,
+            )
+        if not _cli_option_was_provided("--compression_soft_prune_rate_proxy_grad_weight"):
+            args.compression_soft_prune_rate_proxy_grad_weight = min(
+                float(getattr(args, "compression_soft_prune_rate_proxy_grad_weight", 0.1)),
+                0.10,
+            )
+        if not _cli_option_was_provided("--sparsepcgc_active_coord_weight"):
+            args.sparsepcgc_active_coord_weight = max(float(getattr(args, "sparsepcgc_active_coord_weight", 0.60)), 1.00)
+        if not _cli_option_was_provided("--sparsepcgc_isolated_proxy_weight"):
+            args.sparsepcgc_isolated_proxy_weight = max(float(getattr(args, "sparsepcgc_isolated_proxy_weight", 0.25)), 0.35)
+        if not _cli_option_was_provided("--sparsepcgc_entropy_proxy_weight"):
+            args.sparsepcgc_entropy_proxy_weight = max(float(getattr(args, "sparsepcgc_entropy_proxy_weight", 0.15)), 0.20)
+        if not _cli_option_was_provided("--compression_surrogate_levels"):
+            args.compression_surrogate_levels = "2,4,6,8,10"
+        if not _cli_option_was_provided("--octree_diag_levels"):
+            args.octree_diag_levels = "2,4,6,8,10,12"
+        if not _cli_option_was_provided("--sparsepcgc_add_target_ratio"):
+            args.sparsepcgc_add_target_ratio = min(float(getattr(args, "sparsepcgc_add_target_ratio", 0.005)), 0.003)
+        if not _cli_option_was_provided("--sparsepcgc_add_max_ratio"):
+            args.sparsepcgc_add_max_ratio = max(float(getattr(args, "sparsepcgc_add_max_ratio", 0.50)), 0.50) # Addの探索上限を0〜50%へ広げる
+        add_experiment_active = bool(args.sparsepcgc_enable_add_experiment) and (
+            (not bool(args.sparsepcgc_add_only_when_compression_primary))
+            or str(getattr(args, "loss_mode", "legacy_total")).strip().lower() == "compression_primary"
+        )
+        if add_experiment_active:
+            # SparsePCGC Add実験は明示flag時だけ既定disableを解除する。
+            # actual active/unique deltaは微分不能なので、ここではratio制御とログに留める。
+            args.sparsepcgc_disable_add = False
+        if not _cli_option_was_provided("--target_add_ratio"):
+            args.target_add_ratio = (
+                min(max(float(args.sparsepcgc_add_target_ratio), 0.003), 0.02)
+                if add_experiment_active
+                else 0.0 if args.sparsepcgc_disable_add else min(
+                    max(float(getattr(args, "target_add_ratio", 0.0)), float(args.sparsepcgc_add_target_ratio)),
+                    0.02,
+                )
+            )
+        if not _cli_option_was_provided("--max_add_ratio"):
+            args.max_add_ratio = (
+                min(float(args.sparsepcgc_add_max_ratio), 0.50)
+                if add_experiment_active
+                else 0.0 if args.sparsepcgc_disable_add else min(
+                    max(float(getattr(args, "max_add_ratio", 0.0)), float(args.sparsepcgc_add_max_ratio)),
+                    0.50,
+                )
+            )
+        amount_target_mode = str(getattr(args, "repair_amount_target_mode", "none")).strip().lower()
+        # ============================================================
+        # targetなしAmount学習
+        # ============================================================
+        # Amountは固定targetへ寄せず、L_comとSoft/Hard整合性から学習する。
+        # そのため、SparsePCGC用の後処理でもtarget_*_ratioを勝手に上げない。
+        # max_*_ratioだけを0〜30%の探索上限として統一する。
+        # ============================================================
+        if amount_target_mode == "none":
+            if not _cli_option_was_provided("--target_add_ratio"):
+                args.target_add_ratio = 0.0
+            if not _cli_option_was_provided("--target_drop_ratio"):
+                args.target_drop_ratio = 0.0
+            if not _cli_option_was_provided("--target_move_ratio"):
+                args.target_move_ratio = 0.0
+            if not _cli_option_was_provided("--max_add_ratio"):
+                args.max_add_ratio = 0.006
+            if not _cli_option_was_provided("--max_drop_ratio"):
+                args.max_drop_ratio = (
+                    0.050
+                    if str(getattr(args, "dataname", "")).strip().lower() == "8i"
+                    else 0.010
+                )
+            if not _cli_option_was_provided("--max_move_ratio"):
+                args.max_move_ratio = 0.005
+            if not _cli_option_was_provided("--max_repair_ratio"):
+                args.max_repair_ratio = 0.30
+            if not _cli_option_was_provided("--repair_operation_amount_direct_weight"):
+                args.repair_operation_amount_direct_weight = 0.0
+            if not _cli_option_was_provided("--repair_operation_amount_logit_weight"):
+                args.repair_operation_amount_logit_weight = 0.0
+            if not _cli_option_was_provided("--repair_drop_amount_supervision_weight"):
+                args.repair_drop_amount_supervision_weight = 0.0
+            if not _cli_option_was_provided("--repair_add_amount_supervision_weight"):
+                args.repair_add_amount_supervision_weight = 0.0
+            if not _cli_option_was_provided("--repair_move_amount_supervision_weight"):
+                args.repair_move_amount_supervision_weight = 0.0
+            if not _cli_option_was_provided("--repair_move_warmup_steps"):
+                args.repair_move_warmup_steps = 0
+
+        if amount_target_mode != "none" and not _cli_option_was_provided("--repair_move_warmup_steps"):
+            args.repair_move_warmup_steps = 300
+
+        if amount_target_mode != "none" and not _cli_option_was_provided("--repair_move_warmup_steps"):
+            args.repair_move_warmup_steps = max(int(getattr(args, "repair_move_warmup_steps", 0)), 600)
+        if not _cli_option_was_provided("--repair_amount_downstream_grad_max_scale"):
+            args.repair_amount_downstream_grad_max_scale = min(
+                max(float(getattr(args, "repair_amount_downstream_grad_max_scale", 1000.0)), 1.0),
+                1000.0,
+            )
+        if not _cli_option_was_provided("--repair_soft_normalizer_floor"):
+            args.repair_soft_normalizer_floor = max(float(getattr(args, "repair_soft_normalizer_floor", 1e-4)), 1e-4)
+        if not _cli_option_was_provided("--train_grad_clip"):
+            args.train_grad_clip = 10.0
+        if not _cli_option_was_provided("--surrogate_joint_lr_scale"):
+            # Actualを模倣するSurrogateが主Networkより先に教師分布を追い越さないよう、
+            # 063943実行時と同じ実効LR倍率をSparsePCGC訓練の既定にする。
+            args.surrogate_joint_lr_scale = 0.1
+        if not _cli_option_was_provided("--repair_operation_amount_consistency_weight"):
+            args.repair_operation_amount_consistency_weight = min(
+                max(float(getattr(args, "repair_operation_amount_consistency_weight", 0.0)), 0.0),
+                0.0,
+            )
+        if amount_target_mode != "none" and not _cli_option_was_provided("--repair_operation_amount_direct_weight"):
+            args.repair_operation_amount_direct_weight = max(
+                float(getattr(args, "repair_operation_amount_direct_weight", 0.01)),
+                0.02,
+            )
+        if amount_target_mode != "none" and not _cli_option_was_provided("--repair_add_ratio_weight"):
+            args.repair_add_ratio_weight = max(float(getattr(args, "repair_add_ratio_weight", 4.0)), 8.0)
+        if not _cli_option_was_provided("--repair_add_keep_weight"):
+            args.repair_add_keep_weight = 0.10
+        if not _cli_option_was_provided("--repair_add_weight_mode"):
+            args.repair_add_weight_mode = "hard"
+        if not _cli_option_was_provided("--repair_exploration_fraction"):
+            args.repair_exploration_fraction = 0.25
+        if not _cli_option_was_provided("--repair_add_candidate_ratio_start"):
+            args.repair_add_candidate_ratio_start = 0.10
+        if not _cli_option_was_provided("--repair_add_candidate_ratio_end"):
+            args.repair_add_candidate_ratio_end = 0.02
+        if not _cli_option_was_provided("--repair_add_score_noise_start"):
+            args.repair_add_score_noise_start = 0.20
+        if not _cli_option_was_provided("--repair_add_score_noise_end"):
+            args.repair_add_score_noise_end = 0.03
+        if not _cli_option_was_provided("--repair_add_weight_random_mix_start"):
+            args.repair_add_weight_random_mix_start = 0.0 if args.sparsepcgc_disable_add else 0.08
+        if not _cli_option_was_provided("--repair_add_weight_random_mix_end"):
+            args.repair_add_weight_random_mix_end = 0.02
+        if not _cli_option_was_provided("--repair_drop_amount_random_mix_start"):
+            args.repair_drop_amount_random_mix_start = 0.10
+        if not _cli_option_was_provided("--repair_drop_amount_random_mix_end"):
+            args.repair_drop_amount_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_add_amount_random_mix_start"):
+            args.repair_add_amount_random_mix_start = 0.10
+        if not _cli_option_was_provided("--repair_add_amount_random_mix_end"):
+            args.repair_add_amount_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_start"):
+            args.repair_move_amount_random_mix_start = 0.0
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_end"):
+            args.repair_move_amount_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_move_score_noise_start"):
+            args.repair_move_score_noise_start = 0.0
+        if not _cli_option_was_provided("--repair_move_score_noise_end"):
+            args.repair_move_score_noise_end = 0.0
+        if not _cli_option_was_provided("--repair_drop_score_noise_start"):
+            args.repair_drop_score_noise_start = 0.35
+        if not _cli_option_was_provided("--repair_drop_score_noise_end"):
+            args.repair_drop_score_noise_end = 0.05
+        if not _cli_option_was_provided("--repair_drop_random_mix_start"):
+            args.repair_drop_random_mix_start = 0.25
+        if not _cli_option_was_provided("--repair_drop_random_mix_end"):
+            args.repair_drop_random_mix_end = 0.03
+        if not _cli_option_was_provided("--max_repair_qstep"):
+            args.max_repair_qstep = max(float(getattr(args, "max_repair_qstep", 0.0)), 0.55)
+        if not _cli_option_was_provided("--train_subtree_random_full_range"):
+            args.train_subtree_random_full_range = False
+        if not _cli_option_was_provided("--train_subtree_level_sampling"):
+            args.train_subtree_level_sampling = "uniform_random"
+        if not _cli_option_was_provided("--train_subtree_curriculum_fraction"):
+            args.train_subtree_curriculum_fraction = 1.0
+        if not _cli_option_was_provided("--train_subtree_min_points"):
+            args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 4)
+        if not _cli_option_was_provided("--train_patch_subset_anchor_interval"):
+            args.train_patch_subset_anchor_interval = 0
+        if not _cli_option_was_provided("--train_subtree_full_cloud_prob"):
+            args.train_subtree_full_cloud_prob = 0.0
+        if not _cli_option_was_provided("--compression_grad_probe"):
+            args.compression_grad_probe = True
+        if not _cli_option_was_provided("--compression_grad_probe_every"):
+            args.compression_grad_probe_every = min(max(int(getattr(args, "compression_grad_probe_every", 10)), 1), 8)
+        if not _cli_option_was_provided("--debug_grad_flow"):
+            args.debug_grad_flow = True
+        if not _cli_option_was_provided("--debug_grad_flow_rate"):
+            args.debug_grad_flow_rate = 8
+
+    actual_codec_surrogate_backend = args.compression_loss_backend.endswith("_surrogate")
+    if actual_codec_surrogate_backend:
+        if (not sparsepcgc_backend) and not _cli_option_was_provided("--disable_actual_codec_during_train"):
+            # SparsePCGC以外のsurrogateは従来通り重いactual teacherを既定で抑制する。
+            args.disable_actual_codec_during_train = True
+        if bool(getattr(args, "disable_actual_codec_during_train", False)):
+            if not _cli_option_was_provided("--compression_surrogate_replay_steps"):
+                args.compression_surrogate_replay_steps = 0
+            if not _cli_option_was_provided("--surrogate_update_on_teacher_refresh_only"):
+                args.surrogate_update_on_teacher_refresh_only = True
+        if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
+            args.compression_surrogate_forward_mode = "teacher_ste"
+        if (not sparsepcgc_backend) and (not _cli_option_was_provided("--compression_surrogate_refresh_interval")):
+            args.compression_surrogate_refresh_interval = int(getattr(args, "actual_eval_interval", 1000))
+        if (not sparsepcgc_backend) and (not _cli_option_was_provided("--compression_surrogate_reuse_last_target")):
+            args.compression_surrogate_reuse_last_target = True
+        if not _cli_option_was_provided("--compression_surrogate_target_cache_entries"):
+            args.compression_surrogate_target_cache_entries = 256
+        if not _cli_option_was_provided("--compression_surrogate_aux_node_weight"):
+            args.compression_surrogate_aux_node_weight = 0.0
+        if not _cli_option_was_provided("--compression_surrogate_aux_single_weight"):
+            args.compression_surrogate_aux_single_weight = 0.0
+        if (not sparsepcgc_backend) and not _cli_option_was_provided("--compression_surrogate_train_steps"):
+            args.compression_surrogate_train_steps = max(args.compression_surrogate_train_steps, 4)
+        if (not sparsepcgc_backend) and not _cli_option_was_provided("--compression_surrogate_warmup_steps"):
+            args.compression_surrogate_warmup_steps = max(args.compression_surrogate_warmup_steps, 4)
+        if (not sparsepcgc_backend) and not _cli_option_was_provided("--repair_move_require_empty_target"):
+            args.repair_move_require_empty_target = False
+        if (not sparsepcgc_backend) and not _cli_option_was_provided("--repair_move_prefer_occupied_target"):
+            args.repair_move_prefer_occupied_target = True
+        if not _cli_option_was_provided("--max_repair_qstep"):
+            args.max_repair_qstep = max(float(getattr(args, "max_repair_qstep", 0.0)), 0.55)
+
+    external_codec_backend = (
+        compress_key in {"sparsepcgc", "gpcc", "draco"}
+        or args.compression_loss_backend.startswith(("sparsepcgc_", "gpcc_", "draco_"))
+    )
+    if external_codec_backend:
+        if not _cli_option_was_provided("--repair_selection_mode"):
+            args.repair_selection_mode = "threshold_cap"
+        if sparsepcgc_backend:
+            if not _cli_option_was_provided("--repair_move_require_empty_target"):
+                args.repair_move_require_empty_target = True
+            if not _cli_option_was_provided("--repair_move_prefer_occupied_target"):
+                args.repair_move_prefer_occupied_target = False
+        else:
+            if not _cli_option_was_provided("--repair_move_require_empty_target"):
+                args.repair_move_require_empty_target = False
+            if not _cli_option_was_provided("--repair_move_prefer_occupied_target"):
+                args.repair_move_prefer_occupied_target = True
+        if not _cli_option_was_provided("--repair_add_hard_threshold"):
+            args.repair_add_hard_threshold = 0.35 if sparsepcgc_backend else 0.0
+        if not _cli_option_was_provided("--repair_move_hard_threshold"):
+            args.repair_move_hard_threshold = 0.20 if sparsepcgc_backend else min(float(getattr(args, "repair_move_hard_threshold", 0.5)), 0.05)
+        if not _cli_option_was_provided("--repair_drop_hard_threshold"):
+            args.repair_drop_hard_threshold = min(float(getattr(args, "repair_drop_hard_threshold", 0.5)), 0.25)
+        if not _cli_option_was_provided("--repair_exploration_fraction"):
+            args.repair_exploration_fraction = max(float(getattr(args, "repair_exploration_fraction", 0.0)), 0.10)
+        if not _cli_option_was_provided("--repair_drop_score_noise_start"):
+            args.repair_drop_score_noise_start = max(float(getattr(args, "repair_drop_score_noise_start", 0.0)), 0.35)
+        if not _cli_option_was_provided("--repair_drop_score_noise_end"):
+            args.repair_drop_score_noise_end = max(float(getattr(args, "repair_drop_score_noise_end", 0.0)), 0.05)
+        if not _cli_option_was_provided("--repair_drop_random_mix_start"):
+            args.repair_drop_random_mix_start = max(float(getattr(args, "repair_drop_random_mix_start", 0.0)), 0.25)
+        if not _cli_option_was_provided("--repair_drop_random_mix_end"):
+            args.repair_drop_random_mix_end = max(float(getattr(args, "repair_drop_random_mix_end", 0.0)), 0.03)
+        if not _cli_option_was_provided("--repair_add_score_noise_start"):
+            args.repair_add_score_noise_start = max(float(getattr(args, "repair_add_score_noise_start", 0.0)), 0.20)
+        if not _cli_option_was_provided("--repair_add_score_noise_end"):
+            args.repair_add_score_noise_end = max(float(getattr(args, "repair_add_score_noise_end", 0.0)), 0.03)
+        if (not sparsepcgc_backend) and (not _cli_option_was_provided("--target_drop_ratio")):
+            args.target_drop_ratio = min(float(getattr(args, "target_drop_ratio", 0.0)), 0.02)
+        if (not sparsepcgc_backend) and (not _cli_option_was_provided("--max_drop_ratio")):
+            args.max_drop_ratio = min(float(getattr(args, "max_drop_ratio", 0.0)), 0.05)
+
+    args.encoder_pre_downsample_mode = str(args.encoder_pre_downsample_mode).strip().lower()
+    if args.encoder_pre_downsample_mode not in {"voxel"}:
+        raise ValueError(
+            f"--encoder_pre_downsample_mode must be 'voxel' (got {args.encoder_pre_downsample_mode})"
+        )
+
+    args.encoder_feature_propagation = str(args.encoder_feature_propagation).strip().lower()
+    if args.encoder_feature_propagation not in {"knn_inverse_distance"}:
+        raise ValueError(
+            "--encoder_feature_propagation must be 'knn_inverse_distance' "
+            f"(got {args.encoder_feature_propagation})"
+        )
+    args.encoder_feature_propagation_k = max(int(args.encoder_feature_propagation_k), 1)
+    args.point_transformer_node_features = bool(getattr(
+        args, "point_transformer_node_features", True
+    ))
+    args.point_transformer_node_feature_dim = max(int(getattr(
+        args, "point_transformer_node_feature_dim", 8
+    )), 1)
+    args.point_transformer_node_adapter_hidden = max(int(getattr(
+        args, "point_transformer_node_adapter_hidden", 32
+    )), 8)
+    args.point_transformer_node_feature_scale = max(float(getattr(
+        args, "point_transformer_node_feature_scale", 0.25
+    )), 0.0)
+    args.point_transformer_feature_gate_max = min(max(float(getattr(
+        args, "point_transformer_feature_gate_max", 0.10
+    )), 0.0), 1.0)
+    args.point_transformer_feature_warmup_steps = max(int(getattr(
+        args, "point_transformer_feature_warmup_steps", 0
+    )), 0)
+    args.point_transformer_feature_lr_scale = min(max(float(getattr(
+        args, "point_transformer_feature_lr_scale", 0.1
+    )), 0.0), 1.0)
+    args.point_transformer_feature_cache = bool(getattr(
+        args, "point_transformer_feature_cache", True
+    ))
+    args.point_transformer_feature_cache_max_entries = max(int(getattr(
+        args, "point_transformer_feature_cache_max_entries", 16
+    )), 0)
+    args.point_transformer_feature_cache_max_memory_mb = max(int(getattr(
+        args, "point_transformer_feature_cache_max_memory_mb", 128
+    )), 0)
+    args.point_transformer_feature_disk_cache = bool(getattr(
+        args, "point_transformer_feature_disk_cache", True
+    ))
+    args.point_transformer_feature_disk_cache_dir = str(getattr(
+        args, "point_transformer_feature_disk_cache_dir", ""
+    )).strip()
+    args.allow_slow_knn_fallback = bool(getattr(args, "allow_slow_knn_fallback", False))
+
+    args.patch_parallel_mode = str(args.patch_parallel_mode).strip().lower()
+    if args.patch_parallel_mode not in {"auto", "fixed", "all"}:
+        raise ValueError(
+            f"--patch_parallel_mode must be auto/fixed/all (got {args.patch_parallel_mode})"
+        )
+    args.patch_batch_size = max(int(args.patch_batch_size), 1)
+
+    args.test_inference_mode = str(getattr(args, "test_inference_mode", "auto")).strip().lower()
+    if args.test_inference_mode not in {"auto", "full_cloud", "subtree_merge", "patch", "direct", "legacy", "verified"}:
+        raise ValueError(
+            "--test_inference_mode must be one of: auto, full_cloud, subtree_merge, patch, direct, legacy, verified "
+            f"(got {args.test_inference_mode})"
+        )
+    args.test_allow_subtree_merge = bool(getattr(args, "test_allow_subtree_merge", False))
+    args.test_subtree_level = int(getattr(args, "test_subtree_level", 0))
+    if args.test_subtree_level < 0:
+        raise ValueError("--test_subtree_level must be >= 0")
+    args.test_subtree_batch_size = max(int(getattr(args, "test_subtree_batch_size", 1)), 1)
+    args.test_subtree_min_points = max(
+        int(getattr(args, "test_subtree_min_points", getattr(args, "train_subtree_min_points", 1))),
+        1,
+    )
+    args.test_compute_quality_metrics = bool(getattr(args, "test_compute_quality_metrics", True))
+
+    args.train_patch_subset_sampling = str(getattr(args, "train_patch_subset_sampling", "coverage_cycle")).strip().lower()
+    if args.train_patch_subset_sampling not in {"coverage_cycle"}:
+        raise ValueError(
+            "--train_patch_subset_sampling must be coverage_cycle "
+            f"(got {args.train_patch_subset_sampling})"
+        )
+    args.train_patch_subset_patches_per_step = int(getattr(args, "train_patch_subset_patches_per_step", 0))
+    if args.train_patch_subset_patches_per_step < 1:
+        raise ValueError("--train_patch_subset_patches_per_step must be >= 1")
+    args.train_patch_subset_anchor_interval = int(getattr(args, "train_patch_subset_anchor_interval", 0))
+    if args.train_patch_subset_anchor_interval < 0:
+        raise ValueError("--train_patch_subset_anchor_interval must be >= 0")
+    args.train_full_cloud_actual_interval = int(getattr(args, "train_full_cloud_actual_interval", 0))
+    if args.train_full_cloud_actual_interval < 0:
+        raise ValueError("--train_full_cloud_actual_interval must be >= 0")
+    args.sparsepcgc_full_cloud_actual_primary = bool(
+        getattr(args, "sparsepcgc_full_cloud_actual_primary", True)
+    )
+    args.sparsepcgc_require_full_cloud_actual_teacher = bool(
+        getattr(args, "sparsepcgc_require_full_cloud_actual_teacher", True)
+    )
+    args.train_full_cloud_val_frames = max(int(getattr(args, "train_full_cloud_val_frames", 5)), 0)
+    args.train_subtree_full_cloud_prob = float(getattr(args, "train_subtree_full_cloud_prob", 0.0))
+    if not 0.0 <= args.train_subtree_full_cloud_prob <= 1.0:
+        raise ValueError("--train_subtree_full_cloud_prob must be in [0, 1]")
+    args.train_subtree_level = int(getattr(args, "train_subtree_level", 0))
+    if args.train_subtree_level < 0:
+        raise ValueError("--train_subtree_level must be >= 0")
+    args.train_subtree_level_jitter = max(int(getattr(args, "train_subtree_level_jitter", 0)), 0)
+    args.train_subtree_level_min = int(getattr(args, "train_subtree_level_min", 0))
+    args.train_subtree_level_max = int(getattr(args, "train_subtree_level_max", 0))
+    if args.train_subtree_level_min < 0:
+        raise ValueError("--train_subtree_level_min must be >= 0")
+    if args.train_subtree_level_max < 0:
+        raise ValueError("--train_subtree_level_max must be >= 0")
+    args.train_subtree_level_sampling = str(getattr(args, "train_subtree_level_sampling", "uniform_random")).strip().lower()
+    if args.train_subtree_level_sampling not in {"uniform_random", "coverage_cycle"}:
+        raise ValueError(
+            "--train_subtree_level_sampling must be one of: uniform_random, coverage_cycle "
+            f"(got {args.train_subtree_level_sampling})"
+        )
+    args.train_subtree_level_curriculum = bool(getattr(args, "train_subtree_level_curriculum", True))
+    args.train_subtree_curriculum_fraction = min(
+        max(float(getattr(args, "train_subtree_curriculum_fraction", 1.0)), 0.0),
+        1.0,
+    )
+    args.train_subtree_curriculum_direction = str(
+        getattr(args, "train_subtree_curriculum_direction", "deep_to_shallow")
+    ).strip().lower()
+    if args.train_subtree_curriculum_direction not in {"deep_to_shallow", "shallow_to_deep"}:
+        raise ValueError(
+            "--train_subtree_curriculum_direction must be one of: "
+            "deep_to_shallow, shallow_to_deep "
+            f"(got {args.train_subtree_curriculum_direction})"
+        )
+    args.train_subtree_depth_percent_curriculum = bool(
+        getattr(args, "train_subtree_depth_percent_curriculum", True)
+    )
+    args.train_subtree_depth_percent_start = _parse_csv_floats(
+        getattr(args, "train_subtree_depth_percent_start", "0.0,0.50")
+    )
+    args.train_subtree_depth_percent_end = _parse_csv_floats(
+        getattr(args, "train_subtree_depth_percent_end", "0.0,0.50")
+    )
+    for label, values in (
+        ("--train_subtree_depth_percent_start", args.train_subtree_depth_percent_start),
+        ("--train_subtree_depth_percent_end", args.train_subtree_depth_percent_end),
+    ):
+        if len(values) != 2:
+            raise ValueError(f"{label} must contain two comma-separated values, e.g. 0.70,0.90")
+        lo, hi = sorted(float(value) for value in values)
+        if lo < 0.0 or hi > 1.0:
+            raise ValueError(f"{label} values must be in [0, 1] (got {values})")
+        if hi <= 0.0:
+            raise ValueError(f"{label} upper value must be > 0 (got {values})")
+    args.train_subtree_depth_percent_start = sorted(args.train_subtree_depth_percent_start)
+    args.train_subtree_depth_percent_end = sorted(args.train_subtree_depth_percent_end)
+    if not _cli_option_was_provided("--surrogate_pretrain_subtree_depth_percent_min"):
+        args.surrogate_pretrain_subtree_depth_percent_min = float(min(args.train_subtree_depth_percent_start + args.train_subtree_depth_percent_end)) # Surrogate事前学習の最小深さ割合を本学習レンジへ揃える
+    if not _cli_option_was_provided("--surrogate_pretrain_subtree_depth_percent_max"):
+        args.surrogate_pretrain_subtree_depth_percent_max = float(max(args.train_subtree_depth_percent_start + args.train_subtree_depth_percent_end)) # Surrogate事前学習の最大深さ割合を本学習レンジへ揃える
+    args._train_subtree_depth_cli_override = bool(
+        _cli_option_was_provided("--train_subtree_level")
+        or _cli_option_was_provided("--train_subtree_level_min")
+        or _cli_option_was_provided("--train_subtree_level_max")
+    )
+    args.train_subtree_random_full_range = bool(getattr(args, "train_subtree_random_full_range", True))
+    args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
+    amount_cap = 0.30
+
+    args.target_add_ratio = _clamp_float(getattr(args, "target_add_ratio", 0.0), 0.0, amount_cap)
+    args.max_add_ratio = _clamp_float(getattr(args, "max_add_ratio", amount_cap), 0.0, amount_cap)
+    args.target_drop_ratio = _clamp_float(getattr(args, "target_drop_ratio", 0.0), 0.0, amount_cap)
+    args.max_drop_ratio = _clamp_float(getattr(args, "max_drop_ratio", amount_cap), 0.0, amount_cap)
+    args.target_repair_ratio = _clamp_float(getattr(args, "target_repair_ratio", 0.0), 0.0, 0.95)
+    args.max_repair_ratio = _clamp_float(
+        getattr(args, "max_repair_ratio", args.target_repair_ratio),
+        args.target_repair_ratio,
+        1.0,
+    )
+    args.target_move_ratio = _clamp_float(getattr(args, "target_move_ratio", 0.0), 0.0, amount_cap)
+    args.max_move_ratio = _clamp_float(getattr(args, "max_move_ratio", amount_cap), 0.0, amount_cap)
+
+    args.repair_move_ratio_floor = min(
+        max(float(getattr(args, "repair_move_ratio_floor", 0.0)), 0.0),
+        args.max_move_ratio,
+    )
+    # ============================================================
+    # Phase1: SparsePCGCではMoveを小操作に固定する
+    # ============================================================
+    # SparsePCGCのactual bit悪化は、大規模Moveによるoccupancy pattern破壊が主因である。
+    # そのため、ユーザがCLIで明示した場合を除き、Move上限と探索を強く抑制する。
+    compress_key_for_move = _compress_key(getattr(args, "compress", ""))
+
+    if compress_key_for_move == "sparsepcgc":
+        if not _cli_option_was_provided("--max_move_ratio"):
+            args.max_move_ratio = min(float(getattr(args, "max_move_ratio", 0.02)), 0.02)
+
+        if not _cli_option_was_provided("--repair_move_ratio_floor"):
+            args.repair_move_ratio_floor = 0.001
+
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_start"):
+            args.repair_move_amount_random_mix_start = max(
+                float(getattr(args, "repair_move_amount_random_mix_start", 0.0)),
+                0.05,
+            )
+
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_end"):
+            args.repair_move_amount_random_mix_end = 0.0
+
+        if not _cli_option_was_provided("--repair_move_score_noise_start"):
+            args.repair_move_score_noise_start = max(
+                float(getattr(args, "repair_move_score_noise_start", 0.0)),
+                0.05,
+            )
+
+        if not _cli_option_was_provided("--repair_move_score_noise_end"):
+            args.repair_move_score_noise_end = 0.0
+
+        if not _cli_option_was_provided("--repair_move_relax_voxel_count_when_starved"):
+            args.repair_move_relax_voxel_count_when_starved = False
+
+        if not _cli_option_was_provided("--repair_move_relax_duplicate_guard_when_starved"):
+            args.repair_move_relax_duplicate_guard_when_starved = False
+    args.repair_move_warmup_steps = max(int(getattr(args, "repair_move_warmup_steps", 0)), 0)
+    args.repair_delete_max_points_per_voxel = max(int(getattr(args, "repair_delete_max_points_per_voxel", 8)), 0)
+    args.repair_move_max_points_per_voxel = max(int(getattr(args, "repair_move_max_points_per_voxel", 8)), 0)
+    args.add_noop_keep_threshold = min(max(float(getattr(args, "add_noop_keep_threshold", 0.5)), 0.0), 1.0)
+    args.repair_add_drop_conflict_weight = max(float(getattr(args, "repair_add_drop_conflict_weight", 0.0)), 0.0)
+    args.repair_add_keep_weight = max(float(getattr(args, "repair_add_keep_weight", 0.0)), 0.0)
+    args.repair_add_min_offset_weight = max(float(getattr(args, "repair_add_min_offset_weight", 0.0)), 0.0)
+    args.repair_move_require_empty_target = bool(getattr(args, "repair_move_require_empty_target", True))
+    args.repair_move_prefer_occupied_target = bool(getattr(args, "repair_move_prefer_occupied_target", False))
+    args.repair_move_source_prior_weight = min(
+        max(float(getattr(args, "repair_move_source_prior_weight", 0.35)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_move_source_prior_weight = min(
+        max(float(getattr(args, "sparsepcgc_move_source_prior_weight", 0.55)), 0.0),
+        1.0,
+    )
+    args.enable_voxel_collision_log = bool(getattr(args, "enable_voxel_collision_log", False))
+    args.voxel_collision_log_interval = max(int(getattr(args, "voxel_collision_log_interval", 1)), 1)
+    args.voxel_collision_max_points = max(int(getattr(args, "voxel_collision_max_points", 300000)), 0)
+    args.voxel_collision_log_first_batch_only = bool(getattr(args, "voxel_collision_log_first_batch_only", True))
+    args.voxel_collision_log_stages = str(
+        getattr(args, "voxel_collision_log_stages", "input_gt,model_output_raw,compression_input")
+    )
+    args.enable_sparsepcgc_empty_target_guard = bool(getattr(args, "enable_sparsepcgc_empty_target_guard", True))
+    args.enable_sparsepcgc_target_duplicate_guard = bool(getattr(args, "enable_sparsepcgc_target_duplicate_guard", True))
+    args.sparsepcgc_empty_target_penalty_weight = max(
+        float(getattr(args, "sparsepcgc_empty_target_penalty_weight", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_target_duplicate_penalty_weight = max(
+        float(getattr(args, "sparsepcgc_target_duplicate_penalty_weight", 0.0)),
+        0.0,
+    )
+    args.enable_sparsepcgc_occupancy_debug = bool(getattr(args, "enable_sparsepcgc_occupancy_debug", False))
+    args.sparsepcgc_occupancy_low_prob_threshold = min(
+        max(float(getattr(args, "sparsepcgc_occupancy_low_prob_threshold", 0.1)), 1e-6),
+        1.0,
+    )
+    args.sparsepcgc_actual_oracle_geometry_lambda = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_geometry_lambda", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_force_no_edit = bool(
+        getattr(args, "sparsepcgc_actual_oracle_force_no_edit", False)
+    )
+    fast_diag_prune_mode = str(
+        getattr(args, "sparsepcgc_fast_diagnostic_prune_mode", "density_ratio")
+    ).strip().lower()
+    if fast_diag_prune_mode not in {"axis_threshold", "density_ratio", "hybrid"}:
+        fast_diag_prune_mode = "density_ratio"
+    args.sparsepcgc_fast_diagnostic_prune_mode = fast_diag_prune_mode
+    args.enable_sparsepcgc_exact_occupancy_teacher = bool(getattr(args, "enable_sparsepcgc_exact_occupancy_teacher", False))
+    args.sparsepcgc_exact_occupancy_interval = max(
+        int(getattr(args, "sparsepcgc_exact_occupancy_interval", 1)),
+        0,
+    )
+    exact_teacher_mode = str(getattr(args, "sparsepcgc_exact_teacher_mode", "auto")).strip().lower()
+    if exact_teacher_mode not in {"auto", "full_cloud", "global_subtree", "local_subtree"}:
+        raise ValueError("--sparsepcgc_exact_teacher_mode must be auto/full_cloud/global_subtree/local_subtree")
+    args.sparsepcgc_exact_teacher_mode = exact_teacher_mode
+    args.enable_sparsepcgc_exact_occupancy_loss = bool(
+        getattr(args, "enable_sparsepcgc_exact_occupancy_loss", False)
+    )
+    args.sparsepcgc_exact_occupancy_loss_weight = max(
+        float(getattr(args, "sparsepcgc_exact_occupancy_loss_weight", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_exact_bits_loss_weight = max(
+        float(getattr(args, "sparsepcgc_exact_bits_loss_weight", 0.0)),
+        0.0,
+    )
+    selection_mode = str(getattr(args, "repair_selection_mode", "target")).strip().lower().replace("-", "_")
+    if selection_mode in {"cap", "optional", "threshold", "thresholdcap"}:
+        selection_mode = "threshold_cap"
+    if selection_mode not in {"target", "threshold_cap"}:
+        raise ValueError("--repair_selection_mode must be target or threshold_cap")
+    args.repair_selection_mode = selection_mode
+    args.repair_move_hard_threshold = min(max(float(getattr(args, "repair_move_hard_threshold", 0.5)), 0.0), 1.0)
+    args.repair_drop_hard_threshold = min(max(float(getattr(args, "repair_drop_hard_threshold", 0.5)), 0.0), 1.0)
+    args.repair_drop_ratio_floor = min(max(float(getattr(args, "repair_drop_ratio_floor", 0.0)), 0.0), 0.05)
+    args.repair_add_hard_threshold = min(max(float(getattr(args, "repair_add_hard_threshold", 0.5)), 0.0), 1.0)
+    args.repair_quant_guard_weight = max(float(getattr(args, "repair_quant_guard_weight", 0.0)), 0.0)
+    args.repair_local_guard_weight = max(float(getattr(args, "repair_local_guard_weight", 0.0)), 0.0)
+    args.repair_drop_soft_proxy_tau = max(float(getattr(args, "repair_drop_soft_proxy_tau", 8.0)), 1e-6)
+    args.repair_drop_direct_target_weight = max(float(getattr(args, "repair_drop_direct_target_weight", 5.0)), 0.0)
+    args.repair_drop_entropy_weight = max(float(getattr(args, "repair_drop_entropy_weight", 0.01)), 0.0)
+    args.repair_operation_entropy_weight = max(float(getattr(args, "repair_operation_entropy_weight", 0.02)), 0.0)
+    args.repair_operation_entropy_warmup_steps = max(int(getattr(args, "repair_operation_entropy_warmup_steps", 500)), 0)
+    args.repair_add_weight_mode = str(getattr(args, "repair_add_weight_mode", "hard")).strip().lower()
+    if args.repair_add_weight_mode not in {"hard", "soft"}:
+        raise ValueError("--repair_add_weight_mode must be hard or soft")
+    args.repair_exploration_fraction = min(max(float(getattr(args, "repair_exploration_fraction", 0.0)), 0.0), 1.0)
+    args.repair_exploration_smooth_tail_fraction = min(max(float(getattr(
+        args, "repair_exploration_smooth_tail_fraction", 0.25
+    )), 0.0), 1.0)
+    args.repair_exploration_plateau_fraction = min(max(float(getattr(
+        args, "repair_exploration_plateau_fraction", 0.40
+    )), 0.0), 0.90)
+    args.repair_policy_exploration_mode = str(getattr(
+        args, "repair_policy_exploration_mode", "annealed"
+    )).strip().lower()
+    if args.repair_policy_exploration_mode not in {"constant", "annealed"}:
+        raise ValueError("--repair_policy_exploration_mode must be constant or annealed")
+    args.repair_policy_exploration_constant_multiplier = min(max(float(getattr(
+        args, "repair_policy_exploration_constant_multiplier", 0.50
+    )), 0.0), 1.0)
+    args.repair_add_candidate_ratio_start = max(float(getattr(args, "repair_add_candidate_ratio_start", 0.0)), 0.0)
+    args.repair_add_candidate_ratio_end = max(float(getattr(args, "repair_add_candidate_ratio_end", 0.0)), 0.0)
+    args.repair_add_score_noise_start = max(float(getattr(args, "repair_add_score_noise_start", 0.0)), 0.0)
+    args.repair_add_score_noise_end = max(float(getattr(args, "repair_add_score_noise_end", 0.0)), 0.0)
+    args.repair_add_weight_random_mix_start = min(max(float(getattr(args, "repair_add_weight_random_mix_start", 0.0)), 0.0), 1.0)
+    args.repair_add_weight_random_mix_end = min(max(float(getattr(args, "repair_add_weight_random_mix_end", 0.0)), 0.0), 1.0)
+    args.repair_drop_score_noise_start = max(float(getattr(args, "repair_drop_score_noise_start", 0.0)), 0.35)
+    args.repair_drop_score_noise_end = max(float(getattr(args, "repair_drop_score_noise_end", 0.0)), 0.0)
+    args.repair_drop_random_mix_start = min(max(float(getattr(args, "repair_drop_random_mix_start", 0.0)), 0.0), 1.0)
+    args.repair_drop_random_mix_end = min(max(float(getattr(args, "repair_drop_random_mix_end", 0.0)), 0.0), 1.0)
+    args.allow_local_repair_unit_recompute = bool(getattr(args, "allow_local_repair_unit_recompute", False))
+    args.allow_local_octree_recompute = bool(getattr(args, "allow_local_octree_recompute", False))
+    args.forbid_local_voxel_recompute = bool(getattr(args, "forbid_local_voxel_recompute", True))
+    args.ckpt = _resolve_repo_or_cwd_path(args.ckpt)
+    args.octattention_ckpt = _resolve_repo_or_cwd_path(args.octattention_ckpt)
+    args.sparsepcgc_root = _resolve_repo_or_cwd_path(args.sparsepcgc_root)
+    if sparsepcgc_backend:
+        if not _cli_option_was_provided("--repair_exploration_fraction"):
+            args.repair_exploration_fraction = 0.25
+        if not _cli_option_was_provided("--repair_policy_exploration_mode"):
+            args.repair_policy_exploration_mode = "annealed"
+
+        # Prune / Drop exploration. Keep a small tail, but do not keep heavy noise forever.
+        if not _cli_option_was_provided("--repair_drop_score_noise_start"):
+            args.repair_drop_score_noise_start = max(float(getattr(args, "repair_drop_score_noise_start", 0.0)), 0.35)
+        if not _cli_option_was_provided("--repair_drop_score_noise_end"):
+            args.repair_drop_score_noise_end = max(float(getattr(args, "repair_drop_score_noise_end", 0.0)), 0.05)
+        if not _cli_option_was_provided("--repair_drop_random_mix_start"):
+            args.repair_drop_random_mix_start = max(float(getattr(args, "repair_drop_random_mix_start", 0.0)), 0.25)
+        if not _cli_option_was_provided("--repair_drop_random_mix_end"):
+            args.repair_drop_random_mix_end = max(float(getattr(args, "repair_drop_random_mix_end", 0.0)), 0.03)
+
+        # Add exploration.
+        if not _cli_option_was_provided("--repair_add_score_noise_start"):
+            args.repair_add_score_noise_start = max(float(getattr(args, "repair_add_score_noise_start", 0.0)), 0.20)
+        if not _cli_option_was_provided("--repair_add_score_noise_end"):
+            args.repair_add_score_noise_end = max(float(getattr(args, "repair_add_score_noise_end", 0.0)), 0.03)
+        if not _cli_option_was_provided("--repair_add_weight_random_mix_start"):
+            args.repair_add_weight_random_mix_start = max(float(getattr(args, "repair_add_weight_random_mix_start", 0.0)), 0.08)
+        if not _cli_option_was_provided("--repair_add_weight_random_mix_end"):
+            args.repair_add_weight_random_mix_end = max(float(getattr(args, "repair_add_weight_random_mix_end", 0.0)), 0.02)
+
+        # Amount exploration.
+        if not _cli_option_was_provided("--repair_drop_amount_random_mix_start"):
+            args.repair_drop_amount_random_mix_start = max(float(getattr(args, "repair_drop_amount_random_mix_start", 0.0)), 0.10)
+        if not _cli_option_was_provided("--repair_drop_amount_random_mix_end"):
+            args.repair_drop_amount_random_mix_end = max(float(getattr(args, "repair_drop_amount_random_mix_end", 0.0)), 0.02)
+        if not _cli_option_was_provided("--repair_add_amount_random_mix_start"):
+            args.repair_add_amount_random_mix_start = max(float(getattr(args, "repair_add_amount_random_mix_start", 0.0)), 0.08)
+        if not _cli_option_was_provided("--repair_add_amount_random_mix_end"):
+            args.repair_add_amount_random_mix_end = max(float(getattr(args, "repair_add_amount_random_mix_end", 0.0)), 0.02)
+
+        # Operation gate exploration.
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_start"):
+            args.repair_operation_gate_random_mix_start = max(float(getattr(args, "repair_operation_gate_random_mix_start", 0.0)), 0.12)
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
+            args.repair_operation_gate_random_mix_end = max(float(getattr(args, "repair_operation_gate_random_mix_end", 0.0)), 0.02)
+
+        # Move / Adjust exploration.
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_start"):
+            args.repair_move_amount_random_mix_start = max(float(getattr(args, "repair_move_amount_random_mix_start", 0.0)), 0.05)
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_end"):
+            args.repair_move_amount_random_mix_end = max(float(getattr(args, "repair_move_amount_random_mix_end", 0.0)), 0.01)
+        if not _cli_option_was_provided("--repair_move_score_noise_start"):
+            args.repair_move_score_noise_start = max(float(getattr(args, "repair_move_score_noise_start", 0.0)), 0.05)
+        if not _cli_option_was_provided("--repair_move_score_noise_end"):
+            args.repair_move_score_noise_end = max(float(getattr(args, "repair_move_score_noise_end", 0.0)), 0.01)
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
+        # Exploration is sampled inside NetworkOnlyCodecPolicy so the sampled
+        # action and the recorded log-probability refer to the same policy.
+        args.repair_drop_score_noise_start = 0.0
+        args.repair_drop_score_noise_end = 0.0
+        args.repair_add_score_noise_start = 0.0
+        args.repair_add_score_noise_end = 0.0
+        args.repair_move_score_noise_start = 0.0
+        args.repair_move_score_noise_end = 0.0
+        args.repair_add_weight_random_mix_start = 0.0
+        args.repair_add_weight_random_mix_end = 0.0
+        args.repair_operation_gate_random_mix_start = 0.0
+        args.repair_operation_gate_random_mix_end = 0.0
+    args.sparsepcgc_ckptdir = _resolve_from_base_path(args.sparsepcgc_ckptdir, args.sparsepcgc_root)
+    args.sparsepcgc_ckptdir_sr = _resolve_from_base_path(args.sparsepcgc_ckptdir_sr, args.sparsepcgc_root)
+    args.sparsepcgc_ckptdir_ae = _resolve_from_base_path(args.sparsepcgc_ckptdir_ae, args.sparsepcgc_root)
+    args.sparsepcgc_ckptdir_low = _resolve_from_base_path(args.sparsepcgc_ckptdir_low, args.sparsepcgc_root)
+    args.sparsepcgc_ckptdir_high = _resolve_from_base_path(args.sparsepcgc_ckptdir_high, args.sparsepcgc_root)
+    args.sparsepcgc_ckptdir_offset = _resolve_from_base_path(args.sparsepcgc_ckptdir_offset, args.sparsepcgc_root)
+    sparse_python = str(getattr(args, "sparsepcgc_python", "")).strip()
+    if sparse_python and (os.path.isabs(sparse_python) or os.path.sep in sparse_python):
+        args.sparsepcgc_python = _resolve_repo_or_cwd_path(sparse_python)
+    else:
+        args.sparsepcgc_python = sparse_python
+    args.gpcc_root = _resolve_repo_or_cwd_path(args.gpcc_root)
+    args.gpcc_encoder_path = _resolve_from_base_path(args.gpcc_encoder_path, args.gpcc_root)
+    args.gpcc_cfg_dir = _resolve_from_base_path(args.gpcc_cfg_dir, args.gpcc_root)
+    args.draco_root = _resolve_repo_or_cwd_path(args.draco_root)
+    args.draco_encoder_path = _resolve_from_base_path(args.draco_encoder_path, args.draco_root)
+    args.draco_decoder_path = _resolve_from_base_path(args.draco_decoder_path, args.draco_root)
+    args.save_dir = _resolve_repo_or_cwd_path(args.save_dir)
+    args.exact_teacher_cache_root = _resolve_repo_or_cwd_path(
+        str(getattr(args, "exact_teacher_cache_root", "/data/maejima/log/mynet_exact_teacher_cache"))
+    )
+    args.out_path = _resolve_repo_or_cwd_path(args.out_path)
+    args.log_root = _resolve_repo_or_cwd_path(args.log_root)
+    args.save_ply_dir = _resolve_repo_or_cwd_path(args.save_ply_dir)
+    args.output_log = _resolve_repo_or_cwd_path(args.output_log)
+    # ============================================================
+    # Direct Network Prune 最終上書き
+    # ============================================================
+    # direct_network_pruneは診断専用であり、通常訓練では絶対に勝手に有効化しない。
+    # ここでcodec priorをFalseにするのは、明示的にdirectを指定したときだけである。
+    # ============================================================
+    direct_mode_requested = bool(getattr(args, "direct_network_prune", False))
+
+    if direct_mode_requested:
+        args.sparsepcgc_prune_after_prior_mode = "direct_network"
+
+        # direct診断時だけPhase/priorを切る。
+        args.sparsepcgc_codec_prune_prior = False
+
+        # actual oracle / gateでNetwork Pruneを止めない。
+        args.sparsepcgc_actual_gate_prune = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+
+        # no-opへ置換する経路を止める。
+        args.sparsepcgc_policy_actual_noop_guard = False
+
+        # full cloud primary / correction による L_com 上書きを止める。
+        args.sparsepcgc_full_cloud_actual_primary = False
+        args.sparsepcgc_require_full_cloud_actual_teacher = False
+        args.train_full_cloud_actual_interval = 0
+        args.full_cloud_actual_correction = False
+        args.full_cloud_actual_correction_loss_enable = False
+    else:
+        args.direct_network_prune = False
+        if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
+            args.sparsepcgc_prune_after_prior_mode = "network"
+
+    if (
+        bool(getattr(args, "heuristic_guidance_enabled", True))
+        and str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        in {"ana_den6_online", "ana_den6_residual"}
+    ):
+        # 最後の汎用SparsePCGC後処理が旧3～5%探索値を再導入しないよう固定する。
+        profile_amounts = {
+            ("8i", 8): (0.0010, 0.0010, 0.0005),
+            ("8i", 7): (0.000175, 0.000150, 0.000175),
+            ("mvub", 8): (0.00125, 0.00100, 0.00025),
+            ("mvub", 7): (0.00035, 0.00030, 0.00035),
+            ("uvg", 8): (0.00125, 0.00350, 0.00025),
+            ("uvg", 7): (0.00100, 0.00125, 0.00025),
+        }
+        key = (
+            str(getattr(args, "dataname", "8i")).strip().lower(),
+            int(getattr(args, "sparsepcgc_scale_m", 8)),
+        )
+        add_anchor, prune_anchor, move_anchor = profile_amounts.get(
+            key, (0.0010, 0.0010, 0.0005)
+        )
+        # profile値は初期anchorであり、学習後の永久上限ではない。
+        # Add+Prune+2*Adjust（変更Voxel cell数）がonline上限未満となる比率で
+        # 各Amount headの探索幅を配分する。1Stepの候補は引き続き1つだけである。
+        changed_anchor = max(add_anchor + prune_anchor + 2.0 * move_anchor, 1e-12)
+        changed_budget = min(
+            float(getattr(args, "heuristic_guidance_online_max_changed_ratio", 0.0099)),
+            0.0099,
+        )
+        bound_scale = max(changed_budget / changed_anchor, 1.0)
+        if not _cli_option_was_provided("--max_add_ratio"):
+            args.max_add_ratio = min(max(add_anchor * bound_scale, add_anchor + 0.0001), 0.01)
+        if not _cli_option_was_provided("--max_drop_ratio"):
+            args.max_drop_ratio = min(max(prune_anchor * bound_scale, prune_anchor + 0.0001), 0.01)
+        if not _cli_option_was_provided("--max_move_ratio"):
+            args.max_move_ratio = min(max(move_anchor * bound_scale, move_anchor + 0.0001), 0.01)
+        if not _cli_option_was_provided("--repair_drop_ratio_floor"):
+            args.repair_drop_ratio_floor = 0.0
+        if not _cli_option_was_provided("--repair_add_ratio_floor"):
+            args.repair_add_ratio_floor = 0.0
+        if not _cli_option_was_provided("--repair_move_ratio_floor"):
+            args.repair_move_ratio_floor = 0.0
+        # Heuristic priorを中心にNetwork residualだけを学習し、別候補の反復評価はしない。
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_start"):
+            args.repair_operation_gate_random_mix_start = 0.0
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
+            args.repair_operation_gate_random_mix_end = 0.0
+        if args.heuristic_guidance_mode == "ana_den6_online":
+            if not _cli_option_was_provided("--lr_scheduler_enabled"):
+                args.lr_scheduler_enabled = True
+            if not _cli_option_was_provided("--lr_scheduler_mode"):
+                args.lr_scheduler_mode = "plateau"
+            # Validation bestは別checkpointとして保持し、訓練中のparameter/
+            # optimizer stateは巻き戻さない。旧guard rollbackはE30などで
+            # 学習軌跡そのものを飛ばし、plateau schedulerとbest model selection
+            # の役割とも重複していた。明示CLI指定は診断実験用に尊重する。
+            if not _cli_option_was_provided("--actual_guard_restore_best"):
+                args.actual_guard_restore_best = False
+            if not _cli_option_was_provided("--actual_guard_max_restores"):
+                args.actual_guard_max_restores = 0
+            # Exact den6順位＋Network residualを既定とする。GT-onlyへ黙って
+            # 劣化させず、未知frameは初回だけExact cacheを構築する。
+            args.sparsepcgc_codec_prune_prior = False
+            args.sparsepcgc_enable_add_experiment = True
+            args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+            args.sparsepcgc_actual_oracle_apply_full_override = False
+            args.sparsepcgc_actual_gate_prune = False
+            args.sparsepcgc_actual_gate_non_prune = False
+            args.heuristic_guidance_require_exact_single_plan_teacher = True
+            args.heuristic_guidance_auto_build_exact_single_plan_teacher = True
+            args.heuristic_guidance_teacher_bootstrap_steps = 0
+            # 未知frameではden6 Pool生成workerもSparsePCGCモデルを使う。
+            # Actual workerを先に常駐させると初回cache生成中だけGPU上に2モデルが
+            # 同居するため、online modeの既定はActual workerを最初のencode時に
+            # 遅延起動する。明示CLI指定は尊重し、計算内容とActual回数は変えない。
+            if not _cli_option_was_provided("--sparsepcgc_warmup_worker_before_train"):
+                args.sparsepcgc_warmup_worker_before_train = False
+            # 旧設定の3000/150/25倍は1更新でAmount headを飽和させ、Step 2で
+            # 3操作すべてが上限へ飛ぶ。one-plan policyでは実Actualを毎Step得るため、
+            # 人工的な下流勾配増幅は不要である。
+            if not _cli_option_was_provided("--repair_amount_downstream_grad_max_scale"):
+                args.repair_amount_downstream_grad_max_scale = 1.0
+            if not _cli_option_was_provided("--repair_amount_downstream_grad_scale"):
+                args.repair_amount_downstream_grad_scale = 1.0
+            if not _cli_option_was_provided("--repair_drop_amount_downstream_grad_scale"):
+                args.repair_drop_amount_downstream_grad_scale = 1.0
+            if not _cli_option_was_provided("--repair_add_amount_downstream_grad_scale"):
+                args.repair_add_amount_downstream_grad_scale = 1.0
+            if not _cli_option_was_provided("--repair_move_amount_downstream_grad_scale"):
+                args.repair_move_amount_downstream_grad_scale = 1.0
+            # WhereのGT固定特徴とtarget方向priorは学習途中で消さない。どちらも
+            # cache行動ではなく、現在の入力点群から毎forward計算する特徴である。
+            if not _cli_option_was_provided("--heuristic_guidance_where_weight"):
+                args.heuristic_guidance_where_weight = 12.0
+            if not _cli_option_was_provided("--leaf_pattern_add_target_direction_weight"):
+                args.leaf_pattern_add_target_direction_weight = 4.0
+            if not _cli_option_was_provided("--leaf_pattern_move_target_direction_weight"):
+                args.leaf_pattern_move_target_direction_weight = 4.0
+            # 汎用SparsePCGC後処理が有効化する診断を、online one-plan経路では
+            # 再び止める。専用audit textだけはtrain.pyが常時出力する。
+            args.save_good_bad_cases = False
+            args.save_proxy_actual_bad_cases = False
+            args.phase7_eval_summary = False
+            args.phase7_metric_columns = False
+            args.loss_grad_probe_enabled = False
+            if not _cli_option_was_provided("--step_grad_log"):
+                args.step_grad_log = False
+            elif bool(args.step_grad_log):
+                args.save_step_metric_csv = True
+            if not _cli_option_was_provided("--compression_grad_probe"):
+                args.compression_grad_probe = False
+            if not _cli_option_was_provided("--debug_grad_flow"):
+                args.debug_grad_flow = False
+            args.for_better_log = False
+            args.enable_voxel_collision_log = False
+            args.sparsepcgc_hard_debug_interval = 0
+            args.sparsepcgc_hard_debug_on_log = False
+            # 後段の汎用surrogate既定値による再有効化を防ぐ最終保証。
+            # GT cacheは維持し、加工後点群に依存する結果・教師・replayだけを残さない。
+            args.sparsepcgc_actual_result_cache = False
+            args.compression_surrogate_target_cache_entries = 0
+            args.compression_surrogate_replay_entries = 0
+            args.compression_surrogate_replay_steps = 0
+            args.compression_surrogate_reuse_last_target = False
+            args.compression_surrogate_refresh_interval = 1
+            args.heuristic_guidance_online_prefetch_workers = 0
+        if not _cli_option_was_provided("--repair_move_score_noise_start"):
+            args.repair_move_score_noise_start = 0.0
+        if not _cli_option_was_provided("--repair_move_score_noise_end"):
+            args.repair_move_score_noise_end = 0.0
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
+        # Final isolation guard: generic SparsePCGC defaults are normalized
+        # above and historically re-enabled priors/bandit Amount after the
+        # mode-specific block.  Reassert the Network-only contract last.
+        args.heuristic_guidance_enabled = False
+        args.sparsepcgc_codec_prune_prior = False
+        args.sparsepcgc_hybrid_prune_prior = False
+        args.sparsepcgc_hybrid_hard_action = False
+        args.sparsepcgc_hybrid_prior_amount_blend = False
+        args.sparsepcgc_warmup_force_codec_prior_amount = False
+        args.sparsepcgc_post_warmup_amount_strategy = "network"
+        args.sparsepcgc_hybrid_amount_mode = "network"
+        args.sparsepcgc_network_prune_ratio_floor = 0.0
+        args.sparsepcgc_network_prune_min_hard_count = 0
+        args.sparsepcgc_codec_prior_warmup_min_hard_count = 0
+        args.sparsepcgc_algorithmic_proposal_selector = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+        args.sparsepcgc_actual_gate_prune = False
+        args.sparsepcgc_actual_gate_non_prune = False
+        args.sparsepcgc_amount_success_teacher_weight = 0.0
+        args.sparsepcgc_post_warmup_amount_teacher_weight = 0.0
+        args.sparsepcgc_algorithmic_amount_selector_teacher_weight = 0.0
+        args.sparsepcgc_multi_subtree_train = False
+        args.sparsepcgc_outcome_imitation = False
+        args.sparsepcgc_subtree_actual_filter = False
+        args.sparsepcgc_anchor_success_teacher = False
+        args.leaf_pattern_actuator_prior = False
+        args.leaf_pattern_operation_mask = False
+        args.leaf_pattern_target_direction_prior = False
+        args.leaf_pattern_target_direction_mask = False
+        # A generic legacy default caps Adjust to one voxel whenever
+        # heuristic guidance is disabled. Network-only Amount owns this count.
+        args.repair_max_hard_move_voxels = 0
+        args.repair_move_min_hard_expected_voxels = 0.0
+        # Actual scalar policy credit must not be drowned by the initially
+        # inaccurate Surrogate gradient.  Entropy is a distributional safety
+        # term, not a fixed Amount/share target.
+        if not _cli_option_was_provided("--heuristic_guidance_online_policy_weight"):
+            # Actual percent is scaled before REINFORCE; averaging the four
+            # action-family log-probs and this coefficient keep its weighted
+            # magnitude comparable to Actual/Surrogate and entropy losses.
+            args.heuristic_guidance_online_policy_weight = 0.20
+        if not _cli_option_was_provided("--network_only_plan_gain_loss_weight"):
+            args.network_only_plan_gain_loss_weight = 1.0
+        if not _cli_option_was_provided("--heuristic_guidance_online_entropy_weight"):
+            # Actual preferenceが形成された後もentropyを1へ戻し続けた
+            # 0.005を廃止。実効値はActual evidence/qualityでさらに縮小する。
+            args.heuristic_guidance_online_entropy_weight = 0.001
+        args.repair_drop_ratio_floor = 0.0
+        args.repair_add_ratio_floor = 0.0
+        args.repair_move_ratio_floor = 0.0
+        # Exploration comes from the Actor distributions themselves.  These
+        # legacy forward floors would make the raw policy and executed plan
+        # disagree and only hide Amount/share collapse.
+        args.save_good_bad_cases = False
+        args.save_proxy_actual_bad_cases = False
+        args.phase7_eval_summary = False
+        args.loss_grad_probe_enabled = False
+        if not _cli_option_was_provided("--step_grad_log"):
+            args.step_grad_log = False
+        elif bool(args.step_grad_log):
+            args.save_step_metric_csv = True
+        if not _cli_option_was_provided("--compression_grad_probe"):
+            args.compression_grad_probe = False
+        if not _cli_option_was_provided("--debug_grad_flow"):
+            args.debug_grad_flow = False
+        args.heuristic_guidance_online_prefetch_workers = 0
+        args.compression_surrogate_replay_entries = 0
+        args.compression_surrogate_replay_steps = 0
+        args.compression_surrogate_reuse_last_target = False
+        args.compression_surrogate_refresh_interval = 1
+    if compress_key in {"gpcc", "octattention"}:
+        from .geometry_codec import configure_geometry_codec
+        args = configure_geometry_codec(args, _cli_option_was_provided)
+    return args

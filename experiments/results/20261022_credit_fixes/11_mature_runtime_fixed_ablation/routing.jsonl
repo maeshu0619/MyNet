@@ -1,0 +1,2 @@
+{"kind": "completed", "step": 0}
+{"kind": "integrity", "step": 0, "changed": ["models/modules/structure_actuator.py", "models/network.py", "models/utils/training/sparsepcgc_actual_credit.py"]}

@@ -1,0 +1,246 @@
+diff --git a/models/modules/structure_actuator.py b/models/modules/structure_actuator.py
+index b471552..3d625e9 100644
+--- a/models/modules/structure_actuator.py
++++ b/models/modules/structure_actuator.py
+@@ -8077,6 +8077,13 @@ class StructureRepairActuator(nn.Module):
+         return ratio.detach() + scale * (ratio - ratio.detach())
+ 
+     def _scale_where_downstream_grad(self, value, op_name=""):
++        # These legacy STE multipliers must not attenuate the dedicated
++        # Actual score-function path (0.005 * 1/6 for Prune in old defaults).
++        # Forward is identical; codec-specific Actual credit retains its own
++        # measured advantage and downstream safety clipping.
++        from ..utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
++        if sparsepcgc_credit_training(self.args):
++            return value
+         # Where score / logit のforward値は変えず、backwardだけ強める。
+         # これにより圧縮損失 L_com から drop_head / add_head / move_voxel_head へ戻る勾配を操作別に調整する。
+         op_name = str(op_name).strip().lower()
+diff --git a/models/network.py b/models/network.py
+index 51c7e4b..a8eeac7 100644
+--- a/models/network.py
++++ b/models/network.py
+@@ -272,6 +272,7 @@ class Network(nn.Module):
+             "_den6_actual_actor_replay",
+             "_den6_noop_edit_actual_memory",
+             "_den6_plan_critic_replay",
++            "_sparsepcgc_geometry_pair_memory",
+         )
+         actuator_names = (
+             "_den6_factorized_group_counts",
+@@ -835,6 +836,15 @@ class Network(nn.Module):
+                 self.args, "repair_exploration_fraction", 1.0
+             )), 0.0), 1.0)
+             warmup_steps = max(int(round(total_steps * exploration_fraction)), 1)
++            # Auto warmup across the complete exploration curriculum made the
++            # first feature residual ~1e-12 and FP32 adapter updates exactly 0.
++            # Keep the same bounded smoothstep, but introduce this trainable
++            # representation within a short native-codec warmup. Explicit
++            # warmup settings and conventional-codec paths are unchanged.
++            codec = str(getattr(self.args, 'compress', '')).lower().replace('-', '').replace('_', '')
++            if codec == 'sparsepcgc' and str(getattr(self.args, 'heuristic_guidance_mode', '')) == 'ana_den6_online':
++                warmup_steps = min(warmup_steps, max(int(getattr(
++                    self.args, 'sparsepcgc_feature_auto_warmup_cap', 100)), 1))
+         global_step = getattr(self.args, "_global_train_step", None)
+         if warmup_steps > 0 and global_step is not None:
+             phase = min(max((float(global_step) + 1.0) / float(warmup_steps), 0.0), 1.0)
+@@ -1620,6 +1630,7 @@ class Network(nn.Module):
+         # is never copied to each candidate as an individual target.
+         actual_group_pair_raw = objective.new_zeros(())
+         actual_group_pair_weighted = objective.new_zeros(())
++        actual_group_critic_weighted = objective.new_zeros(())
+         actual_group_pair_available = False
+         actual_group_pair_delta = 0.0
+         actual_group_actor_correct = 0.0
+@@ -1709,12 +1720,13 @@ class Network(nn.Module):
+                         "heuristic_guidance_online_actual_candidate_critic_replay_weight",
+                         0.20,
+                     )), 0.0)
+-                    policy_loss = policy_loss + (
++                    actual_group_critic_weighted = (
+                         float(critic_pair_weight)
+                         * float(matched_anchor_age_confidence)
+                         * critic_pair_loss
+                         / float(policy_backward_scale)
+                     )
++                    policy_loss = policy_loss + actual_group_critic_weighted
+ 
+                 actuator_for_group = getattr(self, "actuator", None)
+                 if actuator_for_group is not None:
+@@ -2513,9 +2525,14 @@ class Network(nn.Module):
+         geometry_baseline_source = "unavailable"
+         amount_log_prob = state.get("den6_online_amount_log_prob", None)
+         action_log_prob = state.get("den6_online_action_log_prob", None)
++        from .utils.training.sparsepcgc_actual_credit import (
++            sparsepcgc_credit_training, matched_geometry_advantage,
++        )
++        native_geometry_credit = sparsepcgc_credit_training(self.args)
+         if (
+             mode == "ana_den6_online"
+             and not actor_critic_selection
++            and not native_geometry_credit
+             and torch.is_tensor(geometry)
+             and torch.is_tensor(amount_log_prob)
+         ):
+@@ -2633,6 +2650,37 @@ class Network(nn.Module):
+                 while len(sequence_geometry_baseline) > 128:
+                     sequence_geometry_baseline.popitem(last=False)
+ 
++        if (native_geometry_credit and not actor_critic_selection
++                and torch.is_tensor(geometry)
++                and torch.is_tensor(current_group_log_prob)
++                and current_group_log_prob.requires_grad):
++            memory = getattr(self, '_sparsepcgc_geometry_pair_memory', None)
++            if memory is None:
++                memory = OrderedDict()
++                self._sparsepcgc_geometry_pair_memory = memory
++            advantage_value = matched_geometry_advantage(
++                memory, frame_key=cache_key, anchor_hash=matched_anchor_hash,
++                group=factorized_group, reused=matched_reused,
++                rate=float(objective.detach().cpu()),
++                geometry=float(geometry_objective_for_rd.detach().cpu()),
++                tolerance=float(getattr(self.args, 'heuristic_guidance_online_geometry_compression_tolerance', .05)),
++                clip=float(getattr(self.args, 'heuristic_guidance_online_geometry_advantage_clip', .25)))
++            geometry_baseline_source = 'matched_frame_anchor' if advantage_value is not None else 'matched_unavailable'
++            if advantage_value is not None:
++                geometry_guard_passed = True
++                geometry_advantage = objective.new_tensor(advantage_value)
++                geometry_policy_raw = -geometry_advantage * current_group_log_prob.float().mean()
++                # Native Actual RD already contains cp_lambda_geom * G.
++                # A second normalized geometry-only reward gave the same
++                # Amount action a conflicting teacher (measured cosine -0.975).
++                # Retain the constrained auxiliary only if RD has no geometry;
++                # never change the declared compression/geometry objective.
++                if float(actor_geometry_weight) <= 0.0:
++                    geometry_policy_weighted = (
++                        max(float(getattr(self.args, 'heuristic_guidance_online_geometry_policy_weight', .55)), 0.)
++                        * geometry_policy_raw / float(policy_backward_scale))
++                    policy_loss = policy_loss + geometry_policy_weighted
++
+         # Learn edit efficiency as a constrained tie-break, not as a fixed
+         # operation-ratio target.  Only an Amount/Gate/Fine action whose Actual
+         # compression and geometry stay within the previous same-frame,
+@@ -2954,6 +3002,12 @@ class Network(nn.Module):
+             "geometry": geometry_policy_weighted,
+             "efficiency": efficiency_policy_weighted,
+         }
++        if native_geometry_credit:
++            # Include the existing pair-Critic objective in its proper source;
++            # do not add it to policy_loss a second time.
++            self._den6_policy_source_losses['actual_compression_policy'] = (
++                self._den6_policy_source_losses['actual_compression_policy']
++                + actual_group_critic_weighted)
+         return policy_loss.to(dtype=reward.dtype)
+ 
+     def network_only_plan_gain_loss(self, actual_bit_percent):
+diff --git a/models/utils/config/args.py b/models/utils/config/args.py
+index 90e2107..ef207f6 100644
+--- a/models/utils/config/args.py
++++ b/models/utils/config/args.py
+@@ -28,9 +28,9 @@ method_name = "Mine"
+ 
+ model_name = "best_loss_joint"
+ 
+-dataname = "8i"
++# dataname = "8i"
+ # dataname = "MVUB"
+-# dataname = "UVG"
++dataname = "UVG"
+ 
+ dataset_name = "longdress"
+ # dataset_name = "loot"
+@@ -363,6 +363,7 @@ def parse_pugan_args(parser, file_day, file_time):
+     parser.add_argument('--point_transformer_node_feature_scale', default=0.25, type=float, help='正規化済みPoint Transformer特徴の初期スケール')
+     parser.add_argument('--point_transformer_feature_gate_max', default=0.10, type=float, help='構造特徴へ加えるPoint Transformer residual gateの上限。既存のOctree方策特徴を上書きしない範囲に保つ')
+     parser.add_argument('--point_transformer_feature_warmup_steps', default=0, type=int, help='Point Transformer residualのwarmup Step数。0なら探索schedule全体へ自動追従する')
++    parser.add_argument('--sparsepcgc_feature_auto_warmup_cap', default=100, type=int, help='SparsePCGC ana_den6のみauto feature warmupの上限Step数。明示warmupは変更しない')
+     parser.add_argument('--point_transformer_feature_lr_scale', default=0.1, type=float, help='Point Transformer Adapter/Gate専用LRのmain LRに対する倍率')
+     parser.add_argument('--point_transformer_feature_cache', default=True, type=str2bool, help='固定Point Transformerのcoarse特徴とVoxel対応をCPUへキャッシュする')
+     parser.add_argument('--point_transformer_feature_cache_max_entries', default=16, type=int, help='固定Point Transformer特徴RAM cacheの最大frame数。全件保持はせず共有RAMを圧迫しない')
+@@ -3602,6 +3603,7 @@ def parse_pugan_args(parser, file_day, file_time):
+     parser.add_argument('--checkpoint_full_cloud_min_count', default=1, type=int, help='full_cloud actualをcheckpoint主指標に使う最低件数')
+     parser.add_argument('--checkpoint_min_optimizer_step_ratio', default=0.20, type=float, help='この割合未満しかoptimizer更新できないepisodeはbest/guard対象外')
+     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
++    parser.add_argument('--sparsepcgc_matched_frame_repeats', default=2, type=int, choices=[1, 2], help='SparsePCGC ana_den6学習だけで同一frameのanchor/比較を連続処理する。1は従来順、2は1回ずつencodeする2-view。評価・他codecは変更しない')
+     parser.add_argument('--save_good_bad_cases', default=False, type=str2bool, help='actual deltaが大きく改善/悪化したstepのdebug summaryをCSV保存する')
+     parser.add_argument('--save_proxy_actual_bad_cases', default=True, type=str2bool, help='proxy/cause scoreとactual bitの符号が逆のcaseをCSV保存する')
+     parser.add_argument('--proxy_actual_bad_case_threshold', default=0.0, type=float, help='proxy-actual逆方向caseを保存する最小絶対値しきい値')
+diff --git a/models/utils/training/train_runtime.py b/models/utils/training/train_runtime.py
+index 3cb44ad..4935f6a 100644
+--- a/models/utils/training/train_runtime.py
++++ b/models/utils/training/train_runtime.py
+@@ -5445,6 +5445,12 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
+                 getattr(base_model, "policy_module", None),
+             ],
+         }
++        from models.utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
++        separate_amount = sparsepcgc_credit_training(args)
++        if separate_amount:
++            amount_modules = decision_groups.pop('amount')
++            decision_groups['amount_fine'] = amount_modules[:3]
++            decision_groups['amount_coarse'] = amount_modules[3:]
+         for decision, modules in decision_groups.items():
+             params = []
+             seen = set()
+@@ -5480,6 +5486,18 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
+             # post-balance gradients printed by Den6OnlineAudit.
+             debug[f"den6_online_{decision}_grad_norm"] = float(norm_after)
+ 
++        if separate_amount:
++            # Legacy aggregate diagnostics remain true, but no longer let the
++            # high-variance coarse score-function shrink all three Fine heads.
++            for phase in ('before', 'after'):
++                values = [float(debug.get(f'den6_online_{name}_grad_norm_{phase}_balance', 0.0))
++                          for name in ('amount_fine', 'amount_coarse')]
++                debug[f'den6_online_amount_grad_norm_{phase}_balance'] = math.sqrt(sum(v*v for v in values))
++            debug['den6_online_amount_grad_norm'] = debug['den6_online_amount_grad_norm_after_balance']
++            debug['den6_online_amount_grad_balance_status'] = ('clipped' if any(
++                debug.get(f'den6_online_{name}_grad_balance_status') == 'clipped'
++                for name in ('amount_fine', 'amount_coarse')) else 'preserved')
++
+         # Record the exact sub-head norms from the same actuator instance used
+         # above.  The older generic audit occasionally resolved a wrapper
+         # rather than this live actuator and printed zeros even though the
+@@ -5664,6 +5682,11 @@ def _register_prune_where_head_grad_scale_hook(args, model, writer=None):
+       - optimizer.step直前のgrad balanceとは別である。
+       - このhookはautogradからdrop_head parameterへ流れる勾配そのものに効く。
+     """
++    from models.utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
++    if sparsepcgc_credit_training(args):
++        if writer is not None:
++            writer.write('PruneWhereGradHook: skipped for native Actual policy (legacy STE attenuation only)')
++        return
+     scale = max(
+         float(getattr(args, "grad_scale_prune_where_head", 1.0)),
+         0.0,
+diff --git a/train.py b/train.py
+index 89f4d1b..f07e48e 100644
+--- a/train.py
++++ b/train.py
+@@ -1,6 +1,9 @@
+ """MyNetの訓練エントリポイント。"""
+ 
+ from models.utils.training.train_runtime import *
++from models.utils.training.sparsepcgc_actual_credit import (
++    matched_frame_repeats, matched_sparsepcgc_dataset,
++)
+ 
+ def train(model, args, loss, writer, plot, notifier=None):
+     """==========================================================="""
+@@ -231,7 +234,7 @@ def train(model, args, loss, writer, plot, notifier=None):
+             "runtime_den6=0, candidate_actual=0"
+         )
+     _configure_streaming_exact_caches(args, seq_datasets, writer)
+-    total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
++    total_train_files = sum(len(dataset) for _, dataset in seq_datasets) * matched_frame_repeats(args)
+     den6_prefetch_lookahead = max(
+         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
+     )
+@@ -561,6 +564,7 @@ def train(model, args, loss, writer, plot, notifier=None):
+ 
+             """基本情報のセットアップ"""
+             active_dataset = apply_epoch_file_window(dataset, args, episode) # 各系列の訓練フレームを1周ごとに再配置し、非重複windowで読む
++            active_dataset = matched_sparsepcgc_dataset(active_dataset, args)
+             loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 現在Epochの窓Datasetから点群ファイルを順に読み出す
+             num_steps = len(active_dataset)
+             active_files = list(getattr(active_dataset, "files", ()))

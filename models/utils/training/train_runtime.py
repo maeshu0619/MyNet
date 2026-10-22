@@ -5445,6 +5445,12 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
                 getattr(base_model, "policy_module", None),
             ],
         }
+        from models.utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
+        separate_amount = sparsepcgc_credit_training(args)
+        if separate_amount:
+            amount_modules = decision_groups.pop('amount')
+            decision_groups['amount_fine'] = amount_modules[:3]
+            decision_groups['amount_coarse'] = amount_modules[3:]
         for decision, modules in decision_groups.items():
             params = []
             seen = set()
@@ -5479,6 +5485,18 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
             # Keep the legacy summary fields consistent with the actual
             # post-balance gradients printed by Den6OnlineAudit.
             debug[f"den6_online_{decision}_grad_norm"] = float(norm_after)
+
+        if separate_amount:
+            # Legacy aggregate diagnostics remain true, but no longer let the
+            # high-variance coarse score-function shrink all three Fine heads.
+            for phase in ('before', 'after'):
+                values = [float(debug.get(f'den6_online_{name}_grad_norm_{phase}_balance', 0.0))
+                          for name in ('amount_fine', 'amount_coarse')]
+                debug[f'den6_online_amount_grad_norm_{phase}_balance'] = math.sqrt(sum(v*v for v in values))
+            debug['den6_online_amount_grad_norm'] = debug['den6_online_amount_grad_norm_after_balance']
+            debug['den6_online_amount_grad_balance_status'] = ('clipped' if any(
+                debug.get(f'den6_online_{name}_grad_balance_status') == 'clipped'
+                for name in ('amount_fine', 'amount_coarse')) else 'preserved')
 
         # Record the exact sub-head norms from the same actuator instance used
         # above.  The older generic audit occasionally resolved a wrapper
@@ -5664,6 +5682,11 @@ def _register_prune_where_head_grad_scale_hook(args, model, writer=None):
       - optimizer.step直前のgrad balanceとは別である。
       - このhookはautogradからdrop_head parameterへ流れる勾配そのものに効く。
     """
+    from models.utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
+    if sparsepcgc_credit_training(args):
+        if writer is not None:
+            writer.write('PruneWhereGradHook: skipped for native Actual policy (legacy STE attenuation only)')
+        return
     scale = max(
         float(getattr(args, "grad_scale_prune_where_head", 1.0)),
         0.0,

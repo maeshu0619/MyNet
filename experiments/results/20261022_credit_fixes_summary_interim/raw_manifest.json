@@ -1,0 +1,17 @@
+{
+  "00_baseline_validation/routing.jsonl": "6211841ae6816ad507b49d57a98f4cd77aee558c408bf8fb59330ed9d712fb14",
+  "00_baseline24/routing.jsonl": "149f36a321d973ab92e2bc6c56d714ea063a8db5093a6ae4ff38dce51f47dbc5",
+  "00_baseline24_serial/routing.jsonl": "c1c33d7b72213451949057ddcb735fb8874a7c825871c6dc2208b2aef921bd06",
+  "12_mature24_fixed/routing.jsonl": "a3ec34178162f18ab808ce51be10b6124c647b444bf5aebdea5bb7f981c17b6b",
+  "09_mature_control/routing.jsonl": "4636f02b1802eb442e9102a871ef0b6551751ecf6a7aa671a305820d8443d0c4",
+  "07_geometry_dedup/routing.jsonl": "84959955629e5e0f0f1aabfaa8bdafecfab60ce7efd9949298b4b1b1e50cd718",
+  "00_baseline/routing.jsonl": "312ff7e95c09e4eca3a4838723185d92196027d52443175a6836e8c4a9c83b9e",
+  "04_where/routing.jsonl": "2d91523bedaf539469b5eed110195287ca8ca6907a4252e696705f19cd1e0d6b",
+  "06_adapter/routing.jsonl": "26e0d2101bfa5046f0ded381daa31c98781873598f254dcdd08a746951360ebb",
+  "05_amount/routing.jsonl": "4698526e92cbf66182274f4cc1d36ba45c6173f785d6847cc2990e5bdf66e11d",
+  "10_mature_fixed/routing.jsonl": "0bcb581798f7ceea428459e2d8889fb10b062a5ada4f4376f7797dbc340f7901",
+  "01_matched/routing.jsonl": "96b8f96b5938629468e8aaa080fe6eeb224b31b9941b07d8b685f60c0937ab2c",
+  "08_final24/routing.jsonl": "c5c89e9c5762a7d2b6bdc1e7118792e0babbbd839981c3bf8c362ca27aabeb06",
+  "07_geometry/routing.jsonl": "2b1189c932b0f31bb349ce2f754cef705fffe286bb186f377174126f6f055070",
+  "11_mature24_control/routing.jsonl": "dd2a6663e05e2c5f7f0d112a22ba9584a705f74ccfe90f45016594415939c1c7"
+}

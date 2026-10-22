@@ -1,0 +1,89 @@
+diff --git a/models/modules/structure_actuator.py b/models/modules/structure_actuator.py
+index b471552..3d625e9 100644
+--- a/models/modules/structure_actuator.py
++++ b/models/modules/structure_actuator.py
+@@ -8077,6 +8077,13 @@ class StructureRepairActuator(nn.Module):
+         return ratio.detach() + scale * (ratio - ratio.detach())
+ 
+     def _scale_where_downstream_grad(self, value, op_name=""):
++        # These legacy STE multipliers must not attenuate the dedicated
++        # Actual score-function path (0.005 * 1/6 for Prune in old defaults).
++        # Forward is identical; codec-specific Actual credit retains its own
++        # measured advantage and downstream safety clipping.
++        from ..utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
++        if sparsepcgc_credit_training(self.args):
++            return value
+         # Where score / logit のforward値は変えず、backwardだけ強める。
+         # これにより圧縮損失 L_com から drop_head / add_head / move_voxel_head へ戻る勾配を操作別に調整する。
+         op_name = str(op_name).strip().lower()
+diff --git a/models/utils/config/args.py b/models/utils/config/args.py
+index 90e2107..16a3d72 100644
+--- a/models/utils/config/args.py
++++ b/models/utils/config/args.py
+@@ -28,9 +28,9 @@ method_name = "Mine"
+ 
+ model_name = "best_loss_joint"
+ 
+-dataname = "8i"
++# dataname = "8i"
+ # dataname = "MVUB"
+-# dataname = "UVG"
++dataname = "UVG"
+ 
+ dataset_name = "longdress"
+ # dataset_name = "loot"
+@@ -3602,6 +3602,7 @@ def parse_pugan_args(parser, file_day, file_time):
+     parser.add_argument('--checkpoint_full_cloud_min_count', default=1, type=int, help='full_cloud actualをcheckpoint主指標に使う最低件数')
+     parser.add_argument('--checkpoint_min_optimizer_step_ratio', default=0.20, type=float, help='この割合未満しかoptimizer更新できないepisodeはbest/guard対象外')
+     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
++    parser.add_argument('--sparsepcgc_matched_frame_repeats', default=2, type=int, choices=[1, 2], help='SparsePCGC ana_den6学習だけで同一frameのanchor/比較を連続処理する。1は従来順、2は1回ずつencodeする2-view。評価・他codecは変更しない')
+     parser.add_argument('--save_good_bad_cases', default=False, type=str2bool, help='actual deltaが大きく改善/悪化したstepのdebug summaryをCSV保存する')
+     parser.add_argument('--save_proxy_actual_bad_cases', default=True, type=str2bool, help='proxy/cause scoreとactual bitの符号が逆のcaseをCSV保存する')
+     parser.add_argument('--proxy_actual_bad_case_threshold', default=0.0, type=float, help='proxy-actual逆方向caseを保存する最小絶対値しきい値')
+diff --git a/models/utils/training/train_runtime.py b/models/utils/training/train_runtime.py
+index 3cb44ad..b01ed74 100644
+--- a/models/utils/training/train_runtime.py
++++ b/models/utils/training/train_runtime.py
+@@ -5664,6 +5664,11 @@ def _register_prune_where_head_grad_scale_hook(args, model, writer=None):
+       - optimizer.step直前のgrad balanceとは別である。
+       - このhookはautogradからdrop_head parameterへ流れる勾配そのものに効く。
+     """
++    from models.utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
++    if sparsepcgc_credit_training(args):
++        if writer is not None:
++            writer.write('PruneWhereGradHook: skipped for native Actual policy (legacy STE attenuation only)')
++        return
+     scale = max(
+         float(getattr(args, "grad_scale_prune_where_head", 1.0)),
+         0.0,
+diff --git a/train.py b/train.py
+index 89f4d1b..f07e48e 100644
+--- a/train.py
++++ b/train.py
+@@ -1,6 +1,9 @@
+ """MyNetの訓練エントリポイント。"""
+ 
+ from models.utils.training.train_runtime import *
++from models.utils.training.sparsepcgc_actual_credit import (
++    matched_frame_repeats, matched_sparsepcgc_dataset,
++)
+ 
+ def train(model, args, loss, writer, plot, notifier=None):
+     """==========================================================="""
+@@ -231,7 +234,7 @@ def train(model, args, loss, writer, plot, notifier=None):
+             "runtime_den6=0, candidate_actual=0"
+         )
+     _configure_streaming_exact_caches(args, seq_datasets, writer)
+-    total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
++    total_train_files = sum(len(dataset) for _, dataset in seq_datasets) * matched_frame_repeats(args)
+     den6_prefetch_lookahead = max(
+         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
+     )
+@@ -561,6 +564,7 @@ def train(model, args, loss, writer, plot, notifier=None):
+ 
+             """基本情報のセットアップ"""
+             active_dataset = apply_epoch_file_window(dataset, args, episode) # 各系列の訓練フレームを1周ごとに再配置し、非重複windowで読む
++            active_dataset = matched_sparsepcgc_dataset(active_dataset, args)
+             loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 現在Epochの窓Datasetから点群ファイルを順に読み出す
+             num_steps = len(active_dataset)
+             active_files = list(getattr(active_dataset, "files", ()))

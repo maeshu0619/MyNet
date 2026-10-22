@@ -1,0 +1,40 @@
+{
+  "value": 0.0,
+  "geometry_value": 0.0,
+  "fixed_objective": 0.0,
+  "count": 2,
+  "sample_names": [
+    "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+    "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+  ],
+  "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+  "diagnostic_policy": "network",
+  "operation_distribution": [
+    {
+      "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+      "counts": {
+        "Add": 0,
+        "Prune": 0,
+        "Adjust": 0
+      },
+      "ratios": {
+        "Add": 0.0,
+        "Prune": 0.0,
+        "Adjust": 0.0
+      }
+    },
+    {
+      "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+      "counts": {
+        "Add": 0,
+        "Prune": 0,
+        "Adjust": 0
+      },
+      "ratios": {
+        "Add": 0.0,
+        "Prune": 0.0,
+        "Adjust": 0.0
+      }
+    }
+  ]
+}

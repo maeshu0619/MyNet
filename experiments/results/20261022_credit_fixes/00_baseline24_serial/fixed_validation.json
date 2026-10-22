@@ -1,0 +1,40 @@
+{
+  "value": -2.238504333937767,
+  "geometry_value": 0.02568104024976492,
+  "fixed_objective": 1.6136517035269708,
+  "count": 2,
+  "sample_names": [
+    "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+    "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+  ],
+  "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+  "diagnostic_policy": "network",
+  "operation_distribution": [
+    {
+      "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+      "counts": {
+        "Add": 218,
+        "Prune": 589,
+        "Adjust": 43
+      },
+      "ratios": {
+        "Add": 0.0006318840579710145,
+        "Prune": 0.0017072463768115942,
+        "Adjust": 0.0001246376811594203
+      }
+    },
+    {
+      "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+      "counts": {
+        "Add": 217,
+        "Prune": 594,
+        "Adjust": 43
+      },
+      "ratios": {
+        "Add": 0.0006296918572427622,
+        "Prune": 0.001723672641484796,
+        "Adjust": 0.00012477764913105426
+      }
+    }
+  ]
+}

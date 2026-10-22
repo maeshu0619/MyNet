@@ -1,0 +1,26 @@
+{
+  "run": "/home/maejima/MasterEx/myNet/experiments/results/20261020_sparsepcgc_gradients_audit_v3",
+  "steps": [
+    1,
+    2,
+    3
+  ],
+  "source_files_changed": [],
+  "completed_main_updates": {
+    "1": 2,
+    "2": 2,
+    "3": 2
+  },
+  "probe_errors": 0,
+  "actual_compression_percent_at_log_precision": [
+    -1.55603,
+    -2.317057,
+    -1.747202
+  ],
+  "independent_log_comparison": {
+    "reference": "/data/maejima/log/20261020/MyNetwork_train/SparsePCGC/043722.txt",
+    "printed_precision_only": true,
+    "equal": true,
+    "compared_lines": 9
+  }
+}

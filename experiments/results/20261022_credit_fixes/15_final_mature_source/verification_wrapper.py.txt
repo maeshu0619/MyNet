@@ -1,0 +1,222 @@
+"""Isolated staged train.py verification; preserves existing checkpoints/logs.
+
+Reuses the vector/RMS/Adam audit and the existing fixed validation function.
+Only this diagnostic process is patched to save experimental states and run
+validation at the end; training source fixes are exercised without replacement.
+"""
+import argparse
+import importlib.abc
+import importlib.util
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+
+def main():
+    parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument('--out', required=True, type=Path)
+    parser.add_argument('--steps', type=int, default=6)
+    parser.add_argument('--seed-cache', type=Path)
+    parser.add_argument('--snapshot', action='store_true')
+    parser.add_argument('--validation', type=int, default=1)
+    parser.add_argument('--validation-only', type=Path)
+    parser.add_argument('--more-training', type=Path)
+    parser.add_argument('--baseline-source', type=Path)
+    parser.add_argument('--disable-feature-gate', action='store_true',
+                        help='Diagnostic forward ablation only; never a training setting')
+    parser.add_argument('--online-cache-source', type=Path,
+                        default=Path('/data/maejima/log/mynet_den6_online_cache'))
+    options = parser.parse_args()
+    out = options.out.resolve()
+    if out.exists():
+        raise FileExistsError(out)
+    # Audit main owns creation. Snapshot sidecar is a separate new directory.
+    snapshot = out.with_name(out.name + '_source')
+    snapshot.mkdir(parents=True, exist_ok=False)
+    for command, name in [(['git', 'status', '--short'], 'status.txt'),
+                          (['git', 'diff', '--binary'], 'worktree.diff'),
+                          (['git', 'diff', '--cached', '--binary'], 'index.diff')]:
+        result = subprocess.run(command, cwd=str(ROOT), capture_output=True, check=True)
+        (snapshot/name).write_bytes(result.stdout)
+    files = [ROOT/'train.py', ROOT/'models/network.py',
+             ROOT/'models/modules/structure_actuator.py',
+             ROOT/'models/utils/training/train_runtime.py',
+             ROOT/'models/utils/config/args.py',
+             ROOT/'models/utils/training/sparsepcgc_actual_credit.py']
+    for file in files:
+        dest = snapshot/file.relative_to(ROOT)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(file), str(dest))
+    (snapshot/'manifest.json').write_text(json.dumps({str(p.relative_to(ROOT)):
+        hashlib.sha256(p.read_bytes()).hexdigest() for p in files}, indent=2))
+    shutil.copy2(str(Path(__file__)), str(snapshot/'verification_wrapper.py.txt'))
+    if options.snapshot:
+        return
+
+    if options.baseline_source:
+        source_root = options.baseline_source.resolve()
+        class FrozenSourceLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+            def find_spec(self, fullname, path=None, target=None):
+                relative=Path(*fullname.split('.')).with_suffix('.py')
+                if (source_root/relative).is_file():
+                    return importlib.util.spec_from_loader(fullname,self,origin=str(ROOT/relative))
+            def create_module(self, spec):
+                return None
+            def exec_module(self, module):
+                relative=Path(*module.__name__.split('.')).with_suffix('.py')
+                module.__file__=str(ROOT/relative)
+                exec(compile((source_root/relative).read_text(),str(ROOT/relative),'exec'),module.__dict__)
+        sys.meta_path.insert(0,FrozenSourceLoader())
+        (snapshot/'frozen_source_override.txt').write_text(str(source_root))
+
+    os.environ.setdefault('PYTHONDONTWRITEBYTECODE', '1')
+    import torch
+    import train as training
+    from models.utils.training import train_runtime as runtime
+    import experiments.audit_sparsepcgc_gradient_routing as audit
+
+    original_parse = training.parse_pugan_args
+    def parse(*a, **kw):
+        parsed = original_parse(*a, **kw)
+        if options.more_training:
+            # Model only warm-start is explicit; no claim of optimizer resume.
+            parsed.more_training = True
+            parsed.more_training_ckpt = str(options.more_training.resolve())
+            parsed.sparsepcgc_full_cloud_amount_reset_heads_on_more_training = False
+        parsed.train_full_cloud_val_frames = options.validation
+        # Serialize CPU teacher requests in diagnostics: avoid the existing
+        # async lazy-init/ready-message race; encoding settings are identical.
+        parsed.sparsepcgc_cpu_actual_overlap = False
+        return parsed
+    training.parse_pugan_args = parse
+
+    original_train = training.train
+    def train(model, args, loss, writer, plot, notifier=None):
+        # Read-only observations of the actual head outputs, before any
+        # bounding / sigmoid / residual transforms. No gradient hooks here.
+        amount_observations = {}
+        handles = []
+        for name in ('add_amount_head', 'drop_amount_head', 'move_amount_head'):
+            module = getattr(model.actuator, name)
+            def observe(module, inputs, output, name=name):
+                amount_observations[name] = output.detach().float().cpu().reshape(-1).tolist()
+            handles.append(module.register_forward_hook(observe))
+        observed_model_forward = model.forward
+        def observe_plan(*a, **kw):
+            result = observed_model_forward(*a, **kw)
+            state = getattr(model, 'last_actuator_voxel_state', {}) or {}
+            debug = state.get('ana_den6_exact_residual_plan_debug', {}) or {}
+            fields = {k:v for k,v in debug.items() if k.startswith('operation_amount_')
+                      or k in ('amount_bin_probabilities','amount_bin_index','no_op_selected',
+                               'amount_bin_ratio','selected_counts')}
+            with (out/'amount_observations.jsonl').open('a') as stream:
+                stream.write(json.dumps(dict(step=getattr(args,'_global_train_step',None),
+                    training=model.training, raw_logits=dict(amount_observations),
+                    amount=fields, group_scores=getattr(model.actuator,
+                    '_den6_last_factorized_group_scores',{})),default=str)+'\n')
+            return result
+        model.forward = observe_plan
+        heldout = []
+        dirs = runtime.collect_seq_dirs2(args.input_dir, dataset_name=args.dataname)
+        dirs = runtime._limit_training_seq_dirs(dirs, args)
+        for directory in dirs:
+            heldout.append((directory, runtime.PlyDirDataset(args, directory)))
+        records, _ = runtime.fixed_full_cloud_validation_records(args, heldout, options.validation)
+        # Read-only reuse of existing static candidate JSONs. No edited stream,
+        # Actual GT result, optimizer state, or learned output is reused here.
+        copied=[]
+        if options.online_cache_source.is_dir():
+            needed=set(path for _,path in records)
+            for _,dataset in heldout:
+                window=runtime.apply_epoch_file_window(dataset,args,0)
+                needed.update(str(p) for p in window.files)
+            cache=out/'cache/online';cache.mkdir(parents=True,exist_ok=True)
+            for path in needed:
+                pattern='exact_single_plan_'+str(args.dataname)+'_'+Path(path).stem+'_vs1_pq1_ae0_sr1_m8_*_rf4p0.json'
+                for source in options.online_cache_source.glob(pattern):
+                    target=cache/source.name
+                    if not target.exists():
+                        shutil.copy2(str(source),str(target));copied.append(str(source))
+            (out/'static_cache_reuse.json').write_text(json.dumps(copied,indent=2))
+        (out/'fixed_validation_manifest.json').write_text(json.dumps(
+            [(str(directory), str(path)) for directory, path in records], indent=2, default=str))
+        def validate(label):
+            operations=[]
+            def capture_operations(module, inputs, output):
+                state=getattr(model,'last_actuator_voxel_state',{}) or {}
+                plan=state.get('ana_den6_exact_residual_plan_debug',{}) or {}
+                operations.append(dict(input_file=str(getattr(args,'_current_input_file','')),
+                    counts=dict(plan.get('selected_counts') or {}),
+                    ratios=dict(plan.get('selected_amount_ratios') or {})))
+            original_forward=model.forward
+            def observed_forward(*a,**kw):
+                result=original_forward(*a,**kw)
+                capture_operations(model,a,result)
+                return result
+            model.forward=observed_forward
+            try:
+                result = runtime.run_episode_full_cloud_validation(
+                    model=model, args=args, loss=loss, seq_datasets=heldout, writer=writer,
+                    episode=0, global_step=options.steps,
+                    use_cuda=torch.cuda.is_available() and not args.cpu,
+                    use_amp=False, amp_dtype=torch.float16)
+            finally:
+                model.forward=original_forward
+            result['operation_distribution']=operations
+            (out/(label+'.json')).write_text(json.dumps(result, indent=2, default=str))
+            print('[VERIFY] '+label+': '+json.dumps(result, default=str), flush=True)
+        # Keep RNG/baselines unchanged by evaluating only after the train run.
+        if options.validation_only:
+            saved = torch.load(str(options.validation_only), map_location='cpu')
+            model.load_state_dict(saved['model_state_dict'], strict=True)
+            sidecar = Path(str(options.validation_only)+'.actor_critic_runtime.pth')
+            if sidecar.is_file():
+                model.load_actor_critic_runtime_state_dict(torch.load(str(sidecar),map_location='cpu'))
+            for key in ['_global_train_step', '_total_train_steps_estimate',
+                        '_exploration_schedule_steps_estimate']:
+                if key in saved.get('args', {}):
+                    setattr(args, key, saved['args'][key])
+            if options.disable_feature_gate:
+                original_gate = model._point_transformer_fusion_gate
+                def gate_off(reference):
+                    gate, warmup = original_gate(reference)
+                    return torch.zeros_like(gate), warmup
+                model._point_transformer_fusion_gate = gate_off
+            validate('fixed_validation')
+            return
+        result = original_train(model,args,loss,writer,plot,notifier=notifier)
+        torch.save({'model_state_dict':model.state_dict(), 'steps':options.steps,
+                    'args':{k:v for k,v in vars(args).items()
+                            if isinstance(v,(str,int,float,bool,type(None)))}}, str(out/'experimental_model.pth'))
+        torch.save(model.actor_critic_runtime_state_dict(),
+                   str(out/'experimental_model.pth.actor_critic_runtime.pth'))
+        if options.validation:
+            validate('fixed_validation')
+        return result
+    training.train = train
+
+    if options.more_training:
+        inputs=[options.more_training.resolve()]
+        sidecar=Path(str(inputs[0])+'.actor_critic_runtime.pth')
+        if sidecar.is_file(): inputs.append(sidecar)
+        (snapshot/'read_only_checkpoint_sha256.json').write_text(json.dumps({str(p):
+            hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs},indent=2))
+
+    argv = [str(ROOT/'experiments/audit_sparsepcgc_gradient_routing.py'),
+            '--out',str(out),'--steps',str(options.steps),'--teacher-device','cpu']
+    if options.seed_cache:
+        argv += ['--seed-cache',str(options.seed_cache.resolve())]
+    sys.argv = argv
+    audit.main()
+
+
+if __name__ == '__main__':
+    main()

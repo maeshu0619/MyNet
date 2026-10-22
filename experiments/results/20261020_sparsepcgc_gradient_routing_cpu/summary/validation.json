@@ -1,0 +1,9 @@
+{
+  "steps": 6,
+  "main_optimizer_updates": 6,
+  "emulator_updates": 6,
+  "source_files_changed": [],
+  "max_adam_clone_error": 0.0,
+  "max_routing_decomposition_relative_error": 2.468914180749108e-07,
+  "teacher_device": "cpu"
+}

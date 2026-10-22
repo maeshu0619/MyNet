@@ -1,0 +1,10 @@
+step,loss,alias
+1,L_com,L_downstream
+1,L_com_objective,L_downstream
+1,weighted_compression_primary,L_downstream
+2,L_com,L_downstream
+2,L_com_objective,L_downstream
+2,weighted_compression_primary,L_downstream
+3,L_com,L_downstream
+3,L_com_objective,L_downstream
+3,weighted_compression_primary,L_downstream

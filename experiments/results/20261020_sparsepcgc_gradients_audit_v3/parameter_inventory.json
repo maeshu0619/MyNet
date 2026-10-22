@@ -1,0 +1,3597 @@
+[
+  {
+    "name": "point_transformer_feature_gate",
+    "shape": [
+      1,
+      8,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "encoder.stem.0.weight",
+    "shape": [
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.stem.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.stem.3.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.stem.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn11.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn12.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn13.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv1.0.weight",
+    "shape": [
+      64,
+      192,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv1.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv1.1.weight",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv1.1.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn21.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn22.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn23.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv2.0.weight",
+    "shape": [
+      64,
+      192,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv2.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv2.1.weight",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv2.1.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn31.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn32.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.q_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.q_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.k_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.k_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.v_conv.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.v_conv.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.geo_mlp.0.weight",
+    "shape": [
+      32,
+      3,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.geo_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.geo_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.geo_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.rel_mlp.0.weight",
+    "shape": [
+      32,
+      64,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.rel_mlp.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.rel_mlp.1.weight",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.rel_mlp.1.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.rel_mlp.3.weight",
+    "shape": [
+      64,
+      32,
+      1,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.rel_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.out_conv.0.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.out_conv.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.out_conv.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.attn33.out_conv.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv3.0.weight",
+    "shape": [
+      64,
+      192,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv3.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv3.1.weight",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.conv3.1.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.global_mlp.0.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.global_mlp.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.global_mlp.3.weight",
+    "shape": [
+      128,
+      64,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.global_mlp.3.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.fuse_mlp.0.weight",
+    "shape": [
+      128,
+      384,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.fuse_mlp.0.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.fuse_mlp.1.weight",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.fuse_mlp.1.bias",
+    "shape": [
+      128
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.fuse_mlp.3.weight",
+    "shape": [
+      64,
+      128,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.fuse_mlp.3.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.fuse_mlp.4.weight",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "encoder.fuse_mlp.4.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "point_transformer_feature_adapter.0.weight",
+    "shape": [
+      32,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "point_transformer_feature_adapter.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "point_transformer_feature_adapter.2.weight",
+    "shape": [
+      8,
+      32,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "point_transformer_feature_adapter.2.bias",
+    "shape": [
+      8
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "cost_attributor.net.0.weight",
+    "shape": [
+      96,
+      104,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cost_attributor.net.0.bias",
+    "shape": [
+      96
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cost_attributor.net.2.weight",
+    "shape": [
+      96,
+      96,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cost_attributor.net.2.bias",
+    "shape": [
+      96
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cost_attributor.net.4.weight",
+    "shape": [
+      8,
+      96,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cost_attributor.net.4.bias",
+    "shape": [
+      8
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cause_aggregator.refine.0.weight",
+    "shape": [
+      32,
+      9,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cause_aggregator.refine.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cause_aggregator.refine.2.weight",
+    "shape": [
+      8,
+      32,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "cause_aggregator.refine.2.bias",
+    "shape": [
+      8
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "policy_module.net.0.weight",
+    "shape": [
+      96,
+      113,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "policy_module.net.0.bias",
+    "shape": [
+      96
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "policy_module.net.2.weight",
+    "shape": [
+      96,
+      96,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "policy_module.net.2.bias",
+    "shape": [
+      96
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "policy_module.net.4.weight",
+    "shape": [
+      7,
+      96,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "policy_module.net.4.bias",
+    "shape": [
+      7
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "actuator.candidate_local_utility_gate_logits",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.move_voxel_head.0.weight",
+    "shape": [
+      64,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.move_voxel_head.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.move_voxel_head.2.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.move_voxel_head.2.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.move_voxel_head.4.weight",
+    "shape": [
+      26,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.move_voxel_head.4.bias",
+    "shape": [
+      26
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.drop_head.0.weight",
+    "shape": [
+      64,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.drop_head.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.drop_head.2.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.drop_head.2.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.drop_head.4.weight",
+    "shape": [
+      1,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.drop_head.4.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_head.0.weight",
+    "shape": [
+      64,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_head.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_head.2.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_head.2.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_head.4.weight",
+    "shape": [
+      1,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_head.4.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_voxel_head.0.weight",
+    "shape": [
+      64,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_voxel_head.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_voxel_head.2.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_voxel_head.2.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_voxel_head.4.weight",
+    "shape": [
+      26,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_voxel_head.4.bias",
+    "shape": [
+      26
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.operation_gate_head.0.weight",
+    "shape": [
+      64,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.operation_gate_head.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.operation_gate_head.2.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.operation_gate_head.2.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.operation_gate_head.4.weight",
+    "shape": [
+      3,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.operation_gate_head.4.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.subtree_move_source_head.0.weight",
+    "shape": [
+      64,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.subtree_move_source_head.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.subtree_move_source_head.2.weight",
+    "shape": [
+      64,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.subtree_move_source_head.2.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.subtree_move_source_head.4.weight",
+    "shape": [
+      1,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.subtree_move_source_head.4.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_actor.0.weight",
+    "shape": [
+      32,
+      7
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_actor.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_actor.2.weight",
+    "shape": [
+      1,
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_actor.2.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_critic.0.weight",
+    "shape": [
+      32,
+      7
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_critic.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_critic.2.weight",
+    "shape": [
+      2,
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_critic.2.bias",
+    "shape": [
+      2
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_proxy_critic.0.weight",
+    "shape": [
+      32,
+      7
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_proxy_critic.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_proxy_critic.2.weight",
+    "shape": [
+      2,
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_proxy_critic.2.bias",
+    "shape": [
+      2
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_proposal.0.weight",
+    "shape": [
+      32,
+      7
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_proposal.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_proposal.2.weight",
+    "shape": [
+      1,
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_candidate_proposal.2.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_plan_critic.0.weight",
+    "shape": [
+      32,
+      18
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_plan_critic.0.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_plan_critic.2.weight",
+    "shape": [
+      32,
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_plan_critic.2.bias",
+    "shape": [
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_plan_critic.4.weight",
+    "shape": [
+      2,
+      32
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.den6_plan_critic.4.bias",
+    "shape": [
+      2
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.drop_amount_head.weight",
+    "shape": [
+      1,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.drop_amount_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.algorithmic_amount_selector_head.0.weight",
+    "shape": [
+      64,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.algorithmic_amount_selector_head.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.algorithmic_amount_selector_head.2.weight",
+    "shape": [
+      6,
+      64,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.algorithmic_amount_selector_head.2.bias",
+    "shape": [
+      6
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.algorithmic_amount_residual_head.weight",
+    "shape": [
+      1,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.algorithmic_amount_residual_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_amount_head.weight",
+    "shape": [
+      1,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.add_amount_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.move_amount_head.weight",
+    "shape": [
+      1,
+      56,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "actuator.move_amount_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.local_trunk.0.weight",
+    "shape": [
+      48,
+      62,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.local_trunk.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.local_trunk.2.weight",
+    "shape": [
+      48,
+      48,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.local_trunk.2.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.local_cost_head.weight",
+    "shape": [
+      21,
+      48,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.local_cost_head.bias",
+    "shape": [
+      21
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.direction_field_head.weight",
+    "shape": [
+      8,
+      48,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.direction_field_head.bias",
+    "shape": [
+      8
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.global_trunk.0.weight",
+    "shape": [
+      48,
+      131
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.global_trunk.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.global_trunk.2.weight",
+    "shape": [
+      48,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.global_trunk.2.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.global_trunk.4.weight",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.global_trunk.4.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.coefficient_head.weight",
+    "shape": [
+      21,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.coefficient_head.bias",
+    "shape": [
+      21
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.coefficient_scale_head.weight",
+    "shape": [
+      21,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.coefficient_scale_head.bias",
+    "shape": [
+      21
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.amount_head.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.amount_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.amount_scale_head.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.amount_scale_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.share_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.share_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.share_scale_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.share_scale_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.gate_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.gate_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.priority_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.priority_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.threshold_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.threshold_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.temperature_head.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.temperature_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.interaction_head.0.weight",
+    "shape": [
+      48,
+      73
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.interaction_head.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.interaction_head.2.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_only_codec_policy.interaction_head.2.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "network_k_proposal_policy.plan_tokens",
+    "shape": [
+      8,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.slot_ratio_bias",
+    "shape": [
+      8,
+      5
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.slot_share_bias",
+    "shape": [
+      8,
+      3
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.slot_order_bias",
+    "shape": [
+      8,
+      6
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.slot_variant_bias",
+    "shape": [
+      8,
+      6
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_local_trunk.0.weight",
+    "shape": [
+      48,
+      62,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_local_trunk.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_local_trunk.2.weight",
+    "shape": [
+      48,
+      48,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_local_trunk.2.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_basis_head.weight",
+    "shape": [
+      21,
+      48,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_basis_head.bias",
+    "shape": [
+      21
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.fixed_codec_basis_head.weight",
+    "shape": [
+      21,
+      17,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_direction_head.weight",
+    "shape": [
+      8,
+      48,
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_direction_head.bias",
+    "shape": [
+      8
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_global_trunk.0.weight",
+    "shape": [
+      48,
+      131
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_global_trunk.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_global_trunk.2.weight",
+    "shape": [
+      48,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_global_trunk.2.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_global_trunk.4.weight",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.shared_global_trunk.4.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.token_mixer.0.weight",
+    "shape": [
+      48,
+      96
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.token_mixer.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.token_mixer.2.weight",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.token_mixer.2.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.coefficient_head.weight",
+    "shape": [
+      21,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.coefficient_head.bias",
+    "shape": [
+      21
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.amount_head.weight",
+    "shape": [
+      5,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.amount_head.bias",
+    "shape": [
+      5
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.share_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.share_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.order_head.weight",
+    "shape": [
+      6,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.order_head.bias",
+    "shape": [
+      6
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.variant_head.weight",
+    "shape": [
+      6,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.variant_head.bias",
+    "shape": [
+      6
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.direction_delta_head.weight",
+    "shape": [
+      6,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.direction_delta_head.bias",
+    "shape": [
+      6
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.confidence_head.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.confidence_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic.0.weight",
+    "shape": [
+      48,
+      77
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic.2.weight",
+    "shape": [
+      24,
+      48
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic.2.bias",
+    "shape": [
+      24
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic_gain_head.weight",
+    "shape": [
+      1,
+      24
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic_gain_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic_geometry_head.weight",
+    "shape": [
+      1,
+      24
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic_geometry_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic_interaction_head.weight",
+    "shape": [
+      1,
+      24
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic_interaction_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic_uncertainty_head.weight",
+    "shape": [
+      1,
+      24
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "network_k_proposal_policy.critic_uncertainty_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": false
+  },
+  {
+    "name": "single_plan_student.policy.local_trunk.0.weight",
+    "shape": [
+      48,
+      73,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.local_trunk.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.local_trunk.2.weight",
+    "shape": [
+      48,
+      48,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.local_trunk.2.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.local_cost_head.weight",
+    "shape": [
+      21,
+      48,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.local_cost_head.bias",
+    "shape": [
+      21
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.direct_where_head.weight",
+    "shape": [
+      3,
+      48,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.direct_where_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.direction_field_head.weight",
+    "shape": [
+      8,
+      48,
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.direction_field_head.bias",
+    "shape": [
+      8
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.global_trunk.0.weight",
+    "shape": [
+      48,
+      153
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.global_trunk.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.global_trunk.2.weight",
+    "shape": [
+      48,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.global_trunk.2.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.global_trunk.4.weight",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.global_trunk.4.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.coefficient_head.weight",
+    "shape": [
+      21,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.coefficient_head.bias",
+    "shape": [
+      21
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.coefficient_scale_head.weight",
+    "shape": [
+      21,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.coefficient_scale_head.bias",
+    "shape": [
+      21
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.amount_head.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.amount_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.amount_scale_head.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.amount_scale_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.share_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.share_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.share_scale_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.share_scale_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.gate_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.gate_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.priority_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.priority_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.threshold_head.weight",
+    "shape": [
+      3,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.threshold_head.bias",
+    "shape": [
+      3
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.temperature_head.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.temperature_head.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.interaction_head.0.weight",
+    "shape": [
+      48,
+      73
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.interaction_head.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.interaction_head.2.weight",
+    "shape": [
+      1,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.policy.interaction_head.2.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.utility_head.0.weight",
+    "shape": [
+      48,
+      29
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.utility_head.0.bias",
+    "shape": [
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.utility_head.2.weight",
+    "shape": [
+      4,
+      48
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "single_plan_student.utility_head.2.bias",
+    "shape": [
+      4
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.trunk.0.weight",
+    "shape": [
+      64,
+      12
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.trunk.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.trunk.2.weight",
+    "shape": [
+      64,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.trunk.2.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.subtree_select_logit.weight",
+    "shape": [
+      1,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.subtree_select_logit.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.subtree_predicted_delta.weight",
+    "shape": [
+      1,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.subtree_predicted_delta.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.amount_bin_logits.weight",
+    "shape": [
+      8,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.amount_bin_logits.bias",
+    "shape": [
+      8
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.amount_residual_raw.weight",
+    "shape": [
+      1,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.amount_residual_raw.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.predicted_delta_per_amount.weight",
+    "shape": [
+      8,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "algorithmic_proposal_selector.predicted_delta_per_amount.bias",
+    "shape": [
+      8
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.trunk.0.weight",
+    "shape": [
+      64,
+      56
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.trunk.0.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.trunk.2.weight",
+    "shape": [
+      64,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.trunk.2.bias",
+    "shape": [
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.amount_bin_logits.weight",
+    "shape": [
+      6,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.amount_bin_logits.bias",
+    "shape": [
+      6
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.amount_residual_raw.weight",
+    "shape": [
+      1,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.amount_residual_raw.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.predicted_delta.weight",
+    "shape": [
+      1,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.predicted_delta.bias",
+    "shape": [
+      1
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.predicted_delta_per_amount.weight",
+    "shape": [
+      6,
+      64
+    ],
+    "requires_grad": true
+  },
+  {
+    "name": "full_cloud_amount_selector.predicted_delta_per_amount.bias",
+    "shape": [
+      6
+    ],
+    "requires_grad": true
+  }
+]

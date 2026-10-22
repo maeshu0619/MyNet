@@ -1,0 +1,7743 @@
+import hashlib
+import json
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import time
+import math
+from collections import OrderedDict
+from contextlib import nullcontext
+
+from .encoder.point_trans import PointTransformer
+from .utils.pointcloud import utils_repkpu
+from .utils.pointcloud.utils_repkpu import get_knn_pts, index_points
+from .utils.pointcloud.octree_subtree import assign_octree_subtree_keys, subtree_membership_mask
+from .utils.pointcloud.sparse_tensor import build_sparse_point_tensor_single
+from .utils.pointcloud.sparsepcgc_voxel import (
+    quantize_sparsepcgc_coords,
+    unique_voxel_coords_batched,
+    restore_points_from_voxel_coords,
+)
+from .utils.pointcloud.ana_den6_reference import attach_ana_den6_reference_anchor
+from .utils.pointcloud.ana_den6_online import (
+    _sha256_file as _ana_den6_sha256_file,
+    attach_ana_den6_online_guidance,
+)
+from .modules.heuristic_guidance import build_heuristic_guidance, release_exact_guidance_cache
+from .modules.cause_aggregation import CauseDiagnosisAggregation
+from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
+from .modules.octree_structure import OctreeStructureAnalysis
+from .modules.geometry_octree_structure import GeometryOctreeStructureAnalysis
+from .utils.pointcloud.geometry_octree import is_geometry_octree, build_geometry_point_features, align_geometry_context, geometry_step, geometry_cache_key
+from .utils.pointcloud.geometry_octree_proposals import attach_geometry_octree_guidance
+from .modules.proposal_selector import AlgorithmicProposalSelector, FullCloudAmountSelector
+from .modules.structure_actuator import StructureRepairActuator
+from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
+from .modules.network_only_codec_policy import NetworkOnlyCodecPolicy
+from .modules.network_k_proposal_policy import NetworkKProposalPolicy
+from .modules.fast_heuristic_emulator import FastHeuristicEmulator
+from .utils.loss.k_proposal_distillation import KProposalSetLoss
+from .utils.loss.single_plan_distillation import SinglePlanDistillationLoss
+from .utils.training.saved_tensor_offload import selective_saved_tensor_cpu_offload
+from .utils.cache.frozen_student_feature_cache import FrozenStudentFeatureCache
+
+
+class Network(nn.Module):
+    """
+    ◆全体フロー
+    ・入力点群
+    ・PointTransformer：局所・大域特徴抽出
+    ・OctreeStructureAnalisis：Octree構造特徴を計算
+    ・CostAttributionModule：圧縮非効率の原因を推定
+    ・CauseDiagnosisAggregation：原因スコアをSubtree/Repai Unit単位に集約
+    ・StructureRepairPolicy：修復方策を選択
+    ・StructureRepairActuator：点操作を実行
+    """
+
+    def __init__(self, args, writer):
+        """基本情報セットアップ"""
+        super().__init__() # 親クラスの初期化
+        self.args = args
+        self.writer = writer
+        self.args.encoder_input_dim = 1 if bool(getattr(self.args, "encoder_sparse_tensor", True)) else 3 # Encoderに入力する特徴次元を決めている。encoder_sparse_tensor=TrueならSparse Tensor用に1次元特徴
+        # Full-cloud Node/Voxel input is a deterministic function of the GT
+        # voxel context.  Keep this separate from trainable features so it is
+        # safe to reuse across episodes without retaining an autograd graph.
+        self.cache_enabled = bool(getattr(self.args, "cache_frozen_inputs", True))
+        self.input_cache = OrderedDict()
+        self._input_cache_bytes = 0
+        self._input_cache_working_set_bypassed = 0
+        self.point_transformer_feature_cache = OrderedDict()
+        self._point_transformer_feature_cache_bytes = 0
+        self._point_transformer_feature_cache_hits = 0
+        self._point_transformer_feature_cache_misses = 0
+        self._point_transformer_feature_cache_working_set_bypassed = 0
+        self._point_transformer_feature_disk_cache = None
+        self._point_transformer_feature_disk_hits = 0
+        self._point_transformer_feature_disk_misses = 0
+        self._point_transformer_feature_disk_writes = 0
+        self._point_transformer_encoder_state_sha256 = None
+        self.expected_input_cache_entries = 0 # 想定されるキャッシュ数を初期化
+        self.debug_tensors = {} # デバッグ用のテンソルを保存
+        self.last_structure_debug = {} # 直近Forward時の構造診断デバッグ情報を保存する辞書の初期化
+        self.last_encoder_debug = {} # 直近Forward時のEncoder関連デバッグ情報を保存する辞書を初期化
+        self.last_actuator_soft_terms = {} # 直近Forward時の微分可能な点操作proxyを保存する辞書
+        self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
+        self._den6_online_objective_baseline = OrderedDict()
+        # Previous executed sets are retained per frame so one Actual encode
+        # can supervise only candidates exchanged by consecutive plans.
+        self._den6_online_actual_plan_memory = OrderedDict()
+        self._den6_online_geometry_baseline = OrderedDict()
+        self.last_discrete_policy_debug = {}
+        self.last_k_proposal_terms = None
+        self.last_single_plan_student_terms = None
+        self.last_k_all_actual_debug = {}
+        # Network自身が実行したActual経験だけを保持する。Heuristic候補Poolとは分離する。
+        self._network_k_actual_replay = OrderedDict()
+        self._network_k_previous_plan_hashes = {}
+        self._network_k_previous_distribution_means = {}
+        # checkpointへ保存し、未学習Studentを推論で誤使用しないための契約値。
+        self.register_buffer(
+            "single_plan_distillation_updates",
+            torch.zeros((), dtype=torch.long),
+        )
+        # Teacher planをActual評価した回数ではなく、Student自身が生成・適用した
+        # planをActual評価して主損失へ使用した回数だけを保存する。
+        self.register_buffer(
+            "single_plan_actual_training_updates",
+            torch.zeros((), dtype=torch.long),
+        )
+        # 初期Stepで決めたShadow蒸留scaleをcheckpointへ保存する。
+        # raw lossが下がった後にscaleを逆増幅せず、収束を全体Lossへ反映する。
+        self.register_buffer(
+            "single_plan_shadow_balance_scale",
+            torch.full((), float("nan"), dtype=torch.float32),
+        )
+
+        """モジュールセットアップ"""
+        self.encoder = PointTransformer(self.args) # 特徴抽出器
+        if is_geometry_octree(self.args):
+            self.structure_analyzer = GeometryOctreeStructureAnalysis(self.args, self.writer)
+        else:
+            self.structure_analyzer = OctreeStructureAnalysis(self.args, self.writer) # Octree構造解析モジュールの作成
+
+        """次元数セットアップ"""
+        fused_dim = int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))) # Encoderが出す統合特徴の次元数
+        structure_dim = int(self.structure_analyzer.feature_dim) # Octree構造解析モジュールが出す構造特徴の次元数
+        hidden_dim = int(getattr(self.args, "structure_hidden_dim", 96)) # 構造診断・方策選択モジュール内部の隠れ層次元
+        self.point_transformer_node_features = bool(
+            getattr(self.args, "point_transformer_node_features", True)
+        )
+        self.point_transformer_node_feature_dim = (
+            max(int(getattr(self.args, "point_transformer_node_feature_dim", 8)), 1)
+            if self.point_transformer_node_features
+            else 0
+        )
+        encoder_output_dim = int(getattr(self.args, "out_dim", fused_dim))
+        adapter_hidden = max(int(getattr(
+            self.args, "point_transformer_node_adapter_hidden", 32
+        )), 8)
+        if self.point_transformer_node_features:
+            # Point Transformerは高価なので最大8192点のcoarse表現だけを計算し、
+            # 小さな学習可能bottleneckを通した後にcanonical Voxelへ写像する。
+            # Adapterだけを学習することで、事前学習形状表現を壊さず操作決定へ渡す。
+            # Adapter追加が後段Actuatorの乱数初期値を変えないよう、CPU RNGを
+            # このblock内だけforkする。これでPoint Transformer有無の比較時も
+            # 既存方策headを同じ初期状態に保てる。
+            with torch.random.fork_rng(devices=[], enabled=True):
+                self.point_transformer_feature_adapter = nn.Sequential(
+                    nn.Conv1d(encoder_output_dim, adapter_hidden, 1),
+                    nn.SiLU(inplace=True),
+                    nn.Conv1d(
+                        adapter_hidden,
+                        self.point_transformer_node_feature_dim,
+                        1,
+                    ),
+                    nn.Tanh(),
+                )
+            # 既存の全Voxel Headを拡幅せず、構造特徴の末尾部分へ小さな
+            # 学習可能residualとして注入する。初期値0.1なら構造priorを
+            # 保ったまま、圧縮/幾何勾配で形状特徴の寄与を増減できる。
+            self.point_transformer_feature_gate = nn.Parameter(torch.full(
+                (1, self.point_transformer_node_feature_dim, 1), 0.1
+            ))
+        else:
+            self.point_transformer_feature_adapter = None
+            self.register_parameter("point_transformer_feature_gate", None)
+
+        """モジュールセットアップ"""
+        self.cost_attributor = CostAttributionModule(in_channels=fused_dim + structure_dim, hidden_dim=hidden_dim) # 圧縮非効率の現認を推定するモジュールの作成
+        self.cause_aggregator = CauseDiagnosisAggregation(self.args) # 点単位・ノード単位の原因スコアを、SubtreeやRepai Unitに集約するモジュール
+        self.policy_module = StructureRepairPolicy( # 構造修復方策を選ぶモジュール
+            in_channels=fused_dim + structure_dim + len(CAUSE_NAMES) + self.cause_aggregator.priority_dim,
+            hidden_dim=hidden_dim,
+            temperature=float(getattr(self.args, "repair_policy_temperature", 1.0)),
+        )
+        self.direct_octree_structure_targets = bool(
+            getattr(self.args, "direct_octree_structure_targets", True)
+        )
+        if self.direct_octree_structure_targets:
+            # cause_targetsは入力Octreeから推論時にも同じ値を計算できる。
+            # checkpoint互換のためmodule自体は残すが、冗長な近似headと集約refineは
+            # forward/optimizerの双方から外す。
+            for module in (
+                self.cost_attributor,
+                self.policy_module,
+                self.cause_aggregator.refine,
+            ):
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
+        actuator_feature_dim = (
+            structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES)
+            + self.cause_aggregator.priority_dim
+        )
+        self.actuator = StructureRepairActuator( # 実際に点群に操作するモジュールの作成
+            in_channels=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "repair_actuator_hidden_dim", 64)),
+            args=self.args,
+        )
+        self.network_only_codec_policy = NetworkOnlyCodecPolicy(
+            in_channels=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "network_only_policy_hidden_dim", 48)),
+            max_total_ratio=float(
+                getattr(self.args, "network_only_max_total_ratio", 0.0099)
+            ),
+        )
+        self.network_k_proposal_policy = NetworkKProposalPolicy(
+            in_channels=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "network_k_proposal_hidden_dim", 48)),
+            proposal_count=int(getattr(self.args, "network_k_proposal_count", 8)),
+            max_total_ratio=float(
+                getattr(self.args, "network_only_max_total_ratio", 0.0099)
+            ),
+            shortlist_size=int(
+                getattr(self.args, "network_k_proposal_shortlist_size", 32768)
+            ),
+        )
+        # checkpoint互換の属性名は維持し、実体だけを独立Emulator classにする。
+        self.single_plan_student = FastHeuristicEmulator(
+            in_channels=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "single_plan_student_hidden_dim", 48)),
+            max_total_ratio=float(
+                getattr(self.args, "single_plan_student_max_total_ratio", 0.0099)
+            ),
+            # 入力Octreeだけから作れるparent pattern/child slot/coarse特徴を
+            # den5 probeなしで利用し、Teacherの局所順位を蒸留する。
+            fixed_feature_dim=17,
+        )
+        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() in {
+            "single_plan_student", "ana_den6_online"
+        }:
+            # Single-Plan/Emulator経路ではK Actor/Criticをoptimizerから外す。
+            # legacy K modeを選んだ場合の実装自体は保持する。
+            for parameter in self.network_k_proposal_policy.parameters():
+                parameter.requires_grad_(False)
+        self.k_proposal_set_loss = KProposalSetLoss()
+        self.single_plan_distillation_loss_module = SinglePlanDistillationLoss()
+        proposal_amount_bins = getattr(self.args, "sparsepcgc_proposal_amount_bin_values", None)
+        if not isinstance(proposal_amount_bins, (list, tuple)) or not proposal_amount_bins:
+            proposal_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+        self.algorithmic_proposal_selector = AlgorithmicProposalSelector(
+            feature_dim=12,
+            hidden_dim=int(getattr(self.args, "sparsepcgc_proposal_selector_hidden_dim", 64)),
+            amount_bin_count=len(proposal_amount_bins),
+        )
+        full_cloud_amount_bins = getattr(self.args, "sparsepcgc_full_cloud_amount_bin_values", None)
+        if not isinstance(full_cloud_amount_bins, (list, tuple)) or not full_cloud_amount_bins:
+            full_cloud_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+        self.full_cloud_amount_selector = FullCloudAmountSelector(
+            feature_dim=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "sparsepcgc_full_cloud_amount_hidden_dim", 64)),
+            amount_bin_count=len(full_cloud_amount_bins),
+            init_bias_mode=str(
+                getattr(self.args, "sparsepcgc_full_cloud_amount_init_bias_mode", "weak_center")
+            ),
+        )
+
+        """旧モジュールセットアップ"""
+        # self.prun_module = self.cost_attributor
+        # self.adding_module = self.policy_module
+        # self.disp_module = self.actuator
+
+    def actor_critic_runtime_state_dict(self):
+        """Return bounded non-parameter state required for an exact resume."""
+        network_names = (
+            "_den6_online_objective_baseline",
+            "_den6_online_sequence_objective_baseline",
+            "_den6_online_actual_plan_memory",
+            "_den6_online_geometry_baseline",
+            "_den6_online_sequence_geometry_baseline",
+            "_den6_online_efficiency_baseline",
+            "_den6_actual_actor_replay",
+            "_den6_noop_edit_actual_memory",
+            "_den6_plan_critic_replay",
+            "_sparsepcgc_geometry_pair_memory",
+        )
+        actuator_names = (
+            "_den6_factorized_group_counts",
+            "_den6_factorized_group_uncertainty",
+            "_den6_last_factorized_exploration_group",
+            "_den6_factorized_exploration_group_streak",
+            "_den6_actual_action_evidence",
+            "_den6_actual_action_comparisons",
+            "_den6_actual_candidate_critic_quality",
+            "_den6_actual_candidate_critic_comparisons",
+            "_den6_matched_actual_pair_accuracy",
+            "_den6_matched_actual_pair_count",
+            "_den6_actual_group_stats",
+            "_den6_noop_actual_evidence",
+            "_den6_matched_anchor_plan_memory",
+            "_den6_pending_matched_groups",
+            "_den6_proposal_coverage_visits",
+            "_den6_completed_matched_pairs",
+            "_den6_fixed_rd_safe_authority",
+            "_den6_fixed_rd_authority_rejected",
+            "_den6_fixed_rd_reject_evidence",
+        )
+        result = {
+            "version": 1,
+            "network": {
+                name: getattr(self, name)
+                for name in network_names if hasattr(self, name)
+            },
+            "actuator": {
+                name: getattr(self.actuator, name)
+                for name in actuator_names if hasattr(self, "actuator")
+                and hasattr(self.actuator, name)
+            },
+        }
+        if is_geometry_octree(self.args) and getattr(self.args, 'geometry_octree_joint_policy', True):
+            result['geometry_joint'] = dict(schema='geometry_joint_v3',
+                codec=str(self.args.compress),
+                bins=str(self.args.heuristic_guidance_online_amount_bins),
+                prior_trust=float(getattr(self.args, '_geometry_octree_prior_trust', 1.)),
+                compression_baseline=getattr(self, '_geometry_policy_compression_baseline', OrderedDict()))
+        return result
+
+    def load_actor_critic_runtime_state_dict(self, state):
+        if not isinstance(state, dict):
+            return False
+        if is_geometry_octree(self.args) and getattr(self.args, 'geometry_octree_joint_policy', True):
+            joint = state.get('geometry_joint', {})
+            if joint.get('schema') != 'geometry_joint_v3':
+                raise ValueError('Old geometry runtime has incompatible RD/action bins; start a fresh joint run with --more_training false')
+            if joint.get('codec') != str(self.args.compress):
+                raise ValueError('geometry joint runtime belongs to a different codec')
+            if joint.get('bins') != str(self.args.heuristic_guidance_online_amount_bins):
+                raise ValueError('geometry joint Amount bins differ from saved runtime')
+            self.args._geometry_octree_prior_trust = float(joint['prior_trust'])
+            self._geometry_policy_compression_baseline = OrderedDict(joint['compression_baseline'])
+        for name, value in dict(state.get("network") or {}).items():
+            setattr(self, str(name), value)
+        if hasattr(self, "actuator"):
+            for name, value in dict(state.get("actuator") or {}).items():
+                setattr(self.actuator, str(name), value)
+        return True
+
+    def train(self, mode: bool = True): # Encoderを訓練対象から外すためにPyTorchのtrain()を上書き
+        super().train(mode)
+        if bool(getattr(self.args, "encoder_0grad", True)):
+            self.encoder.eval()
+        return self
+
+    """キャッシュ関係の互換関数"""
+    def input_cache_stats(self): # 入力キャッシュの状態を返す関数
+        max_entries, max_bytes = self._input_cache_limits()
+        return {
+            "entries": len(self.input_cache),
+            "bytes": int(self._input_cache_bytes),
+            "max_entries": int(max_entries),
+            "max_bytes": int(max_bytes),
+            "working_set_bypassed": int(getattr(self, "_input_cache_working_set_bypassed", 0)),
+            "point_transformer_entries": int(len(getattr(
+                self, "point_transformer_feature_cache", {}
+            ))),
+            "point_transformer_bytes": int(getattr(
+                self, "_point_transformer_feature_cache_bytes", 0
+            )),
+            "point_transformer_hits": int(getattr(
+                self, "_point_transformer_feature_cache_hits", 0
+            )),
+            "point_transformer_misses": int(getattr(
+                self, "_point_transformer_feature_cache_misses", 0
+            )),
+            "point_transformer_working_set_bypassed": int(getattr(
+                self, "_point_transformer_feature_cache_working_set_bypassed", 0
+            )),
+            "point_transformer_disk_hits": int(getattr(
+                self, "_point_transformer_feature_disk_hits", 0
+            )),
+            "point_transformer_disk_misses": int(getattr(
+                self, "_point_transformer_feature_disk_misses", 0
+            )),
+            "point_transformer_disk_writes": int(getattr(
+                self, "_point_transformer_feature_disk_writes", 0
+            )),
+        }
+
+    def set_expected_input_cache_entries(self, total_entries): # 想定されるキャッシュ件数を設定する関数
+        self.expected_input_cache_entries = max(int(total_entries), 0)
+
+    def estimate_input_cache_capacity_entries(self): # 入力キャッシュに何件保存できるか見積もる関数
+        max_entries, max_bytes = self._input_cache_limits()
+        if max_entries <= 0:
+            return 0
+        if not self.input_cache or max_bytes <= 0:
+            return int(max_entries)
+        average_bytes = max(int(self._input_cache_bytes) // len(self.input_cache), 1)
+        return max(0, min(int(max_entries), int(max_bytes) // average_bytes))
+
+    def clear_input_cache(self): # 入力キャッシュを空にする関数
+        self.input_cache.clear()
+        self._input_cache_bytes = 0
+
+    def clear_point_transformer_feature_cache(self):
+        """固定Encoderのcoarse特徴キャッシュだけを破棄する。"""
+        point_cache = getattr(self, "point_transformer_feature_cache", None)
+        if point_cache is not None:
+            point_cache.clear()
+        self._point_transformer_feature_cache_bytes = 0
+
+    def release_step_transient_state(self):
+        """Release tensors that are only needed until the current optimizer step.
+
+        These fields are diagnostic/bridge references, not model parameters or
+        reusable input caches.  Keeping them on the module makes the previous
+        full-cloud output survive while Python evaluates the next forward,
+        unnecessarily increasing the CUDA peak without affecting learning.
+        """
+        self.debug_tensors = {}
+        self.last_structure_debug = {}
+        self.last_encoder_debug = {}
+        self.last_actuator_voxel_state = None
+        self.last_actuator_soft_terms = {}
+        self.last_k_proposal_terms = None
+        self.last_single_plan_student_terms = None
+        self.last_k_all_actual_debug = {}
+        release_exact_guidance_cache(self.args)
+        for module in (self.actuator, self.cost_attributor, self.policy_module):
+            if hasattr(module, "debug_tensors"):
+                module.debug_tensors = {}
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", None)
+            setattr(self.args, "_last_actuator_soft_terms", {})
+            setattr(self.args, "_full_cloud_canonical_context", None)
+        except Exception:
+            pass
+
+    def disable_input_cache(self): # 入力キャッシュを無効化する関数
+        self.cache_enabled = False
+        self.clear_input_cache()
+        self.clear_point_transformer_feature_cache()
+
+    def _input_cache_limits(self):
+        max_entries = max(int(getattr(self.args, "cache_max_entries", 0)), 0)
+        max_memory_mb = max(int(getattr(self.args, "cache_max_memory_mb", 0)), 0)
+        return max_entries, max_memory_mb * 1024 * 1024
+
+    @staticmethod
+    def _input_cache_value_bytes(value, seen=None):
+        if seen is None:
+            seen = set()
+        if torch.is_tensor(value):
+            storage = value.untyped_storage() if hasattr(value, "untyped_storage") else value.storage()
+            identity = (str(value.device), int(storage.data_ptr()))
+            if identity in seen:
+                return 0
+            seen.add(identity)
+            return int(value.numel()) * int(value.element_size())
+        if isinstance(value, dict):
+            return sum(
+                Network._input_cache_value_bytes(item, seen)
+                for item in value.values()
+            )
+        if isinstance(value, (list, tuple)):
+            return sum(Network._input_cache_value_bytes(item, seen) for item in value)
+        return 0
+
+    @staticmethod
+    def _clone_static_cache_value(value, device, memo=None):
+        """固定Node入力を値不変のままCPU/GPU間で複製する。
+
+        同じTensorを複数keyが参照する場合はaliasを維持し、容量と転送を重複
+        させない。固定入力は学習対象でないためautograd graphは保持しない。
+        """
+        if memo is None:
+            memo = {}
+        if torch.is_tensor(value):
+            identity = id(value)
+            cached = memo.get(identity)
+            if cached is not None:
+                return cached
+            detached = value.detach()
+            # device転送自体が独立storageを作るため、転送後の二重cloneを避ける。
+            cloned = (
+                detached.clone()
+                if detached.device == torch.device(device)
+                else detached.to(device=device)
+            )
+            memo[identity] = cloned
+            return cloned
+        if isinstance(value, dict):
+            return {
+                key: Network._clone_static_cache_value(item, device, memo)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                Network._clone_static_cache_value(item, device, memo)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                Network._clone_static_cache_value(item, device, memo)
+                for item in value
+            )
+        return value
+
+    def _static_node_cache_key(self, cache_key, source):
+        if is_geometry_octree(self.args):
+            cache_key = geometry_cache_key(self.args, cache_key)
+        if not cache_key:
+            return ""
+        # Include every coordinate convention that can change a voxel-derived
+        # input.  The file cache key already identifies the source PLY.
+        return "|".join((
+            "static_node_input_v1",
+            str(cache_key),
+            str(source),
+            str(getattr(self.args, "qs", 2)),
+            str(getattr(self.args, "sparsepcgc_voxel_size", 1.0)),
+            str(getattr(self.args, "sparsepcgc_pos_quantscale", 1)),
+            str(getattr(self.args, "sparsepcgc_quant_mode", "round_voxel_then_pos")),
+            str(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+            str(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))),
+        ))
+
+    def _get_static_node_cache(self, cache_key, source, device):
+        if not self.cache_enabled:
+            return None
+        key = self._static_node_cache_key(cache_key, source)
+        if not key:
+            return None
+        entry = self.input_cache.get(key)
+        if not isinstance(entry, dict):
+            return None
+        state = entry.get("state")
+        if not isinstance(state, dict):
+            return None
+        self.input_cache.move_to_end(key)
+        if bool(getattr(self.args, "static_node_cache_cpu", True)):
+            return self._clone_static_cache_value(state, device)
+        # GPU cache互換modeでも別deviceのTensorは使用しない。
+        for value in state.values():
+            if torch.is_tensor(value) and value.device != device:
+                return None
+        return state
+
+    def _put_static_node_cache(self, cache_key, source, state):
+        if not self.cache_enabled or not isinstance(state, dict):
+            return
+        key = self._static_node_cache_key(cache_key, source)
+        max_entries, max_bytes = self._input_cache_limits()
+        if not key or max_entries <= 0 or max_bytes <= 0:
+            return
+        cached_state = (
+            self._clone_static_cache_value(state, torch.device("cpu"))
+            if bool(getattr(self.args, "static_node_cache_cpu", True))
+            else {
+                name: value.detach() if torch.is_tensor(value) else value
+                for name, value in state.items()
+            }
+        )
+        entry_bytes = self._input_cache_value_bytes(cached_state)
+        # Do not evict the whole useful cache for a frame that cannot fit.
+        if entry_bytes > max_bytes:
+            return
+        # Training scans every frame sequentially and revisits it only in the
+        # next episode.  If the complete working set cannot fit, an LRUには
+        # 再利用がないためbypassする。CPU cache既定ならGPUメモリは消費しない。
+        expected_entries = max(int(getattr(self, "expected_input_cache_entries", 0)), 0)
+        capacity_by_bytes = int(max_bytes // max(entry_bytes, 1))
+        effective_capacity = min(int(max_entries), int(capacity_by_bytes))
+        if expected_entries > 0 and effective_capacity < expected_entries:
+            self._input_cache_working_set_bypassed = int(
+                getattr(self, "_input_cache_working_set_bypassed", 0)
+            ) + 1
+            if self.input_cache:
+                self.clear_input_cache()
+            return
+        old = self.input_cache.pop(key, None)
+        if isinstance(old, dict):
+            self._input_cache_bytes -= int(old.get("bytes", 0) or 0)
+        self.input_cache[key] = {"state": cached_state, "bytes": int(entry_bytes)}
+        self._input_cache_bytes += int(entry_bytes)
+        while self.input_cache and (
+            len(self.input_cache) > max_entries or self._input_cache_bytes > max_bytes
+        ):
+            _, removed = self.input_cache.popitem(last=False)
+            if isinstance(removed, dict):
+                self._input_cache_bytes -= int(removed.get("bytes", 0) or 0)
+        self._input_cache_bytes = max(int(self._input_cache_bytes), 0)
+
+    def _point_transformer_cache_key(self, cache_key, source, batch_index, point_count):
+        if is_geometry_octree(self.args):
+            cache_key = geometry_cache_key(self.args, cache_key)
+        if not cache_key:
+            return ""
+        input_sha256 = ""
+        input_file = str(getattr(self.args, "_current_input_file", "") or "").strip()
+        if input_file:
+            try:
+                input_path = Path(input_file).expanduser().resolve()
+                if input_path.is_file():
+                    input_sha256 = _ana_den6_sha256_file(input_path)
+            except (OSError, ValueError):
+                input_sha256 = ""
+        return "|".join((
+            "frozen_point_transformer_node_v1",
+            str(cache_key),
+            str(source),
+            str(int(batch_index)),
+            str(int(point_count)),
+            str(getattr(self.args, "sparsepcgc_voxel_size", 1.0)),
+            str(getattr(self.args, "sparsepcgc_pos_quantscale", 1)),
+            str(getattr(self.args, "encoder_pre_downsample_max_points", 8192)),
+            str(getattr(self.args, "encoder_raw_downsample_factor", 10.0)),
+            str(getattr(self.args, "out_dim", 64)),
+            str(input_sha256),
+        ))
+
+    def _point_transformer_encoder_fingerprint(self):
+        cached = getattr(self, "_point_transformer_encoder_state_sha256", None)
+        if cached:
+            return str(cached)
+        digest = hashlib.sha256(b"mynet_point_transformer_node_features_v2")
+        for name, value in sorted(self.encoder.state_dict().items()):
+            tensor = value.detach().cpu().contiguous()
+            digest.update(str(name).encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            try:
+                digest.update(tensor.numpy().tobytes(order="C"))
+            except TypeError:
+                digest.update(tensor.float().numpy().tobytes(order="C"))
+        cached = digest.hexdigest()
+        self._point_transformer_encoder_state_sha256 = cached
+        return cached
+
+    def _point_transformer_disk_fingerprint(self, key):
+        value = {
+            "schema_version": "mynet_point_transformer_node_features_v2",
+            "cache_key": str(key),
+            "encoder_state_sha256": self._point_transformer_encoder_fingerprint(),
+        }
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        value["fingerprint_sha256"] = hashlib.sha256(encoded).hexdigest()
+        return value
+
+    def _point_transformer_disk_cache(self):
+        if not bool(getattr(
+            self.args, "point_transformer_feature_disk_cache", True
+        )):
+            return None
+        cache = getattr(self, "_point_transformer_feature_disk_cache", None)
+        if cache is None:
+            root = str(getattr(
+                self.args, "point_transformer_feature_disk_cache_dir", ""
+            )).strip()
+            if not root:
+                return None
+            # These entries are read on every later Episode.  Uncompressed NPZ
+            # is exact and substantially cheaper to write/read; /data has ample
+            # capacity, while compressing 400 large index arrays wastes CPU.
+            cache = FrozenStudentFeatureCache(root, compressed=False)
+            self._point_transformer_feature_disk_cache = cache
+        return cache
+
+    def _load_point_transformer_feature_disk_cache(self, key):
+        cache = self._point_transformer_disk_cache()
+        if cache is None:
+            return None
+        fingerprint = self._point_transformer_disk_fingerprint(key)
+        try:
+            tensors = cache.load(fingerprint)
+        except FileNotFoundError:
+            self._point_transformer_feature_disk_misses += 1
+            return None
+        coarse_fused = tensors.get("coarse_fused")
+        full_to_coarse_idx = tensors.get("full_to_coarse_idx")
+        if (
+            not torch.is_tensor(coarse_fused)
+            or not torch.is_tensor(full_to_coarse_idx)
+            or coarse_fused.ndim != 3
+            or full_to_coarse_idx.ndim != 1
+            or not coarse_fused.is_floating_point()
+        ):
+            raise RuntimeError(
+                "Point Transformer feature disk cache has invalid tensors"
+            )
+        self._point_transformer_feature_disk_hits += 1
+        return {
+            "coarse_fused": coarse_fused.contiguous(),
+            "full_to_coarse_idx": full_to_coarse_idx.to(
+                dtype=torch.int32
+            ).contiguous(),
+            "coarse_count": int(coarse_fused.shape[-1]),
+        }
+
+    def _write_point_transformer_feature_disk_cache(
+        self, key, coarse_fused, full_to_coarse_idx
+    ):
+        cache = self._point_transformer_disk_cache()
+        if cache is None:
+            return
+        fingerprint = self._point_transformer_disk_fingerprint(key)
+        cache.write(fingerprint, {
+            "coarse_fused": coarse_fused.detach().cpu().contiguous(),
+            "full_to_coarse_idx": full_to_coarse_idx.detach().to(
+                device="cpu", dtype=torch.int32
+            ).contiguous(),
+        })
+        self._point_transformer_feature_disk_writes += 1
+
+    def _get_point_transformer_feature_cache(self, key, device):
+        if not key or not bool(getattr(self.args, "point_transformer_feature_cache", True)):
+            return None
+        entry = self.point_transformer_feature_cache.get(key)
+        if isinstance(entry, dict):
+            self.point_transformer_feature_cache.move_to_end(key)
+            self._point_transformer_feature_cache_hits += 1
+        else:
+            entry = self._load_point_transformer_feature_disk_cache(key)
+            if not isinstance(entry, dict):
+                self._point_transformer_feature_cache_misses += 1
+                return None
+        return {
+            "coarse_fused": entry["coarse_fused"].to(device=device),
+            "full_to_coarse_idx": entry["full_to_coarse_idx"].to(
+                device=device, dtype=torch.long
+            ),
+            "coarse_count": int(entry["coarse_count"]),
+        }
+
+    def _put_point_transformer_feature_cache(
+        self,
+        key,
+        coarse_fused,
+        full_to_coarse_idx,
+    ):
+        if (
+            not key
+            or not bool(getattr(self.args, "point_transformer_feature_cache", True))
+            or not bool(getattr(self.args, "encoder_0grad", True))
+        ):
+            return
+        # Encoder is frozen, so its exact output can be reused across Episodes.
+        # Preserve the source dtype: float16 compression changed the adapter
+        # input on a cache hit and therefore was not a computation-only cache.
+        # Build each CPU payload once and share it between disk and RAM cache.
+        cached_feature = coarse_fused.detach().to(
+            device=torch.device("cpu")
+        ).contiguous()
+        cached_index = full_to_coarse_idx.detach().to(
+            device=torch.device("cpu"), dtype=torch.int32
+        ).contiguous()
+        entry_bytes = (
+            int(cached_feature.numel()) * int(cached_feature.element_size())
+            + int(cached_index.numel()) * int(cached_index.element_size())
+        )
+        self._write_point_transformer_feature_disk_cache(
+            key, cached_feature, cached_index
+        )
+        max_entries = max(int(getattr(
+            self.args, "point_transformer_feature_cache_max_entries", 16
+        )), 0)
+        max_bytes = max(int(getattr(
+            self.args, "point_transformer_feature_cache_max_memory_mb", 128
+        )), 0) * 1024 * 1024
+        if max_entries <= 0 or max_bytes <= 0:
+            return
+        if entry_bytes > max_bytes:
+            return
+        expected_entries = max(int(getattr(
+            self, "expected_input_cache_entries", 0
+        )), 0)
+        effective_capacity = min(
+            int(max_entries), int(max_bytes // max(entry_bytes, 1))
+        )
+        # 通常学習は全frameを順番に1回ずつ通る。次Episodeまで全件を保持
+        # できないLRUにはhitがなく、数百MBを消費するだけなので保存しない。
+        if expected_entries > 0 and effective_capacity < expected_entries:
+            self._point_transformer_feature_cache_working_set_bypassed += 1
+            if self.point_transformer_feature_cache:
+                self.clear_point_transformer_feature_cache()
+            return
+        old = self.point_transformer_feature_cache.pop(key, None)
+        if isinstance(old, dict):
+            self._point_transformer_feature_cache_bytes -= int(old.get("bytes", 0))
+        self.point_transformer_feature_cache[key] = {
+            "coarse_fused": cached_feature,
+            "full_to_coarse_idx": cached_index,
+            "coarse_count": int(coarse_fused.shape[-1]),
+            "bytes": int(entry_bytes),
+        }
+        self._point_transformer_feature_cache_bytes += int(entry_bytes)
+        while self.point_transformer_feature_cache and (
+            len(self.point_transformer_feature_cache) > max_entries
+            or self._point_transformer_feature_cache_bytes > max_bytes
+        ):
+            _, removed = self.point_transformer_feature_cache.popitem(last=False)
+            self._point_transformer_feature_cache_bytes -= int(removed.get("bytes", 0))
+        self._point_transformer_feature_cache_bytes = max(
+            int(self._point_transformer_feature_cache_bytes), 0
+        )
+
+    def _adapt_point_transformer_features(self, frozen_features):
+        # 全体RMSだけを整える。チャネル平均を引くとPoint Transformerの
+        # global max-pool成分まで消えるため、局所・大域表現をともに残す。
+        rms = frozen_features.float().square().mean(
+            dim=(1, 2), keepdim=True
+        ).sqrt().clamp_min(1e-6)
+        normalized = (frozen_features / rms.to(frozen_features)).clamp(-8.0, 8.0)
+        scale = max(float(getattr(
+            self.args, "point_transformer_node_feature_scale", 0.25
+        )), 0.0)
+        return self.point_transformer_feature_adapter(normalized) * scale
+
+    def _point_transformer_fusion_gate(self, reference):
+        """Bound and smoothly introduce the trainable feature residual."""
+        if self.point_transformer_feature_gate is None:
+            return reference.new_zeros((1, 0, 1)), 0.0
+        maximum = min(max(float(getattr(
+            self.args, "point_transformer_feature_gate_max", 0.10
+        )), 0.0), 1.0)
+        if maximum <= 0.0:
+            return self.point_transformer_feature_gate.to(reference).mul(0.0), 0.0
+        raw_gate = self.point_transformer_feature_gate.to(
+            device=reference.device, dtype=reference.dtype
+        )
+        # raw=0.1の従来初期寄与はほぼ維持しつつ、学習が進んでもmaximumを
+        # 超えない滑らかなparameterizationにする。
+        bounded_gate = maximum * torch.tanh(raw_gate / maximum)
+        configured_warmup_steps = max(int(getattr(
+            self.args, "point_transformer_feature_warmup_steps", 0
+        )), 0)
+        if configured_warmup_steps > 0:
+            warmup_steps = configured_warmup_steps
+        else:
+            total_steps = max(int(getattr(
+                self.args, "_total_train_steps_estimate", 1
+            )), 1)
+            exploration_fraction = min(max(float(getattr(
+                self.args, "repair_exploration_fraction", 1.0
+            )), 0.0), 1.0)
+            warmup_steps = max(int(round(total_steps * exploration_fraction)), 1)
+            # Auto warmup across the complete exploration curriculum made the
+            # first feature residual ~1e-12 and FP32 adapter updates exactly 0.
+            # Keep the same bounded smoothstep, but introduce this trainable
+            # representation within a short native-codec warmup. Explicit
+            # warmup settings and conventional-codec paths are unchanged.
+            codec = str(getattr(self.args, 'compress', '')).lower().replace('-', '').replace('_', '')
+            if codec == 'sparsepcgc' and str(getattr(self.args, 'heuristic_guidance_mode', '')) == 'ana_den6_online':
+                warmup_steps = min(warmup_steps, max(int(getattr(
+                    self.args, 'sparsepcgc_feature_auto_warmup_cap', 100)), 1))
+        global_step = getattr(self.args, "_global_train_step", None)
+        if warmup_steps > 0 and global_step is not None:
+            phase = min(max((float(global_step) + 1.0) / float(warmup_steps), 0.0), 1.0)
+            # smoothstepは開始・終了点の傾きが0なので、方策入力に段差を作らない。
+            warmup = phase * phase * (3.0 - 2.0 * phase)
+        else:
+            warmup = 1.0
+        return bounded_gate * float(warmup), float(warmup)
+
+    def _point_transformer_features_for_nodes(
+        self,
+        node_xyz,
+        node_counts,
+        *,
+        coord_scale=None,
+        cache_key=None,
+        source="none",
+    ):
+        """固定Point Transformer特徴をcoarse点で計算しcanonical Nodeへ戻す。"""
+        if not self.point_transformer_node_features:
+            return node_xyz.new_zeros((node_xyz.shape[0], 0, node_xyz.shape[-1])), {
+                "used": False,
+                "reason": "disabled",
+            }
+        if self.point_transformer_feature_adapter is None:
+            raise RuntimeError("Point Transformer node feature adapter is missing")
+
+        scales = self._normalize_coord_scale(node_xyz, coord_scale)
+        output_rows = []
+        cache_hits = 0
+        coarse_counts = []
+        frozen_encoder = bool(getattr(self.args, "encoder_0grad", True))
+        cacheable_source = str(source).startswith("full_octree_context")
+        for batch_index in range(int(node_xyz.shape[0])):
+            valid_count = int(node_counts[batch_index]) if node_counts is not None else int(node_xyz.shape[-1])
+            valid_count = max(min(valid_count, int(node_xyz.shape[-1])), 1)
+            sample_xyz = node_xyz[batch_index, :, :valid_count]
+            feature_key = self._point_transformer_cache_key(
+                cache_key,
+                source,
+                batch_index,
+                valid_count,
+            ) if frozen_encoder and cacheable_source else ""
+            cached = self._get_point_transformer_feature_cache(
+                feature_key,
+                node_xyz.device,
+            )
+            if cached is not None:
+                coarse_fused = cached["coarse_fused"]
+                full_to_coarse_idx = cached["full_to_coarse_idx"]
+                cache_hits += 1
+            else:
+                sparse_qs, sparse_quant_mode, sparse_pos_q = self._encoder_sparse_qs_mode_and_pos()
+                point_builder = build_geometry_point_features if is_geometry_octree(self.args) else build_sparse_point_tensor_single
+                sparse_tensor = point_builder(
+                    sample_xyz,
+                    scales[batch_index:batch_index + 1],
+                    max_points=int(getattr(self.args, "encoder_pre_downsample_max_points", 8192)),
+                    qs=sparse_qs,
+                    raw_downsample_factor=float(getattr(self.args, "encoder_raw_downsample_factor", 10.0)),
+                    voxel_scale=float(getattr(self.args, "encoder_pre_downsample_voxel_scale", 1.0)),
+                    growth=float(getattr(self.args, "encoder_pre_downsample_growth", 1.5)),
+                    max_iters=int(getattr(self.args, "encoder_pre_downsample_max_iters", 8)),
+                    quant_mode=sparse_quant_mode,
+                    pos_quantscale=sparse_pos_q,
+                )
+                encoder_xyz = sparse_tensor["coords_xyz"].unsqueeze(0)
+                encoder_feat = sparse_tensor["feat"].unsqueeze(0)
+                grad_enabled = not frozen_encoder
+                with torch.set_grad_enabled(grad_enabled):
+                    _, coarse_fused = self.encoder(encoder_xyz, feat=encoder_feat)
+                if frozen_encoder:
+                    coarse_fused = coarse_fused.detach()
+                full_to_coarse_idx = sparse_tensor["full_to_coarse_idx"].to(
+                    device=node_xyz.device, dtype=torch.long
+                )
+                self._put_point_transformer_feature_cache(
+                    feature_key,
+                    coarse_fused,
+                    full_to_coarse_idx,
+                )
+
+            coarse_counts.append(int(coarse_fused.shape[-1]))
+            adapted_coarse = self._adapt_point_transformer_features(coarse_fused)
+            mapped = adapted_coarse.index_select(2, full_to_coarse_idx.reshape(-1))
+            if valid_count < int(node_xyz.shape[-1]):
+                mapped = torch.cat((
+                    mapped,
+                    mapped.new_zeros((
+                        1,
+                        mapped.shape[1],
+                        int(node_xyz.shape[-1]) - valid_count,
+                    )),
+                ), dim=2)
+            output_rows.append(mapped)
+
+        output = torch.cat(output_rows, dim=0)
+        return output, {
+            "used": True,
+            "reason": "frozen_point_transformer_to_node",
+            "feature_dim": int(output.shape[1]),
+            "coarse_counts": tuple(coarse_counts),
+            "cache_hits_this_forward": int(cache_hits),
+            "cache_entries": int(len(self.point_transformer_feature_cache)),
+            "cache_bytes": int(self._point_transformer_feature_cache_bytes),
+            "encoder_frozen": bool(frozen_encoder),
+            "flows_to_actuator": True,
+        }
+
+    # def warmup_frozen_input(self, pts_xyz, cache_key=None, coord_scale=None): # 旧実装で、固定入力特徴を事前計算してキャッシュするための関数
+    #     return None
+
+    # def clear_discrete_policy_terms(self): # 離散方策に関する一時的な損失項やログ情報を消すための関数
+    #     return None
+
+    """補助関数"""
+    def discrete_policy_loss(self, reward, geometry=None):
+        """Update the executed one-plan policy from the actual codec scalar."""
+        if not torch.is_tensor(reward):
+            raise TypeError("discrete_policy_lossのrewardはTensorである必要がある")
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode not in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
+            return reward.new_zeros(())
+        state = self.last_actuator_voxel_state
+        if not isinstance(state, dict):
+            return reward.new_zeros(())
+        log_prob = state.get("den6_online_policy_log_prob", None)
+        entropy = state.get("den6_online_policy_entropy", None)
+        if not torch.is_tensor(log_prob) or not log_prob.requires_grad:
+            return reward.new_zeros(())
+        objective = torch.nan_to_num(reward.float().mean(), nan=0.0, posinf=1e3, neginf=-1e3)
+        selection_mode = str(getattr(
+            self.args,
+            "heuristic_guidance_online_selection_mode",
+            # Missing on old checkpoints/tests: keep prior-residual semantics.
+            "prior_residual",
+        )).strip().lower()
+        actor_critic_selection = bool(
+            mode == "ana_den6_online" and selection_mode == "actor_critic"
+        )
+        # Safe prior-residual behavior still needs the same factorized Actual
+        # RD baselines as the pure Actor/Critic policy.  Previously these were
+        # coupled to ``actor_critic_selection``; consequently the restored
+        # prior-residual run explored all heads at once and accumulated zero
+        # matched evidence through E131.  This flag changes credit semantics,
+        # not the forward ranking equation.
+        factorized_actual_credit = bool(
+            mode == "ana_den6_online"
+            and selection_mode in {"actor_critic", "prior_residual"}
+        )
+        geometry_joint_policy = bool(is_geometry_octree(self.args) and getattr(
+            self.args, 'geometry_octree_joint_policy', True))
+        if geometry_joint_policy:
+            # Calibrate trust using the executed codec, never treat proxy gain
+            # as an Actual label. Repeated sign failures remove prior control.
+            joint_audit = (state.get('ana_den6_exact_residual_plan_debug', {}) or {}).get('geometry_joint_policy', {})
+            predicted_gain = float(joint_audit.get('joint_gain', 0.))
+            if joint_audit and abs(predicted_gain) > 1e-8:
+                correct = float((predicted_gain > 0.) == (float(objective.detach().cpu()) < 0.))
+                previous_trust = float(getattr(self.args, '_geometry_octree_prior_trust', 1.))
+                self.args._geometry_octree_prior_trust = .9 * previous_trust + .1 * correct
+        # prior_residual differs only in forward safety (H is retained).  The
+        # Actual Actor/Critic/Proposal learners and their replay are shared.
+        actual_residual_learning = bool(factorized_actual_credit)
+        geometry_objective_for_rd = (
+            torch.nan_to_num(
+                geometry.float().mean(), nan=0.0, posinf=1e3, neginf=0.0
+            )
+            if torch.is_tensor(geometry)
+            else objective.new_zeros(())
+        )
+        geometry_penalty = torch.relu(
+            geometry_objective_for_rd
+            - geometry_objective_for_rd.new_tensor(float(getattr(
+                self.args, "cp_tau_geom", 0.0
+            )))
+        )
+        if geometry_joint_policy:
+            from .utils.pointcloud.geometry_rd import geometry_penalty as conventional_geometry_penalty
+            geometry_penalty = conventional_geometry_penalty(geometry_objective_for_rd, self.args)
+        changed_ratio = state.get(
+            "den6_online_actor_critic_changed_ratio", objective.new_zeros(())
+        )
+        if not torch.is_tensor(changed_ratio):
+            changed_ratio = objective.new_tensor(float(changed_ratio))
+        actor_compression_weight = max(float(getattr(
+            self.args, "w_com", 1.0
+        )), 0.0)
+        actor_geometry_weight = max(float(getattr(
+            self.args, "cp_lambda_geom", 1.0
+        )), 0.0)
+        actor_rd_target = (
+            float(actor_compression_weight) * objective.detach()
+            + float(actor_geometry_weight) * geometry_penalty.detach()
+            + max(float(getattr(
+                self.args, "heuristic_guidance_online_edit_tiebreak_weight", 0.0
+            )), 0.0) * changed_ratio.detach().float().mean()
+        )
+        input_file = str(getattr(self.args, "_current_input_file", ""))
+        cache_key = "|".join((
+            input_file,
+            str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_m", 8)),
+        ))
+        plan_debug_state = state.get("ana_den6_exact_residual_plan_debug", {})
+        if not isinstance(plan_debug_state, dict):
+            plan_debug_state = {}
+        factorized_group = str(
+            plan_debug_state.get("factorized_exploration_group", "none")
+        )
+        # A comparison across different factorized decision groups cannot
+        # identify which decision caused the Actual RD change.  The 081832
+        # replay proved that a generic frame EMA still credited Gate for
+        # changes made by Where/Amount and drove Adjust to 75%.  Keep one EMA
+        # per exact frame *and* explored group.  A weaker sequence-level EMA
+        # is also separated by group below so previously unseen frames still
+        # obtain normalized Actual feedback without cross-head attribution.
+        # This uses no extra codec encode and is independent of Episode number.
+        policy_baseline_key = (
+            f"{cache_key}|factor={factorized_group}"
+            if factorized_actual_credit else cache_key
+        )
+        normalized_input_file = input_file.replace("\\", "/")
+        sequence_name = (
+            normalized_input_file.rsplit("/", 1)[0]
+            if "/" in normalized_input_file
+            else normalized_input_file
+        )
+        sequence_key = "|".join((
+            sequence_name,
+            str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_m", 8)),
+        ))
+        policy_sequence_key = (
+            f"{sequence_key}|factor={factorized_group}"
+            if factorized_actual_credit else sequence_key
+        )
+        sequence_objective_baseline = getattr(
+            self, "_den6_online_sequence_objective_baseline", None
+        )
+        if sequence_objective_baseline is None:
+            sequence_objective_baseline = OrderedDict()
+            self._den6_online_sequence_objective_baseline = sequence_objective_baseline
+        baseline_seen = policy_baseline_key in self._den6_online_objective_baseline
+        sequence_baseline_seen = policy_sequence_key in sequence_objective_baseline
+        if baseline_seen:
+            previous = self._den6_online_objective_baseline[policy_baseline_key]
+            baseline_source = (
+                "frame_factor" if factorized_actual_credit else "frame"
+            )
+        elif sequence_baseline_seen:
+            previous = sequence_objective_baseline[policy_sequence_key]
+            baseline_source = (
+                "sequence_factor" if factorized_actual_credit else "sequence"
+            )
+        else:
+            previous = 0.0
+            # Different frames have different intrinsic codec difficulty.
+            # The first observation for each sequence/group initializes its
+            # baseline; later unseen frames compare only against that same
+            # sequence and same explored decision group.
+            baseline_source = (
+                "frame_factor_unseen" if factorized_actual_credit else "frame_unseen"
+            )
+        previous_t = objective.new_tensor(float(previous))
+        # objectiveはActual圧縮率[%]で、小さいほど良い。baselineより小さい時に
+        # 今回の唯一のplanの選択確率を増やす。±1%未満の信号が他損失に埋もれない
+        # よう倍率を掛けるが、forwardのActual値や候補数は変更しない。
+        reward_scale = max(
+            float(getattr(self.args, "heuristic_guidance_online_reward_scale", 1.0)), 0.0
+        )
+        advantage_clip = max(
+            float(getattr(self.args, "heuristic_guidance_online_advantage_clip", 2.0)), 0.0
+        )
+        # RD objective convention: smaller is better.  The EMA compares the
+        # same rate+geometry quantity as the Actor target; comparing Critic RD
+        # against a rate-only EMA gave Gate/Amount contradictory credit.
+        # The factorized objective is rate + lambda*geometry and can validly be
+        # positive (172318: about -3.8 + 150*0.033 ~= +1.15).  Clamping its EMA
+        # baseline to zero therefore marked virtually every executed plan as a
+        # negative-advantage action.  The zero clamp is meaningful only for the
+        # legacy compression-only objective.
+        effective_baseline_t = (
+            previous_t
+            if factorized_actual_credit
+            else torch.minimum(previous_t, previous_t.new_zeros(()))
+        )
+        ema_advantage = (
+            effective_baseline_t
+            - (actor_rd_target.detach() if factorized_actual_credit else objective.detach())
+        ) * float(reward_scale)
+        advantage = ema_advantage
+        plan_critic_value = state.get(
+            "den6_online_actor_critic_plan_value", objective.new_zeros(())
+        )
+        plan_critic_log_variance = state.get(
+            "den6_online_actor_critic_plan_log_variance", objective.new_zeros(())
+        )
+        plan_feature = state.get(
+            "den6_online_actor_critic_plan_feature", None
+        )
+        # The Plan Critic is trained and audited, but is not an Actor baseline.
+        # Its replay correlation is dominated by frame difficulty and does not
+        # prove action-conditional calibration.  Run 074549 showed positive
+        # Critic advantage while Adjust rose 0.29 -> 0.74 and Actual worsened.
+        # Actual EMA, isolated by factorized group, is the global Actor
+        # comparison; the Critic remains an audit/training target only.
+        plan_critic_policy_confidence = 0.0
+        if advantage_clip > 0.0:
+            advantage = advantage.clamp(-advantage_clip, advantage_clip)
+        # Use an EMA state baseline, not best-so-far.  A single lucky codec
+        # quantisation event must not make every subsequent exploratory plan
+        # negative-advantage forever; that failure mode collapsed Amount to
+        # zero after the first -1 byte event.
+        objective_value = float(
+            (actor_rd_target.detach() if factorized_actual_credit else objective.detach()).cpu()
+        )
+        baseline_alpha = min(max(
+            float(getattr(self.args, "heuristic_guidance_online_reward_ema", 0.10)),
+            1e-4,
+        ), 1.0)
+        updated = (
+            (1.0 - baseline_alpha) * float(previous) + baseline_alpha * objective_value
+            if baseline_seen else objective_value
+        )
+        self._den6_online_objective_baseline[policy_baseline_key] = float(updated)
+        self._den6_online_objective_baseline.move_to_end(policy_baseline_key)
+        while len(self._den6_online_objective_baseline) > 4096:
+            self._den6_online_objective_baseline.popitem(last=False)
+        previous_sequence = float(sequence_objective_baseline.get(
+            policy_sequence_key, objective_value
+        ))
+        updated_sequence = (
+            (1.0 - baseline_alpha) * previous_sequence
+            + baseline_alpha * objective_value
+            if sequence_baseline_seen else objective_value
+        )
+        sequence_objective_baseline[policy_sequence_key] = float(updated_sequence)
+        sequence_objective_baseline.move_to_end(policy_sequence_key)
+        while len(sequence_objective_baseline) > 128:
+            sequence_objective_baseline.popitem(last=False)
+
+        weight = max(float(getattr(self.args, "heuristic_guidance_online_policy_weight", 1.0)), 0.0)
+        entropy_weight = max(float(getattr(self.args, "heuristic_guidance_online_entropy_weight", 0.001)), 0.0)
+        # train.py keeps a legacy score-function-only backward multiplier.
+        # Candidate-local credit is already calibrated, and the one scalar
+        # Actual result describes the whole composite plan rather than any
+        # individual candidate.  On the measured repeated-frame run the
+        # uncalibrated composite term produced Amount/Where pre-clip norms
+        # 8918/6.24 while local credit was about 42/0.2, so clipping preserved
+        # almost only the high-variance global direction.  Cancel the legacy
+        # multiplier here and retain Actual only as a weak global correction.
+        policy_backward_scale = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_policy_backward_scale",
+            1.0,
+        )), 1.0)
+        global_actual_credit_weight = (
+            max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_global_actual_credit_weight",
+                0.05,
+            )), 0.0)
+            if mode == "ana_den6_online" else 1.0
+        )
+        # A first-seen frame/sequence has only the no-op reference.  Its one
+        # composite Actual scalar can say that the plan as a whole compresses,
+        # but cannot identify which of thousands of candidates caused it.
+        # Reinforcing every sampled candidate in that situation produced a
+        # measured utility-correlation flip from near zero to negative after
+        # one update.  Initialize the Actual baseline on first sight and apply
+        # the global policy correction only once a comparative frame/sequence
+        # baseline exists.  Candidate-local RD credit remains active from the
+        # first step, and Actual correction remains active on revisits.
+        global_credit_available = bool(baseline_seen or sequence_baseline_seen)
+        # Cross-frame deltas remain noisier than exact-frame comparisons even
+        # after percent/RD normalization.  In Actor/Critic mode grant Actual
+        # score-function authority only in proportion to the independently
+        # measured candidate-RD alignment.  This is learning-state dependent,
+        # not Episode dependent, and the confidence floor in the actuator
+        # keeps a non-zero learning path.
+        global_credit_confidence = (
+            min(max(float(plan_debug_state.get(
+                "network_plan_confidence",
+                getattr(
+                    self.args,
+                    "heuristic_guidance_network_confidence_floor",
+                    0.05,
+                ),
+            )), 0.0), 1.0)
+            if actor_critic_selection else 1.0
+        )
+        # Learn the binary edit/no-edit decision only from executed Actual
+        # outcomes.  Store best observed RD per action and compare the opposite
+        # action on a later Amount exploration.  No heuristic operation ratio or
+        # Episode schedule is used, and no additional codec call is required.
+        noop_edit_comparison_available = False
+        noop_edit_comparison_exact = False
+        if factorized_actual_credit and (factorized_group == "Amount" or geometry_joint_policy):
+            noop_selected = bool(plan_debug_state.get("no_op_selected", False))
+            noop_memory = getattr(self, "_den6_noop_edit_actual_memory", None)
+            if noop_memory is None:
+                noop_memory = OrderedDict()
+                self._den6_noop_edit_actual_memory = noop_memory
+            action_name = "noop" if noop_selected else "edit"
+            opposite_name = "edit" if noop_selected else "noop"
+            frame_entry = noop_memory.setdefault(str(cache_key), {})
+            sequence_entry = noop_memory.setdefault(str(sequence_key), {})
+            opposite_value = frame_entry.get(opposite_name)
+            if opposite_value is not None:
+                noop_edit_comparison_available = True
+                noop_edit_comparison_exact = True
+                advantage = advantage.new_tensor(
+                    float(opposite_value) - float(objective_value)
+                ).clamp(-advantage_clip, advantage_clip)
+            elif opposite_name in sequence_entry:
+                noop_edit_comparison_available = True
+                advantage = advantage.new_tensor(
+                    min(max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_actual_actor_cross_frame_weight",
+                        0.25,
+                    )), 0.0), 1.0)
+                    * (float(sequence_entry[opposite_name]) - float(objective_value))
+                ).clamp(-advantage_clip, advantage_clip)
+            if noop_edit_comparison_available:
+                global_credit_available = True
+                baseline_source = (
+                    "actual_noop_edit_frame" if noop_edit_comparison_exact
+                    else "actual_noop_edit_sequence"
+                )
+                global_credit_confidence = max(global_credit_confidence, 0.25)
+            frame_entry[action_name] = min(
+                float(frame_entry.get(action_name, float("inf"))), objective_value
+            )
+            sequence_entry[action_name] = min(
+                float(sequence_entry.get(action_name, float("inf"))), objective_value
+            )
+            noop_memory.move_to_end(str(cache_key))
+            noop_memory.move_to_end(str(sequence_key))
+            while len(noop_memory) > 1024:
+                noop_memory.popitem(last=False)
+        policy_core_raw = (
+            -float(global_credit_confidence) * advantage * log_prob.float().mean()
+            if global_credit_available
+            else 0.0 * log_prob.float().mean()
+        )
+        policy_core_weighted = (
+            weight
+            * float(global_actual_credit_weight)
+            * policy_core_raw
+            / float(policy_backward_scale)
+        )
+        policy_loss = policy_core_weighted
+        # Compare Amount>0 with a *measured* no-op passed through the same
+        # edited pipeline.  The nominal GT baseline is not exact here (observed
+        # no-op runs differ by small bitstream overhead), so J_noop=0 would
+        # systematically bias Amount against edits.
+        noop_actual_raw = objective.new_zeros(())
+        noop_actual_weighted = objective.new_zeros(())
+        amount_log_probs_all = plan_debug_state.get(
+            "_actual_credit_amount_log_probs", None
+        )
+        selected_amount_index = int(plan_debug_state.get(
+            "_actual_credit_amount_bin_index", -1
+        ))
+        measured_noop_objective = None
+        noop_memory_for_amount = getattr(
+            self, "_den6_noop_edit_actual_memory", None
+        )
+        if isinstance(noop_memory_for_amount, dict):
+            exact_noop_entry = noop_memory_for_amount.get(str(cache_key), {})
+            if isinstance(exact_noop_entry, dict):
+                measured_noop_objective = exact_noop_entry.get("noop")
+        if (
+            factorized_actual_credit
+            and (factorized_group == "Amount" or geometry_joint_policy)
+            and torch.is_tensor(amount_log_probs_all)
+            and amount_log_probs_all.requires_grad
+            and 0 < selected_amount_index < int(amount_log_probs_all.numel())
+            and measured_noop_objective is not None
+        ):
+            selected_vs_noop = (
+                amount_log_probs_all[selected_amount_index]
+                - amount_log_probs_all[0]
+            )
+            edit_objective_value = float(actor_rd_target.detach().cpu())
+            edit_is_better = (
+                1.0
+                if edit_objective_value < float(measured_noop_objective)
+                else -1.0
+            )
+            noop_actual_raw = torch.nn.functional.softplus(
+                -float(edit_is_better) * selected_vs_noop
+            )
+            noop_actual_weight = max(float(getattr(
+                self.args, "heuristic_guidance_online_actual_set_credit_weight", 0.50
+            )), 0.0)
+            noop_actual_weighted = (
+                float(noop_actual_weight)
+                * noop_actual_raw
+                / float(policy_backward_scale)
+            )
+            policy_loss = policy_loss + noop_actual_weighted
+            if hasattr(self, "actuator"):
+                previous_noop_evidence = min(max(float(getattr(
+                    self.actuator, "_den6_noop_actual_evidence", 0.0
+                )), 0.0), 1.0)
+                evidence_alpha = 1.0 / float(max(int(getattr(
+                    self.args, "heuristic_guidance_online_actual_actor_replay_entries", 512
+                )), 1))
+                self.actuator._den6_noop_actual_evidence = (
+                    (1.0 - evidence_alpha) * previous_noop_evidence + evidence_alpha
+                )
+        plan_critic_loss_raw = objective.new_zeros(())
+        plan_critic_loss_weighted = objective.new_zeros(())
+        plan_critic_replay_loss = objective.new_zeros(())
+        replay_count = 0
+        plan_critic_replay_pearson = 0.0
+        plan_critic_replay_spearman = 0.0
+        if (
+            actual_residual_learning
+            and torch.is_tensor(plan_critic_value)
+            and plan_critic_value.requires_grad
+            and torch.is_tensor(plan_feature)
+            and int(plan_feature.numel()) == 18
+        ):
+            log_variance = plan_critic_log_variance.float().mean().clamp(-8.0, 8.0)
+            critic_error = plan_critic_value.float().mean() - actor_rd_target.detach()
+            critic_uncertainty = torch.exp(0.5 * log_variance)
+            plan_critic_loss_raw = (
+                torch.nn.functional.smooth_l1_loss(
+                    plan_critic_value.float().mean(),
+                    actor_rd_target.detach(),
+                    beta=0.25,
+                )
+                + 0.1 * torch.nn.functional.smooth_l1_loss(
+                    critic_uncertainty,
+                    (critic_error.detach().abs() + 0.05).clamp(max=10.0),
+                    beta=0.25,
+                )
+            )
+            replay = getattr(self, "_den6_actor_critic_replay", None)
+            if replay is None:
+                replay = []
+                self._den6_actor_critic_replay = replay
+            replay_batch = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_plan_critic_replay_batch",
+                32,
+            )), 0)
+            if replay and replay_batch > 0:
+                rows = replay[-min(len(replay), replay_batch):]
+                replay_features = torch.stack([
+                    (row["plan_feature"] if isinstance(row, dict) else row[0]).to(
+                        device=objective.device, dtype=torch.float32
+                    )
+                    for row in rows
+                ])
+                replay_targets = objective.new_tensor(
+                    [
+                        float(row["actual_rd"] if isinstance(row, dict) else row[1])
+                        for row in rows
+                    ], dtype=torch.float32
+                )
+                replay_output = self.actuator.den6_plan_critic(replay_features)
+                replay_mean = replay_output[:, 0]
+                replay_log_variance = replay_output[:, 1].clamp(-8.0, 8.0)
+                replay_error = replay_mean - replay_targets
+                replay_uncertainty = torch.exp(0.5 * replay_log_variance)
+                plan_critic_replay_loss = (
+                    torch.nn.functional.smooth_l1_loss(
+                        replay_mean, replay_targets, beta=0.25
+                    )
+                    + 0.1 * torch.nn.functional.smooth_l1_loss(
+                        replay_uncertainty,
+                        (replay_error.detach().abs() + 0.05).clamp(max=10.0),
+                        beta=0.25,
+                    )
+                )
+                replay_count = len(rows)
+                if replay_count > 1:
+                    replay_mean_detached = replay_mean.detach().float()
+                    replay_target_detached = replay_targets.detach().float()
+                    pred_centered = (
+                        replay_mean_detached - replay_mean_detached.mean()
+                    )
+                    target_centered = (
+                        replay_target_detached - replay_target_detached.mean()
+                    )
+                    correlation_denominator = (
+                        pred_centered.square().sum().sqrt()
+                        * target_centered.square().sum().sqrt()
+                    ).clamp_min(1e-12)
+                    plan_critic_replay_pearson = float((
+                        (pred_centered * target_centered).sum()
+                        / correlation_denominator
+                    ).cpu())
+                    pred_rank = torch.argsort(torch.argsort(
+                        replay_mean_detached
+                    )).float()
+                    target_rank = torch.argsort(torch.argsort(
+                        replay_target_detached
+                    )).float()
+                    pred_rank = pred_rank - pred_rank.mean()
+                    target_rank = target_rank - target_rank.mean()
+                    rank_denominator = (
+                        pred_rank.square().sum().sqrt()
+                        * target_rank.square().sum().sqrt()
+                    ).clamp_min(1e-12)
+                    plan_critic_replay_spearman = float((
+                        (pred_rank * target_rank).sum() / rank_denominator
+                    ).cpu())
+            # Critic authority is based on measured replay ordering, not an
+            # Episode schedule.  Both linear and rank correlation must be
+            # positive; a short replay receives proportionally less trust.
+            replay_coverage = min(
+                float(replay_count) / float(max(replay_batch, 1)), 1.0
+            )
+            instant_critic_quality = (
+                replay_coverage
+                * min(
+                    max(float(plan_critic_replay_pearson), 0.0),
+                    max(float(plan_critic_replay_spearman), 0.0),
+                )
+            )
+            previous_critic_quality = min(max(float(getattr(
+                self, "_den6_plan_critic_policy_confidence", 0.0
+            )), 0.0), 1.0)
+            self._den6_plan_critic_policy_confidence = (
+                0.9 * previous_critic_quality
+                + 0.1 * min(max(instant_critic_quality, 0.0), 1.0)
+            )
+            plan_critic_policy_confidence = float(
+                self._den6_plan_critic_policy_confidence
+            )
+            critic_weight = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_plan_critic_weight",
+                0.10,
+            )), 0.0)
+            plan_critic_loss_weighted = float(critic_weight) * (
+                plan_critic_loss_raw + plan_critic_replay_loss
+            )
+            policy_loss = policy_loss + plan_critic_loss_weighted
+            plan_debug_for_replay = state.get(
+                "ana_den6_exact_residual_plan_debug", {}
+            )
+            if not isinstance(plan_debug_for_replay, dict):
+                plan_debug_for_replay = {}
+            # Replay regression consumes only these sufficient statistics.
+            # Keeping thousands of candidate-id strings per step grew the
+            # Python heap but never participated in an Actor/Critic update.
+            replay.append({
+                "plan_feature": plan_feature.detach().to(
+                    device="cpu", dtype=torch.float16
+                ),
+                "actual_rd": float(actor_rd_target.detach().cpu()),
+            })
+            replay_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_plan_critic_replay_entries",
+                512,
+            )), 1)
+            if len(replay) > replay_capacity:
+                del replay[:-replay_capacity]
+        candidate_local_credit = state.get(
+            "den6_online_candidate_local_credit_loss", None
+        )
+        candidate_actor_proxy = state.get(
+            "den6_online_candidate_actor_proxy_loss", None
+        )
+        candidate_local_credit_weighted = objective.new_zeros(())
+        candidate_actor_proxy_weighted_for_probe = objective.new_zeros(())
+        if (
+            mode == "ana_den6_online"
+            and torch.is_tensor(candidate_local_credit)
+            and candidate_local_credit.requires_grad
+        ):
+            local_weight = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_candidate_local_credit_weight",
+                1.0,
+            )), 0.0)
+            # train.py applies the existing score-function backward multiplier
+            # to the combined policy tensor.  Local differentiable credit is
+            # already normalized and must not inherit that REINFORCE-only
+            # amplification, so cancel it here exactly.
+            candidate_local_credit_weighted = (
+                float(local_weight)
+                * candidate_local_credit.float().mean()
+                / float(policy_backward_scale)
+            )
+            policy_loss = policy_loss + candidate_local_credit_weighted
+            # candidate_local_credit contains the Critic/local-RD objectives as
+            # well as this small Actor warm-start term.  Keep a separate view of
+            # the latter for source-gradient diagnostics; do not add it twice.
+            if (
+                torch.is_tensor(candidate_actor_proxy)
+                and candidate_actor_proxy.requires_grad
+            ):
+                actor_proxy_weight = max(float(
+                    (state.get("ana_den6_exact_residual_plan_debug", {}) or {}).get(
+                        "candidate_actor_proxy_weight", 0.0
+                    )
+                ), 0.0)
+                candidate_actor_proxy_weighted_for_probe = (
+                    float(local_weight)
+                    * float(actor_proxy_weight)
+                    * candidate_actor_proxy.float().mean()
+                    / float(policy_backward_scale)
+                )
+
+        # One codec result describes the complete plan, but consecutive plans
+        # for the *same frame* reveal which candidate set was exchanged.  Give
+        # Actual supervision only to those changed candidates: when the new
+        # plan improves, its inserted set should outrank the removed set; when
+        # it worsens, the preference is reversed.  This is deliberately not
+        # applied across frames and does not evaluate candidates individually.
+        actual_set_contrast_raw = objective.new_zeros(())
+        actual_set_contrast_weighted = objective.new_zeros(())
+        actual_set_contrast_operations = 0
+        actual_set_contrast_pairs = 0
+        actual_set_contrast_evidence = 0.0
+        actual_set_incumbent_updated = False
+        plan_debug = state.get("ana_den6_exact_residual_plan_debug", {})
+        matched_anchor_age_confidence = min(max(float(
+            plan_debug.get("matched_actual_anchor_age_confidence", 1.0)
+            if isinstance(plan_debug, dict) else 1.0
+        ), 0.0), 1.0)
+        score_tensors = (
+            plan_debug.get("_actual_credit_network_scores", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        candidate_ids_by_operation = (
+            plan_debug.get("_actual_credit_candidate_ids", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        selected_ids_by_operation = (
+            plan_debug.get("_actual_credit_selected_ids", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        matched_anchor_hash = str(
+            plan_debug.get("matched_actual_anchor_hash", "")
+            if isinstance(plan_debug, dict) else ""
+        )
+        replay_operation = (
+            factorized_group[:-5]
+            if factorized_group.endswith("Where") else ""
+        )
+        # WhereAll changes one joint Add/Prune/Adjust candidate set.  Keep
+        # that set as a single replay observation, not three independent
+        # candidate labels derived from the same composite codec scalar.
+        if factorized_group == "WhereAll":
+            replay_operation = "All"
+        replay_operations = (
+            ("Add", "Prune", "Adjust") if replay_operation == "All"
+            else (replay_operation,) if replay_operation else ()
+        )
+        plan_memory = getattr(self, "_den6_online_actual_plan_memory", None)
+        if plan_memory is None:
+            plan_memory = OrderedDict()
+            self._den6_online_actual_plan_memory = plan_memory
+        matched_plan_key = "|".join((
+            str(cache_key), str(factorized_group), str(matched_anchor_hash)
+        ))
+        previous_plan = (
+            plan_memory.get(matched_plan_key) if matched_anchor_hash else None
+        )
+        current_objective_value = float(
+            (
+                actor_rd_target
+                if factorized_actual_credit
+                else objective.detach()
+            ).cpu()
+        )
+
+        # Strict one-factor plan preference.  This is the only Actual teacher
+        # for Amount/Gate/Fine and an additional group-level teacher for Where.
+        # It acts on the composite action log-probability; the scalar plan RD
+        # is never copied to each candidate as an individual target.
+        actual_group_pair_raw = objective.new_zeros(())
+        actual_group_pair_weighted = objective.new_zeros(())
+        actual_group_critic_weighted = objective.new_zeros(())
+        actual_group_pair_available = False
+        actual_group_pair_delta = 0.0
+        actual_group_actor_correct = 0.0
+        actual_group_critic_correct = 0.0
+        current_group_log_prob = (
+            plan_debug.get("_actual_credit_group_log_prob")
+            if isinstance(plan_debug, dict) else None
+        )
+        anchor_group_log_prob = (
+            plan_debug.get("_actual_credit_anchor_group_log_prob")
+            if isinstance(plan_debug, dict) else None
+        )
+        strict_group = factorized_group in {
+            "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
+            "Amount", "Gate", "Fine",
+        }
+        matched_reused = bool(
+            plan_debug.get("matched_actual_anchor_reused", False)
+            if isinstance(plan_debug, dict) else False
+        )
+        group_min_delta = max(float(getattr(
+            self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
+        )), 0.0)
+        if (
+            mode == "ana_den6_online"
+            and strict_group
+            and matched_reused
+            and isinstance(previous_plan, dict)
+            and torch.is_tensor(current_group_log_prob)
+            and current_group_log_prob.requires_grad
+        ):
+            actual_group_pair_delta = (
+                float(previous_plan.get("objective", 0.0))
+                - current_objective_value
+            )
+            if abs(actual_group_pair_delta) >= group_min_delta:
+                preference_sign = 1.0 if actual_group_pair_delta > 0.0 else -1.0
+                if torch.is_tensor(anchor_group_log_prob):
+                    group_logit_difference = (
+                        current_group_log_prob - anchor_group_log_prob
+                    )
+                else:
+                    group_logit_difference = current_group_log_prob
+                actual_group_pair_raw = torch.nn.functional.softplus(
+                    -float(preference_sign) * group_logit_difference / 0.25
+                )
+                actual_group_actor_correct = float(
+                    (float(preference_sign) * group_logit_difference.detach() > 0.0)
+                    .float().cpu()
+                )
+                group_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_actor_replay_weight",
+                    0.20,
+                )), 0.0)
+                actual_group_pair_weighted = (
+                    float(group_weight)
+                    * float(matched_anchor_age_confidence)
+                    * actual_group_pair_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_group_pair_weighted
+                actual_group_pair_available = True
+
+                old_plan_feature = previous_plan.get("plan_feature")
+                if (
+                    torch.is_tensor(old_plan_feature)
+                    and torch.is_tensor(plan_feature)
+                    and plan_feature.numel() > 0
+                ):
+                    old_plan_feature = old_plan_feature.to(
+                        device=plan_feature.device, dtype=plan_feature.dtype
+                    )
+                    old_plan_value = self.actuator.den6_plan_critic(
+                        old_plan_feature.reshape(1, -1)
+                    ).reshape(-1)[0]
+                    critic_advantage = old_plan_value - plan_critic_value.reshape(())
+                    actual_group_critic_correct = float(
+                        (float(preference_sign) * critic_advantage.detach() > 0.0)
+                        .float().cpu()
+                    )
+                    critic_pair_loss = torch.nn.functional.softplus(
+                        -float(preference_sign) * critic_advantage / 0.25
+                    )
+                    critic_pair_weight = max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_actual_candidate_critic_replay_weight",
+                        0.20,
+                    )), 0.0)
+                    actual_group_critic_weighted = (
+                        float(critic_pair_weight)
+                        * float(matched_anchor_age_confidence)
+                        * critic_pair_loss
+                        / float(policy_backward_scale)
+                    )
+                    policy_loss = policy_loss + actual_group_critic_weighted
+
+                actuator_for_group = getattr(self, "actuator", None)
+                if actuator_for_group is not None:
+                    stats = getattr(
+                        actuator_for_group, "_den6_actual_group_stats", None
+                    )
+                    if not isinstance(stats, dict):
+                        stats = {}
+                        actuator_for_group._den6_actual_group_stats = stats
+                    row = stats.setdefault(factorized_group, {
+                        "comparisons": 0,
+                        "evidence": 0.0,
+                        "actor_correct": 0.0,
+                        "critic_correct": 0.0,
+                        "proposal_correct": 0.0,
+                        "proposal_comparisons": 0,
+                    })
+                    row["comparisons"] = int(row.get("comparisons", 0)) + 1
+                    row["evidence"] = float(row.get("evidence", 0.0)) + float(
+                        matched_anchor_age_confidence
+                    )
+                    row["actor_correct"] = float(
+                        row.get("actor_correct", 0.0)
+                    ) + float(actual_group_actor_correct)
+                    row["critic_correct"] = float(
+                        row.get("critic_correct", 0.0)
+                    ) + float(actual_group_critic_correct)
+
+        # A strict counterfactual has now consumed the pending anchor.  The
+        # previous implementation left this entry resident, so every revisit
+        # of a frame was permanently locked to its first group.  That produced
+        # the observed 22% Where rate and repeatedly sampled Amount/Gate/Fine
+        # even after their comparison was complete.  Releasing both records
+        # lets the next visit choose the group from current Actual evidence,
+        # uncertainty and coverage.  This is independent of Episode number and
+        # also applies when the RD delta is below the training margin: the
+        # comparison was still performed and must not monopolise the frame.
+        if mode == "ana_den6_online" and strict_group and matched_reused:
+            actuator_for_completion = getattr(self, "actuator", None)
+            if actuator_for_completion is not None:
+                completed_frame_key = str(
+                    plan_debug.get("matched_actual_frame_codec_key", "")
+                    if isinstance(plan_debug, dict) else ""
+                )
+                completed_anchor_key = str(
+                    plan_debug.get("matched_actual_anchor_key", "")
+                    if isinstance(plan_debug, dict) else ""
+                )
+                complete_pending = getattr(
+                    actuator_for_completion,
+                    "_complete_den6_pending_matched_group",
+                    None,
+                )
+                if callable(complete_pending):
+                    complete_pending(completed_frame_key, completed_anchor_key)
+                else:
+                    # Lightweight test/legacy actuator compatibility.
+                    pending_groups = getattr(
+                        actuator_for_completion,
+                        "_den6_pending_matched_groups",
+                        None,
+                    )
+                    if isinstance(pending_groups, OrderedDict) and completed_frame_key:
+                        pending_groups.pop(completed_frame_key, None)
+                    anchor_memory = getattr(
+                        actuator_for_completion,
+                        "_den6_matched_anchor_plan_memory",
+                        None,
+                    )
+                    if isinstance(anchor_memory, OrderedDict) and completed_anchor_key:
+                        anchor_memory.pop(completed_anchor_key, None)
+
+        def _compact_candidate_id(value):
+            """Stable 64-bit token for memory-resident set comparison."""
+            if isinstance(value, int):
+                return int(value)
+            digest = hashlib.blake2b(
+                str(value).encode("utf-8"), digest_size=8
+            ).digest()
+            return int.from_bytes(digest, byteorder="little", signed=False)
+
+        if (
+            mode == "ana_den6_online"
+            and isinstance(previous_plan, dict)
+            and isinstance(score_tensors, dict)
+            and isinstance(candidate_ids_by_operation, dict)
+            and isinstance(selected_ids_by_operation, dict)
+        ):
+            # Candidate-local supervision already contains both rate proxy and
+            # geometry risk.  This contrast supplies the orthogonal correction
+            # from the real codec rate; adding geometry here too measurably
+            # double-counted it in the controlled comparison.
+            actual_delta = float(previous_plan.get("objective", 0.0)) - current_objective_value
+            scale_floor = max(
+                abs(float(previous_plan.get("objective", 0.0)))
+                * max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_set_relative_scale",
+                    0.02,
+                )), 0.0),
+                1e-8,
+            )
+            actual_set_contrast_evidence = min(abs(actual_delta) / scale_floor, 1.0)
+            actual_set_contrast_evidence *= float(matched_anchor_age_confidence)
+            preference_sign = 1.0 if actual_delta > 0.0 else -1.0
+            temperature = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_set_temperature",
+                0.25,
+            )), 1e-4)
+            max_candidates = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_set_max_candidates",
+                128,
+            )), 1)
+            contrast_terms = []
+            previous_selected = previous_plan.get("selected", {})
+
+            for operation in ("Add", "Prune", "Adjust"):
+                if operation not in replay_operations:
+                    continue
+                scores = score_tensors.get(operation)
+                ids = candidate_ids_by_operation.get(operation, ())
+                if not torch.is_tensor(scores) or not scores.requires_grad:
+                    continue
+                if len(ids) != int(scores.numel()):
+                    continue
+                current_set = {
+                    _compact_candidate_id(value)
+                    for value in selected_ids_by_operation.get(operation, ())
+                }
+                previous_set = {
+                    _compact_candidate_id(value)
+                    for value in previous_selected.get(operation, ())
+                }
+                current_only = current_set - previous_set
+                previous_only = previous_set - current_set
+                if not current_only or not previous_only:
+                    continue
+                id_to_index = {
+                    _compact_candidate_id(value): index
+                    for index, value in enumerate(ids)
+                }
+                current_indices = [
+                    id_to_index[value] for value in sorted(current_only)
+                    if value in id_to_index
+                ][:max_candidates]
+                previous_indices = [
+                    id_to_index[value] for value in sorted(previous_only)
+                    if value in id_to_index
+                ][:max_candidates]
+                if not current_indices or not previous_indices:
+                    continue
+                current_mean = scores.reshape(-1).index_select(
+                    0, torch.as_tensor(current_indices, device=scores.device)
+                ).mean()
+                previous_mean = scores.reshape(-1).index_select(
+                    0, torch.as_tensor(previous_indices, device=scores.device)
+                ).mean()
+                contrast_terms.append(current_mean - previous_mean)
+                actual_set_contrast_operations += 1
+                actual_set_contrast_pairs += min(
+                    len(current_indices), len(previous_indices)
+                )
+            if contrast_terms and actual_set_contrast_evidence > 0.0:
+                # Credit the joint set difference once.  An improving joint
+                # plan does not prove that each individual operation improved.
+                actual_set_contrast_raw = torch.nn.functional.softplus(
+                    -float(preference_sign)
+                    * torch.stack(contrast_terms).mean()
+                    / float(temperature)
+                )
+                contrast_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_set_credit_weight",
+                    0.10,
+                )), 0.0)
+                actual_set_contrast_weighted = (
+                    float(contrast_weight)
+                    * float(actual_set_contrast_evidence)
+                    * actual_set_contrast_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_set_contrast_weighted
+        # Exploration may contract only after the behavior policy has produced
+        # a different candidate set on the *same frame* and Actual SparsePCGC
+        # has compared it with the incumbent.  Use a replay-sized EMA so one
+        # lucky comparison cannot terminate exploration.  This is evidence
+        # dependent and contains no Episode counter or target loss value.
+        actuator_for_evidence = getattr(self, "actuator", None)
+        if (
+            (actual_set_contrast_operations > 0 or actual_group_pair_available)
+            and actuator_for_evidence is not None
+        ):
+            completed = getattr(
+                actuator_for_evidence, "_den6_completed_matched_pairs", None
+            )
+            if completed is None:
+                completed = OrderedDict()
+                actuator_for_evidence._den6_completed_matched_pairs = completed
+            completed_key = "|".join((
+                str(cache_key), str(factorized_group), str(matched_anchor_hash)
+            ))
+            group_pair_evidence = (
+                min(
+                    abs(float(actual_group_pair_delta))
+                    / max(group_min_delta, 1e-8),
+                    1.0,
+                ) * float(matched_anchor_age_confidence)
+                if actual_group_pair_available else 0.0
+            )
+            completed[completed_key] = float(max(
+                actual_set_contrast_evidence, group_pair_evidence
+            ))
+            completed.move_to_end(completed_key)
+            completed_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_completed_matched_entries",
+                4096,
+            )), 1)
+            while len(completed) > completed_capacity:
+                completed.popitem(last=False)
+            evidence_target = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_evidence_target_pairs",
+                128,
+            )), 1)
+            evidence_sum = sum(min(max(float(value), 0.0), 1.0)
+                               for value in completed.values())
+            actuator_for_evidence._den6_actual_action_evidence = min(
+                evidence_sum / float(evidence_target), 1.0
+            )
+            actuator_for_evidence._den6_actual_action_comparisons = int(getattr(
+                actuator_for_evidence, "_den6_actual_action_comparisons", 0
+            )) + 1
+            # The outstanding evidence request is complete only after an
+            # executable candidate-set difference produced an Actual contrast.
+            frame_codec_key = str(plan_debug.get(
+                "matched_actual_frame_codec_key", ""
+            ))
+            anchor_key = str(plan_debug.get("matched_actual_anchor_key", ""))
+            pending = getattr(
+                actuator_for_evidence, "_den6_pending_matched_groups", None
+            )
+            if isinstance(pending, dict) and frame_codec_key:
+                pending.pop(frame_codec_key, None)
+            anchors = getattr(
+                actuator_for_evidence, "_den6_matched_anchor_plan_memory", None
+            )
+            if isinstance(anchors, dict) and anchor_key:
+                anchors.pop(anchor_key, None)
+        if isinstance(selected_ids_by_operation, dict) and matched_anchor_hash:
+            # Retain the best *executed training plan* for this frame as the
+            # comparison incumbent.  A worse exploratory sample must not
+            # replace the teacher for the next visit and cause a random walk.
+            # This memory never selects an inference action and contains no
+            # candidate-wise codec oracle result.
+            should_update_incumbent = (
+                not isinstance(previous_plan, dict)
+                or current_objective_value
+                < float(previous_plan.get("objective", float("inf")))
+            )
+            if should_update_incumbent:
+                plan_memory[matched_plan_key] = {
+                    "objective": current_objective_value,
+                    "anchor_hash": matched_anchor_hash,
+                    "factorized_group": factorized_group,
+                    "plan_feature": (
+                        plan_feature.detach().to(device="cpu", dtype=torch.float16)
+                        if torch.is_tensor(plan_feature) and plan_feature.numel() > 0
+                        else torch.empty((0,), dtype=torch.float16)
+                    ),
+                    "selected": {
+                        name: tuple(
+                            _compact_candidate_id(value)
+                            for value in selected_ids_by_operation.get(name, ())
+                        )
+                        for name in ("Add", "Prune", "Adjust")
+                    },
+                }
+                actual_set_incumbent_updated = True
+            if matched_anchor_hash:
+                plan_memory.move_to_end(matched_plan_key)
+            plan_memory_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_plan_memory_entries",
+                512,
+            )), 1)
+            while len(plan_memory) > plan_memory_capacity:
+                plan_memory.popitem(last=False)
+
+        # Candidate Actual replay: factorized Where exploration changes at most
+        # a few candidates.  Only an exact frame+anchor+decision-group match may
+        # supervise Actor/Critic/Proposal; cross-frame plan scalars remain solely
+        # in the plan-level replay and are never expanded into candidate labels.
+        actual_actor_replay_raw = objective.new_zeros(())
+        actual_actor_replay_weighted = objective.new_zeros(())
+        actual_actor_replay_pairs = 0
+        actual_actor_replay_exact_pairs = 0
+        actual_actor_replay_count = 0
+        actual_candidate_critic_replay_raw = objective.new_zeros(())
+        actual_candidate_critic_replay_weighted = objective.new_zeros(())
+        actual_proposal_replay_raw = objective.new_zeros(())
+        actual_proposal_replay_weighted = objective.new_zeros(())
+        actual_actor_replay_accuracy = 0.0
+        actual_candidate_critic_replay_accuracy = 0.0
+        actual_proposal_replay_accuracy = 0.0
+        explored_features = (
+            plan_debug.get("_actual_credit_explored_features", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        current_features = (
+            explored_features.get(replay_operation)
+            if isinstance(explored_features, dict) and replay_operation else None
+        )
+        explored_critic_features = (
+            plan_debug.get("_actual_credit_explored_critic_features", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        current_critic_features = (
+            explored_critic_features.get(replay_operation)
+            if isinstance(explored_critic_features, dict) and replay_operation else None
+        )
+        if replay_operation == "All":
+            feature_parts = []
+            critic_parts = []
+            for operation in replay_operations:
+                features = explored_features.get(operation)
+                critic_features = explored_critic_features.get(operation)
+                if not torch.is_tensor(features) or features.numel() == 0:
+                    continue
+                if (not torch.is_tensor(critic_features)
+                        or critic_features.shape != features.shape):
+                    # Never align the Actor's rows with a different Critic set.
+                    feature_parts = []
+                    critic_parts = []
+                    break
+                feature_parts.append(features)
+                critic_parts.append(critic_features)
+            current_features = torch.cat(feature_parts, dim=0) if feature_parts else None
+            current_critic_features = torch.cat(critic_parts, dim=0) if critic_parts else None
+        actor_replay = getattr(self, "_den6_actual_actor_replay", None)
+        if actor_replay is None:
+            actor_replay = []
+            self._den6_actual_actor_replay = actor_replay
+        if (
+            actual_residual_learning
+            and torch.is_tensor(current_features)
+            and current_features.ndim == 2
+            and int(current_features.shape[0]) > 0
+        ):
+            current_actor_scores = self.actuator.den6_candidate_actor(
+                current_features
+            ).reshape(-1)
+            current_proposal_scores = self.actuator.den6_candidate_proposal(
+                current_features
+            ).reshape(-1)
+            current_critic_output = (
+                self.actuator.den6_candidate_critic(
+                    current_critic_features.detach()
+                )
+                if torch.is_tensor(current_critic_features)
+                and current_critic_features.ndim == 2
+                and int(current_critic_features.shape[0]) > 0
+                else None
+            )
+            current_critic_scores = (
+                current_critic_output[:, 0].reshape(-1)
+                if torch.is_tensor(current_critic_output) else None
+            )
+            current_critic_uncertainty = (
+                torch.nn.functional.softplus(
+                    current_critic_output[:, 1]
+                ).clamp_min(1e-4).reshape(-1)
+                if torch.is_tensor(current_critic_output) else None
+            )
+            minimum_delta = max(float(getattr(
+                self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
+            )), 0.0)
+            cross_frame_weight = min(max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_actor_cross_frame_weight",
+                0.25,
+            )), 0.0), 1.0)
+            replay_batch = max(int(getattr(
+                self.args, "heuristic_guidance_online_actual_actor_replay_batch", 16
+            )), 1)
+            preference_terms = []
+            critic_preference_terms = []
+            proposal_preference_terms = []
+            actor_preference_accuracies = []
+            critic_preference_accuracies = []
+            proposal_preference_accuracies = []
+            current_advantage_value = float(advantage.detach().cpu())
+            for record in reversed(actor_replay):
+                if len(preference_terms) >= replay_batch:
+                    break
+                if (
+                    str(record.get("sequence_key", "")) != str(sequence_key)
+                    or str(record.get("factorized_group", "")) != factorized_group
+                    or str(record.get("operation", "")) != replay_operation
+                ):
+                    continue
+                exact_pair = bool(
+                    str(record.get("cache_key", "")) == str(cache_key)
+                    and matched_anchor_hash
+                    and str(record.get("anchor_hash", "")) == matched_anchor_hash
+                )
+                # A plan scalar cannot label individual candidates across
+                # frames/anchors.  Such records remain available to Plan Critic
+                # replay, but never become candidate Actor/Proposal teachers.
+                if not exact_pair:
+                    continue
+                delta = float(record.get("actual_rd", 0.0)) - current_objective_value
+                if abs(delta) < minimum_delta:
+                    continue
+                old_features = record.get("candidate_features")
+                if not torch.is_tensor(old_features) or old_features.numel() == 0:
+                    continue
+                old_features = old_features.to(
+                    device=current_features.device,
+                    dtype=current_features.dtype,
+                )
+                old_actor_scores = self.actuator.den6_candidate_actor(
+                    old_features
+                ).reshape(-1)
+                current_is_better = 1.0 if delta > 0.0 else -1.0
+                actor_difference = current_actor_scores.mean() - old_actor_scores.mean()
+                preference_terms.append(
+                    torch.nn.functional.softplus(
+                        -float(current_is_better)
+                        * actor_difference / 0.25
+                    )
+                )
+                actor_preference_accuracies.append(float(
+                    (float(current_is_better) * actor_difference.detach() > 0.0).cpu()
+                ))
+                old_proposal_scores = self.actuator.den6_candidate_proposal(
+                    old_features
+                ).reshape(-1)
+                proposal_difference = (
+                    current_proposal_scores.mean() - old_proposal_scores.mean()
+                )
+                proposal_preference_terms.append(torch.nn.functional.softplus(
+                    -float(current_is_better) * proposal_difference / 0.25
+                ))
+                proposal_preference_accuracies.append(float(
+                    (float(current_is_better) * proposal_difference.detach() > 0.0).cpu()
+                ))
+                old_critic_features = record.get("candidate_critic_features")
+                if (
+                    current_critic_scores is not None
+                    and torch.is_tensor(old_critic_features)
+                    and old_critic_features.numel() > 0
+                ):
+                    old_critic_features = old_critic_features.to(
+                        device=current_features.device,
+                        dtype=current_features.dtype,
+                    )
+                    old_critic_output = self.actuator.den6_candidate_critic(
+                        old_critic_features.detach()
+                    )
+                    old_critic_scores = old_critic_output[:, 0].reshape(-1)
+                    old_critic_uncertainty = torch.nn.functional.softplus(
+                        old_critic_output[:, 1]
+                    ).clamp_min(1e-4).reshape(-1)
+                    critic_difference = (
+                        current_critic_scores.mean() - old_critic_scores.mean()
+                    )
+                    preference_loss = torch.nn.functional.softplus(
+                        -float(current_is_better)
+                        * critic_difference / 0.25
+                    )
+                    # The value difference is a group-level Actual advantage,
+                    # not an individual-candidate label.  Calibrate both its
+                    # magnitude and uncertainty so deterministic LCB fallback
+                    # has a meaningful unit after enough matched evidence.
+                    advantage_scale = max(minimum_delta, 0.01)
+                    target_difference = critic_difference.new_tensor(
+                        math.tanh(float(delta) / float(advantage_scale))
+                    )
+                    regression_loss = torch.nn.functional.smooth_l1_loss(
+                        critic_difference,
+                        target_difference,
+                        beta=0.25,
+                    )
+                    predicted_uncertainty = torch.sqrt(
+                        current_critic_uncertainty.mean().square()
+                        + old_critic_uncertainty.mean().square()
+                    )
+                    uncertainty_target = (
+                        critic_difference.detach() - target_difference
+                    ).abs().add(0.05).clamp(max=2.0)
+                    calibration_loss = torch.nn.functional.smooth_l1_loss(
+                        predicted_uncertainty,
+                        uncertainty_target,
+                        beta=0.25,
+                    )
+                    critic_preference_terms.append(
+                        preference_loss + regression_loss + 0.1 * calibration_loss
+                    )
+                    critic_preference_accuracies.append(float(
+                        (float(current_is_better) * critic_difference.detach() > 0.0).cpu()
+                    ))
+                actual_actor_replay_pairs += 1
+                actual_actor_replay_exact_pairs += int(exact_pair)
+            if preference_terms:
+                actual_actor_replay_accuracy = sum(
+                    actor_preference_accuracies
+                ) / float(max(len(actor_preference_accuracies), 1))
+                actual_actor_replay_raw = torch.stack(preference_terms).mean()
+                actual_actor_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_actor_replay_weight",
+                    0.20,
+                )), 0.0)
+                actual_actor_replay_weighted = (
+                    float(actual_actor_weight)
+                    * float(matched_anchor_age_confidence)
+                    * actual_actor_replay_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_actor_replay_weighted
+            if critic_preference_terms:
+                actual_candidate_critic_replay_accuracy = sum(
+                    critic_preference_accuracies
+                ) / float(max(len(critic_preference_accuracies), 1))
+                actual_candidate_critic_replay_raw = torch.stack(
+                    critic_preference_terms
+                ).mean()
+                critic_replay_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_candidate_critic_replay_weight",
+                    0.20,
+                )), 0.0)
+                actual_candidate_critic_replay_weighted = (
+                    float(critic_replay_weight)
+                    * float(matched_anchor_age_confidence)
+                    * actual_candidate_critic_replay_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_candidate_critic_replay_weighted
+                if actuator_for_evidence is not None:
+                    comparison_count = int(getattr(
+                        actuator_for_evidence,
+                        "_den6_actual_candidate_critic_comparisons",
+                        0,
+                    )) + len(critic_preference_terms)
+                    coverage = min(float(comparison_count) / 32.0, 1.0)
+                    observed_quality = coverage * max(
+                        2.0 * (actual_candidate_critic_replay_accuracy - 0.5),
+                        0.0,
+                    )
+                    previous_quality = min(max(float(getattr(
+                        actuator_for_evidence,
+                        "_den6_actual_candidate_critic_quality",
+                        0.0,
+                    )), 0.0), 1.0)
+                    actuator_for_evidence._den6_actual_candidate_critic_quality = (
+                        0.9 * previous_quality
+                        + 0.1 * min(max(observed_quality, 0.0), 1.0)
+                    )
+                    actuator_for_evidence._den6_actual_candidate_critic_comparisons = (
+                        comparison_count
+                    )
+            if proposal_preference_terms:
+                actual_proposal_replay_accuracy = sum(
+                    proposal_preference_accuracies
+                ) / float(max(len(proposal_preference_accuracies), 1))
+                actual_proposal_replay_raw = torch.stack(
+                    proposal_preference_terms
+                ).mean()
+                proposal_replay_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_actor_replay_weight",
+                    0.20,
+                )), 0.0)
+                actual_proposal_replay_weighted = (
+                    float(proposal_replay_weight)
+                    * float(matched_anchor_age_confidence)
+                    * actual_proposal_replay_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_proposal_replay_weighted
+                if actuator_for_evidence is not None:
+                    # Forward authority requires both the final Actor and the
+                    # membership Proposal to order the same matched groups
+                    # correctly.  Proposal accuracy alone previously let a
+                    # good subset scorer grant authority to a wrong Actor.
+                    joint_actor_proposal_accuracy = min(
+                        float(actual_actor_replay_accuracy),
+                        float(actual_proposal_replay_accuracy),
+                    )
+                    previous_count = int(getattr(
+                        actuator_for_evidence, "_den6_matched_actual_pair_count", 0
+                    ))
+                    batch_count = len(proposal_preference_terms)
+                    matched_count = previous_count + batch_count
+                    previous_accuracy = float(getattr(
+                        actuator_for_evidence,
+                        "_den6_matched_actual_pair_accuracy",
+                        0.0,
+                    ))
+                    actuator_for_evidence._den6_matched_actual_pair_accuracy = (
+                        (
+                            previous_accuracy * float(previous_count)
+                            + float(joint_actor_proposal_accuracy) * float(batch_count)
+                        )
+                        / float(max(matched_count, 1))
+                    )
+                    actuator_for_evidence._den6_matched_actual_pair_count = matched_count
+                    group_stats = getattr(
+                        actuator_for_evidence, "_den6_actual_group_stats", None
+                    )
+                    if isinstance(group_stats, dict) and factorized_group in group_stats:
+                        group_row = group_stats[factorized_group]
+                        group_row["proposal_comparisons"] = int(
+                            group_row.get("proposal_comparisons", 0)
+                        ) + 1
+                        group_row["proposal_correct"] = float(
+                            group_row.get("proposal_correct", 0.0)
+                        ) + float(actual_proposal_replay_accuracy)
+            if (
+                actuator_for_evidence is not None
+                and bool(replay_operations)
+                and actual_group_pair_available
+                and actual_actor_replay_pairs > 0
+            ):
+                # Where authority should reflect the changed candidate group,
+                # not the nearly identical mean log-probability of the full
+                # thousand-candidate plan.  Replace this pair's coarse plan
+                # diagnostic with the candidate-group replay observation.
+                group_stats = getattr(
+                    actuator_for_evidence, "_den6_actual_group_stats", None
+                )
+                if isinstance(group_stats, dict) and factorized_group in group_stats:
+                    group_row = group_stats[factorized_group]
+                    group_row["actor_correct"] = float(
+                        group_row.get("actor_correct", 0.0)
+                    ) - float(actual_group_actor_correct) + float(
+                        actual_actor_replay_accuracy
+                    )
+                    if critic_preference_terms:
+                        group_row["critic_correct"] = float(
+                            group_row.get("critic_correct", 0.0)
+                        ) - float(actual_group_critic_correct) + float(
+                            actual_candidate_critic_replay_accuracy
+                        )
+            # Retain only the actually perturbed candidates.  Keeping the
+            # complete composite-plan ID list (hundreds/thousands of Python
+            # strings per record) made the bounded tensor replay unbounded in
+            # host memory and contributed no candidate-level contrast.
+            explored_indices_for_replay = (
+                plan_debug.get("_actual_credit_explored_indices", {}).get(
+                    replay_operation, ()
+                )
+                if isinstance(plan_debug, dict) and replay_operation else ()
+            )
+            operation_ids_for_replay = (
+                tuple(candidate_ids_by_operation.get(replay_operation, ()))
+                if isinstance(candidate_ids_by_operation, dict) else ()
+            )
+            selected_ids_for_replay = tuple(
+                operation_ids_for_replay[int(index)]
+                for index in explored_indices_for_replay
+                if 0 <= int(index) < len(operation_ids_for_replay)
+            )
+            if replay_operation == "All":
+                selected_ids_for_replay = tuple(
+                    (operation, candidate_ids_by_operation[operation][int(index)])
+                    for operation in replay_operations
+                    for index in plan_debug.get(
+                        "_actual_credit_explored_indices", {}
+                    ).get(operation, ())
+                    if 0 <= int(index) < len(candidate_ids_by_operation.get(operation, ()))
+                )
+            actor_replay.append({
+                "sequence_key": str(sequence_key),
+                "cache_key": str(cache_key),
+                "factorized_group": str(factorized_group),
+                "operation": str(replay_operation),
+                "anchor_hash": str(matched_anchor_hash),
+                "candidate_features": current_features.detach().to(
+                    device="cpu", dtype=torch.float16
+                ),
+                "candidate_critic_features": (
+                    current_critic_features.detach().to(
+                        device="cpu", dtype=torch.float16
+                    )
+                    if torch.is_tensor(current_critic_features)
+                    else torch.empty((0, 7), dtype=torch.float16)
+                ),
+                "selected_candidate_ids": selected_ids_for_replay,
+                "behavior_probability": float(
+                    log_prob.detach().float().mean().exp().clamp(max=1.0).cpu()
+                ),
+                "actual_rate": float(objective.detach().cpu()),
+                "geometry": float(geometry_objective_for_rd.detach().cpu()),
+                "actual_rd": float(current_objective_value),
+                "actual_advantage": float(current_advantage_value),
+                "actual_advantage_vs_noop": float(-current_objective_value),
+            })
+            replay_capacity = max(int(getattr(
+                self.args, "heuristic_guidance_online_actual_actor_replay_entries", 512
+            )), 1)
+            if len(actor_replay) > replay_capacity:
+                del actor_replay[:-replay_capacity]
+        actual_actor_replay_count = len(actor_replay)
+        local_plan_credit_debug = {}
+        for state_name, arg_name, debug_name in (
+            (
+                "den6_online_operation_local_credit_loss",
+                "heuristic_guidance_online_operation_local_credit_weight",
+                "operation_local_credit",
+            ),
+            (
+                "den6_online_amount_local_credit_loss",
+                "heuristic_guidance_online_amount_local_credit_weight",
+                "amount_local_credit",
+            ),
+            (
+                "den6_online_fine_local_credit_loss",
+                "heuristic_guidance_online_fine_local_credit_weight",
+                "fine_local_credit",
+            ),
+        ):
+            local_term = state.get(state_name, None)
+            local_weight = max(float(getattr(self.args, arg_name, 0.0)), 0.0)
+            weighted_term = objective.new_zeros(())
+            if (
+                mode == "ana_den6_online"
+                and local_weight > 0.0
+                and torch.is_tensor(local_term)
+                and local_term.requires_grad
+            ):
+                # The outer multiplier belongs to score-function credit.  Keep
+                # normalized differentiable local targets at their configured
+                # effective weights, as for candidate-local credit above.
+                weighted_term = (
+                    float(local_weight) * local_term.float().mean()
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + weighted_term
+            local_plan_credit_debug[f"{debug_name}_raw"] = (
+                float(local_term.detach().float().mean().cpu())
+                if torch.is_tensor(local_term) else 0.0
+            )
+            local_plan_credit_debug[f"{debug_name}_weighted"] = float(
+                weighted_term.detach().cpu()
+            )
+        entropy_raw = entropy.float().mean() if torch.is_tensor(entropy) else objective.new_zeros(())
+        group_authority_fn = getattr(
+            actuator_for_evidence, "_den6_group_actual_authority", None
+        ) if actuator_for_evidence is not None else None
+        if callable(group_authority_fn):
+            preference_groups = (
+                ("WhereAll", "Amount", "Gate", "Fine")
+                if bool(getattr(
+                    self.args,
+                    "heuristic_guidance_online_simultaneous_operation_exploration",
+                    False,
+                ))
+                else (
+                    "AddWhere", "PruneWhere", "AdjustWhere",
+                    "Amount", "Gate", "Fine",
+                )
+            )
+            preference_quality = sum(
+                float(group_authority_fn(group))
+                for group in preference_groups
+            ) / float(len(preference_groups))
+        else:
+            preference_quality = 0.0
+        entropy_min_fraction = min(max(float(getattr(
+            self.args, "heuristic_guidance_online_entropy_min_fraction", 0.10
+        )), 0.0), 1.0)
+        effective_entropy_weight = float(entropy_weight) * (
+            entropy_min_fraction
+            + (1.0 - entropy_min_fraction) * (1.0 - preference_quality)
+        )
+        entropy_weighted = (
+            -effective_entropy_weight * entropy_raw / float(policy_backward_scale)
+            if mode == "ana_den6_online"
+            else -effective_entropy_weight * entropy_raw
+        )
+        if torch.is_tensor(entropy):
+            policy_loss = policy_loss + entropy_weighted
+        # hard整数化されたExact Amount/Fineとoperation Gateは通常のGeometry
+        # lossから微分できない。圧縮改善を保つplanだけに限定し、実測Geometry
+        # の改善を両方の方策へ返す。Whereはcandidate-local RD教師ですでに
+        # geometry riskを受けるため、同じglobal scalarを重ねて高分散化しない。
+        geometry_policy_raw = objective.new_zeros(())
+        geometry_policy_weighted = objective.new_zeros(())
+        geometry_advantage = objective.new_zeros(())
+        geometry_guard_passed = False
+        geometry_baseline_source = "unavailable"
+        amount_log_prob = state.get("den6_online_amount_log_prob", None)
+        action_log_prob = state.get("den6_online_action_log_prob", None)
+        from .utils.training.sparsepcgc_actual_credit import (
+            sparsepcgc_credit_training, matched_geometry_advantage,
+        )
+        native_geometry_credit = sparsepcgc_credit_training(self.args)
+        if (
+            mode == "ana_den6_online"
+            and not actor_critic_selection
+            and not native_geometry_credit
+            and torch.is_tensor(geometry)
+            and torch.is_tensor(amount_log_prob)
+        ):
+            geometry_baseline = getattr(
+                self, "_den6_online_geometry_baseline", None
+            )
+            if geometry_baseline is None:
+                geometry_baseline = OrderedDict()
+                self._den6_online_geometry_baseline = geometry_baseline
+            geometry_objective = torch.nan_to_num(
+                geometry.float().mean(), nan=0.0, posinf=1e3, neginf=0.0
+            )
+            geometry_seen = cache_key in geometry_baseline
+            sequence_geometry_baseline = getattr(
+                self, "_den6_online_sequence_geometry_baseline", None
+            )
+            if sequence_geometry_baseline is None:
+                sequence_geometry_baseline = OrderedDict()
+                self._den6_online_sequence_geometry_baseline = sequence_geometry_baseline
+            sequence_geometry_seen = sequence_key in sequence_geometry_baseline
+            if geometry_seen:
+                previous_geometry = float(geometry_baseline[cache_key])
+                geometry_baseline_source = "frame"
+            elif sequence_geometry_seen:
+                previous_geometry = float(sequence_geometry_baseline[sequence_key])
+                geometry_baseline_source = "sequence"
+            else:
+                previous_geometry = float(geometry_objective.detach().cpu())
+                geometry_baseline_source = "initialize"
+            compression_tolerance = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_geometry_compression_tolerance",
+                0.25,
+            )), 0.0)
+            geometry_guard_passed = bool(
+                float(objective.detach().cpu())
+                <= min(
+                    0.0,
+                    float(effective_baseline_t.detach().cpu()) + compression_tolerance,
+                )
+            )
+            if geometry_joint_policy:
+                # Positive Actual is not a reason to disable learning which
+                # reduces distortion while holding the *current* rate.
+                memory = getattr(self, '_geometry_policy_compression_baseline', None)
+                if memory is None:
+                    memory = OrderedDict()
+                    self._geometry_policy_compression_baseline = memory
+                current_rate = float(objective.detach().cpu())
+                previous_rate = memory.get(cache_key)
+                geometry_guard_passed = bool(previous_rate is not None and
+                    current_rate <= previous_rate + compression_tolerance)
+                memory[cache_key] = current_rate if previous_rate is None else (
+                    (1. - baseline_alpha) * previous_rate + baseline_alpha * current_rate)
+                memory.move_to_end(cache_key)
+                while len(memory) > 4096:
+                    memory.popitem(last=False)
+            geometry_reference_available = bool(
+                geometry_seen or sequence_geometry_seen
+            )
+            if geometry_reference_available and geometry_guard_passed:
+                previous_geometry_t = geometry_objective.new_tensor(previous_geometry)
+                geometry_advantage = (
+                    previous_geometry_t - geometry_objective.detach()
+                ) / previous_geometry_t.abs().clamp_min(1e-8)
+                geometry_clip = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_geometry_advantage_clip",
+                    0.25,
+                )), 0.0)
+                if geometry_clip > 0.0:
+                    geometry_advantage = geometry_advantage.clamp(
+                        -geometry_clip, geometry_clip
+                    )
+                geometry_policy_log_probs = [amount_log_prob.float().mean()]
+                if torch.is_tensor(action_log_prob) and action_log_prob.requires_grad:
+                    geometry_policy_log_probs.append(action_log_prob.float().mean())
+                geometry_policy_raw = -geometry_advantage * torch.stack(
+                    geometry_policy_log_probs
+                ).mean()
+                geometry_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_geometry_policy_weight",
+                    0.10,
+                )), 0.0)
+                geometry_policy_weighted = geometry_weight * geometry_policy_raw
+                if mode == "ana_den6_online":
+                    geometry_policy_weighted = (
+                        geometry_policy_weighted / float(policy_backward_scale)
+                    )
+                policy_loss = policy_loss + geometry_policy_weighted
+            if geometry_guard_passed:
+                updated_geometry = (
+                    (1.0 - baseline_alpha) * previous_geometry
+                    + baseline_alpha * float(geometry_objective.detach().cpu())
+                    if geometry_seen else float(geometry_objective.detach().cpu())
+                )
+                geometry_baseline[cache_key] = updated_geometry
+                geometry_baseline.move_to_end(cache_key)
+                while len(geometry_baseline) > 4096:
+                    geometry_baseline.popitem(last=False)
+                previous_sequence_geometry = float(sequence_geometry_baseline.get(
+                    sequence_key, float(geometry_objective.detach().cpu())
+                ))
+                updated_sequence_geometry = (
+                    (1.0 - baseline_alpha) * previous_sequence_geometry
+                    + baseline_alpha * float(geometry_objective.detach().cpu())
+                    if sequence_geometry_seen
+                    else float(geometry_objective.detach().cpu())
+                )
+                sequence_geometry_baseline[sequence_key] = float(
+                    updated_sequence_geometry
+                )
+                sequence_geometry_baseline.move_to_end(sequence_key)
+                while len(sequence_geometry_baseline) > 128:
+                    sequence_geometry_baseline.popitem(last=False)
+
+        if (native_geometry_credit and not actor_critic_selection
+                and torch.is_tensor(geometry)
+                and torch.is_tensor(current_group_log_prob)
+                and current_group_log_prob.requires_grad):
+            memory = getattr(self, '_sparsepcgc_geometry_pair_memory', None)
+            if memory is None:
+                memory = OrderedDict()
+                self._sparsepcgc_geometry_pair_memory = memory
+            advantage_value = matched_geometry_advantage(
+                memory, frame_key=cache_key, anchor_hash=matched_anchor_hash,
+                group=factorized_group, reused=matched_reused,
+                rate=float(objective.detach().cpu()),
+                geometry=float(geometry_objective_for_rd.detach().cpu()),
+                tolerance=float(getattr(self.args, 'heuristic_guidance_online_geometry_compression_tolerance', .05)),
+                clip=float(getattr(self.args, 'heuristic_guidance_online_geometry_advantage_clip', .25)))
+            geometry_baseline_source = 'matched_frame_anchor' if advantage_value is not None else 'matched_unavailable'
+            if advantage_value is not None:
+                geometry_guard_passed = True
+                geometry_advantage = objective.new_tensor(advantage_value)
+                geometry_policy_raw = -geometry_advantage * current_group_log_prob.float().mean()
+                # Native Actual RD already contains cp_lambda_geom * G.
+                # A second normalized geometry-only reward gave the same
+                # Amount action a conflicting teacher (measured cosine -0.975).
+                # Retain the constrained auxiliary only if RD has no geometry;
+                # never change the declared compression/geometry objective.
+                if float(actor_geometry_weight) <= 0.0:
+                    geometry_policy_weighted = (
+                        max(float(getattr(self.args, 'heuristic_guidance_online_geometry_policy_weight', .55)), 0.)
+                        * geometry_policy_raw / float(policy_backward_scale))
+                    policy_loss = policy_loss + geometry_policy_weighted
+
+        # Learn edit efficiency as a constrained tie-break, not as a fixed
+        # operation-ratio target.  Only an Amount/Gate/Fine action whose Actual
+        # compression and geometry stay within the previous same-frame,
+        # same-decision envelope receives credit for using fewer operations.
+        # A performance-regressing action receives no sparsity reward and is
+        # left to the ordinary RD losses.  Thus the model can choose any ratio,
+        # including a larger one when it is needed for better RD performance.
+        efficiency_policy_raw = objective.new_zeros(())
+        efficiency_policy_weighted = objective.new_zeros(())
+        efficiency_advantage = objective.new_zeros(())
+        efficiency_guard_passed = False
+        efficiency_baseline_available = False
+        # Prefer the exact plan-debug tensor.  Some forward wrappers retain the
+        # public state dictionary from the pre-edit branch, while the attached
+        # exact-plan debug is the object that actually produced the encoded
+        # point cloud.  172318/155935 exposed this mismatch as
+        # eff_op_ratio=0 despite selected_amount_ratios summing to ~0.00248.
+        operation_ratio = plan_debug_state.get(
+            "_actor_critic_selected_operation_ratio",
+            state.get(
+                "den6_online_actor_critic_operation_ratio", objective.new_zeros(())
+            ),
+        )
+        if not torch.is_tensor(operation_ratio):
+            operation_ratio = objective.new_tensor(float(operation_ratio))
+        operation_ratio_value = float(operation_ratio.detach().float().mean().cpu())
+        if operation_ratio_value <= 0.0:
+            selected_ratio_rows = plan_debug_state.get("selected_amount_ratios", {})
+            if isinstance(selected_ratio_rows, dict):
+                fallback_ratio = sum(
+                    max(float(selected_ratio_rows.get(name, 0.0) or 0.0), 0.0)
+                    for name in ("Add", "Prune", "Adjust")
+                )
+                if fallback_ratio > 0.0:
+                    operation_ratio = objective.new_tensor(fallback_ratio)
+                    operation_ratio_value = float(fallback_ratio)
+        if (
+            mode == "ana_den6_online"
+            and factorized_actual_credit
+            and torch.is_tensor(geometry)
+            and torch.is_tensor(log_prob)
+            and log_prob.requires_grad
+        ):
+            efficiency_memory = getattr(
+                self, "_den6_online_efficiency_baseline", None
+            )
+            if efficiency_memory is None:
+                efficiency_memory = OrderedDict()
+                self._den6_online_efficiency_baseline = efficiency_memory
+            # Efficiency is a property of the complete executed plan, not of
+            # the currently explored factor.  Keying it by factorized_group
+            # left it inactive on every Where Step and on every deterministic
+            # Step after exploration (the 172318 log consequently reported
+            # eff_loss=0 throughout).  Same-frame/codec isolation still keeps
+            # intrinsic frame difficulty out of this comparison.
+            efficiency_key = str(cache_key)
+            previous_efficiency = efficiency_memory.get(efficiency_key)
+            current_geometry_value = float(
+                geometry_objective_for_rd.detach().cpu()
+            )
+            current_compression_value = float(objective.detach().cpu())
+            if isinstance(previous_efficiency, dict):
+                efficiency_baseline_available = True
+                previous_compression = float(previous_efficiency["compression"])
+                previous_geometry_value = float(previous_efficiency["geometry"])
+                previous_operation_ratio = float(previous_efficiency["operation_ratio"])
+                compression_tolerance = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_efficiency_compression_tolerance",
+                    0.02,
+                )), 0.0)
+                geometry_relative_tolerance = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_efficiency_geometry_relative_tolerance",
+                    0.005,
+                )), 0.0)
+                compression_ok = bool(
+                    current_compression_value
+                    <= min(0.0, previous_compression + compression_tolerance)
+                )
+                if geometry_joint_policy:
+                    compression_ok = current_compression_value <= previous_compression + compression_tolerance
+                geometry_ok = bool(
+                    current_geometry_value
+                    <= previous_geometry_value
+                    + abs(previous_geometry_value) * geometry_relative_tolerance
+                    + 1e-12
+                )
+                efficiency_guard_passed = bool(compression_ok and geometry_ok)
+                if efficiency_guard_passed:
+                    efficiency_advantage = operation_ratio.new_tensor(
+                        (previous_operation_ratio - operation_ratio_value)
+                        / max(previous_operation_ratio, 1e-6)
+                    )
+                    efficiency_clip = max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_efficiency_advantage_clip",
+                        0.25,
+                    )), 0.0)
+                    if efficiency_clip > 0.0:
+                        efficiency_advantage = efficiency_advantage.clamp(
+                            -efficiency_clip, efficiency_clip
+                        )
+                    score_function_term = (
+                        -efficiency_advantage.detach() * log_prob.float().mean()
+                    )
+                    # A hard selected bin changes only at a decision boundary.
+                    # Add a zero-forward, continuous backward tie-break through
+                    # the STE operation ratio so Amount/Gate/Fine can improve
+                    # between boundaries without changing the reported loss.
+                    direct_scale = max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_efficiency_direct_grad_scale",
+                        0.10,
+                    )), 0.0)
+                    normalized_ratio = (
+                        operation_ratio.float().mean()
+                        / max(previous_operation_ratio, 1e-6)
+                    )
+                    direct_term = float(direct_scale) * (
+                        normalized_ratio - normalized_ratio.detach()
+                    )
+                    efficiency_policy_raw = score_function_term + direct_term
+                    efficiency_weight = max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_efficiency_policy_weight",
+                        0.25,
+                    )), 0.0)
+                    efficiency_policy_weighted = (
+                        float(efficiency_weight)
+                        * efficiency_policy_raw
+                        / float(policy_backward_scale)
+                    )
+                    policy_loss = policy_loss + efficiency_policy_weighted
+            # Initialize immediately, then update only inside the feasible RD
+            # envelope.  Bad compression/geometry samples therefore cannot
+            # relax the reference and manufacture a false sparsity reward.
+            if previous_efficiency is None or efficiency_guard_passed:
+                if isinstance(previous_efficiency, dict):
+                    efficiency_memory[efficiency_key] = {
+                        "compression": (
+                            (1.0 - baseline_alpha) * float(previous_efficiency["compression"])
+                            + baseline_alpha * current_compression_value
+                        ),
+                        "geometry": (
+                            (1.0 - baseline_alpha) * float(previous_efficiency["geometry"])
+                            + baseline_alpha * current_geometry_value
+                        ),
+                        # Retain the best feasible edit ratio as the frontier;
+                        # an equally safe but larger plan must not relax it.
+                        "operation_ratio": min(
+                            float(previous_efficiency["operation_ratio"]),
+                            operation_ratio_value,
+                        ),
+                    }
+                else:
+                    efficiency_memory[efficiency_key] = {
+                        "compression": current_compression_value,
+                        "geometry": current_geometry_value,
+                        "operation_ratio": operation_ratio_value,
+                    }
+                efficiency_memory.move_to_end(efficiency_key)
+                while len(efficiency_memory) > 4096:
+                    efficiency_memory.popitem(last=False)
+        adaptive_amount_entropy = objective.new_zeros(())
+        adaptive_amount_entropy_weighted = objective.new_zeros(())
+        if mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
+            amount_entropy = state.get("network_only_amount_entropy", None)
+            ratio_mean = state.get("network_only_total_ratio_mean", None)
+            shares_mean = state.get("network_only_shares_mean", None)
+            if (
+                torch.is_tensor(amount_entropy)
+                and torch.is_tensor(ratio_mean)
+                and torch.is_tensor(shares_mean)
+            ):
+                ratio_boundary = max(
+                    1.0 - float(ratio_mean.detach().float().mean().cpu()) / 0.0015,
+                    0.0,
+                )
+                share_boundary = max(
+                    1.0 - float(shares_mean.detach().float().min().cpu()) / 0.15,
+                    0.0,
+                )
+                collapse_severity = min(max(ratio_boundary, share_boundary), 1.0)
+                adaptive_weight = max(
+                    float(getattr(self.args, "network_only_adaptive_entropy_weight", 0.50)),
+                    0.0,
+                ) * collapse_severity
+                adaptive_amount_entropy = amount_entropy.float().mean()
+                adaptive_amount_entropy_weighted = -adaptive_weight * adaptive_amount_entropy
+                policy_loss = policy_loss + adaptive_amount_entropy_weighted
+        self.last_discrete_policy_debug = {
+            "objective": float(objective.detach().cpu()),
+            "objective_baseline": float(previous),
+            "objective_baseline_source": str(baseline_source),
+            "objective_baseline_factorized_group": str(factorized_group),
+            "objective_sequence_baseline": float(updated_sequence),
+            "objective_effective_baseline": float(effective_baseline_t.detach().cpu()),
+            "global_actual_credit_available": bool(global_credit_available),
+            "global_actual_credit_confidence": float(global_credit_confidence),
+            "global_actual_credit_weight": float(global_actual_credit_weight),
+            "advantage": float(advantage.detach().cpu()),
+            "actual_set_contrast_raw": float(actual_set_contrast_raw.detach().cpu()),
+            "actual_set_contrast_weighted": float(
+                actual_set_contrast_weighted.detach().cpu()
+            ),
+            "actual_set_contrast_operations": int(actual_set_contrast_operations),
+            "actual_set_contrast_pairs": int(actual_set_contrast_pairs),
+            "actual_set_contrast_evidence": float(actual_set_contrast_evidence),
+            "actual_set_incumbent_updated": bool(actual_set_incumbent_updated),
+            "actual_actor_replay_raw": float(actual_actor_replay_raw.detach().cpu()),
+            "actual_actor_replay_weighted": float(
+                actual_actor_replay_weighted.detach().cpu()
+            ),
+            "actual_actor_replay_pairs": int(actual_actor_replay_pairs),
+            "actual_actor_replay_exact_pairs": int(actual_actor_replay_exact_pairs),
+            "actual_actor_replay_count": int(actual_actor_replay_count),
+            "actual_actor_replay_accuracy": float(actual_actor_replay_accuracy),
+            "actual_group_pair_available": bool(actual_group_pair_available),
+            "actual_group_pair_delta": float(actual_group_pair_delta),
+            "actual_group_pair_raw": float(actual_group_pair_raw.detach().cpu()),
+            "actual_group_pair_weighted": float(
+                actual_group_pair_weighted.detach().cpu()
+            ),
+            "actual_group_actor_correct": float(actual_group_actor_correct),
+            "actual_group_critic_correct": float(actual_group_critic_correct),
+            "actual_candidate_critic_replay_raw": float(
+                actual_candidate_critic_replay_raw.detach().cpu()
+            ),
+            "actual_candidate_critic_replay_weighted": float(
+                actual_candidate_critic_replay_weighted.detach().cpu()
+            ),
+            "actual_candidate_critic_replay_accuracy": float(
+                actual_candidate_critic_replay_accuracy
+            ),
+            "actual_proposal_replay_raw": float(
+                actual_proposal_replay_raw.detach().cpu()
+            ),
+            "actual_proposal_replay_weighted": float(
+                actual_proposal_replay_weighted.detach().cpu()
+            ),
+            "actual_proposal_replay_accuracy": float(
+                actual_proposal_replay_accuracy
+            ),
+            "matched_actual_anchor_hash": str(matched_anchor_hash),
+            "log_prob": float(log_prob.detach().float().mean().cpu()),
+            "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,
+            "policy_core_raw": float(policy_core_raw.detach().cpu()),
+            "policy_core_weighted": float(policy_core_weighted.detach().cpu()),
+            "selection_mode": str(selection_mode),
+            "actor_rd_target": float(actor_rd_target.detach().cpu()),
+            "actor_rd_compression_weight": float(actor_compression_weight),
+            "actor_rd_geometry_weight": float(actor_geometry_weight),
+            "plan_critic_value": float(
+                plan_critic_value.detach().float().mean().cpu()
+            ) if torch.is_tensor(plan_critic_value) else 0.0,
+            "plan_critic_uncertainty": float(
+                torch.exp(0.5 * plan_critic_log_variance.detach().float().mean()).cpu()
+            ) if torch.is_tensor(plan_critic_log_variance) else 0.0,
+            "plan_critic_loss_raw": float(plan_critic_loss_raw.detach().cpu()),
+            "plan_critic_replay_loss": float(plan_critic_replay_loss.detach().cpu()),
+            "plan_critic_loss_weighted": float(
+                plan_critic_loss_weighted.detach().cpu()
+            ),
+            "plan_critic_replay_count": int(replay_count),
+            "plan_critic_replay_pearson": float(plan_critic_replay_pearson),
+            "plan_critic_replay_spearman": float(plan_critic_replay_spearman),
+            "plan_critic_policy_confidence": float(
+                plan_critic_policy_confidence
+            ),
+            "candidate_local_credit_raw": float(
+                candidate_local_credit.detach().float().mean().cpu()
+            ) if torch.is_tensor(candidate_local_credit) else 0.0,
+            "candidate_local_credit_weighted": float(
+                candidate_local_credit_weighted.detach().cpu()
+            ),
+            "candidate_actor_proxy_weighted": float(
+                candidate_actor_proxy_weighted_for_probe.detach().cpu()
+            ),
+            **local_plan_credit_debug,
+            "entropy_raw": float(entropy_raw.detach().cpu()),
+            "entropy_weighted": float(entropy_weighted.detach().cpu()),
+            "entropy_weight_effective": float(effective_entropy_weight),
+            "actual_preference_quality": float(preference_quality),
+            "noop_actual_raw": float(noop_actual_raw.detach().cpu()),
+            "noop_actual_weighted": float(noop_actual_weighted.detach().cpu()),
+            "geometry_policy_guard_passed": bool(geometry_guard_passed),
+            "geometry_policy_baseline_source": str(geometry_baseline_source),
+            "geometry_policy_advantage": float(geometry_advantage.detach().cpu()),
+            "geometry_policy_raw": float(geometry_policy_raw.detach().cpu()),
+            "geometry_policy_weighted": float(geometry_policy_weighted.detach().cpu()),
+            "efficiency_policy_guard_passed": bool(efficiency_guard_passed),
+            "efficiency_policy_baseline_available": bool(efficiency_baseline_available),
+            "efficiency_policy_operation_ratio": float(operation_ratio_value),
+            "efficiency_policy_advantage": float(efficiency_advantage.detach().cpu()),
+            "efficiency_policy_raw": float(efficiency_policy_raw.detach().cpu()),
+            "efficiency_policy_weighted": float(efficiency_policy_weighted.detach().cpu()),
+            "adaptive_amount_entropy_raw": float(adaptive_amount_entropy.detach().cpu()),
+            "adaptive_amount_entropy_weighted": float(adaptive_amount_entropy_weighted.detach().cpu()),
+            "baseline_ema_alpha": float(baseline_alpha),
+            "policy_loss": float(policy_loss.detach().cpu()),
+        }
+        # Retain graph-connected source tensors only until train.py performs its
+        # optional low-frequency diagnostic probe.  These are never serialized
+        # and never used to choose an action.
+        self._den6_policy_source_losses = {
+            "actual_compression_policy": (
+                policy_core_weighted
+                + actual_group_pair_weighted
+                + actual_set_contrast_weighted
+                + actual_actor_replay_weighted
+                + actual_candidate_critic_replay_weighted
+                + actual_proposal_replay_weighted
+                + noop_actual_weighted
+                + plan_critic_loss_weighted
+            ),
+            "proxy": candidate_local_credit_weighted,
+            "entropy": entropy_weighted,
+            "geometry": geometry_policy_weighted,
+            "efficiency": efficiency_policy_weighted,
+        }
+        if native_geometry_credit:
+            # Include the existing pair-Critic objective in its proper source;
+            # do not add it to policy_loss a second time.
+            self._den6_policy_source_losses['actual_compression_policy'] = (
+                self._den6_policy_source_losses['actual_compression_policy']
+                + actual_group_critic_weighted)
+        return policy_loss.to(dtype=reward.dtype)
+
+    def network_only_plan_gain_loss(self, actual_bit_percent):
+        """Fit the plan-level local-sum + interaction predictor to actual bits."""
+        if not torch.is_tensor(actual_bit_percent):
+            raise TypeError("actual_bit_percent must be a Tensor")
+        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() not in {
+            "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"
+        }:
+            return actual_bit_percent.new_zeros(())
+        state = self.last_actuator_voxel_state
+        prediction = state.get("network_only_predicted_plan_gain") if isinstance(state, dict) else None
+        if not torch.is_tensor(prediction) or not prediction.requires_grad:
+            raise RuntimeError("network-only plan gain predictor is detached or missing")
+        # ``prediction`` is a gain: larger values are ranked ahead by the
+        # policy.  Actual compression is an objective delta where negative is
+        # better, so its regression target must have the opposite sign.
+        # Using the raw objective here reinforced codec-worsening locations.
+        target = (-actual_bit_percent.detach().float().mean()).expand_as(prediction.float())
+        loss = torch.nn.functional.smooth_l1_loss(
+            prediction.float(), target, beta=0.25
+        )
+        weight = max(float(getattr(self.args, "network_only_plan_gain_loss_weight", 0.25)), 0.0)
+        weighted = loss * weight
+        self.last_discrete_policy_debug.update({
+            "predicted_plan_gain": float(prediction.detach().float().mean().cpu()),
+            "plan_gain_target": float(target.detach().float().mean().cpu()),
+            "plan_gain_huber": float(loss.detach().cpu()),
+            "plan_gain_huber_weighted": float(weighted.detach().cpu()),
+        })
+        return weighted.to(dtype=actual_bit_percent.dtype)
+
+    def score_algorithmic_proposal_subtrees(self, subtree_features):
+        """Score candidate subtrees for the algorithmic proposal selector path."""
+        return self.algorithmic_proposal_selector(subtree_features)
+
+    def single_plan_teacher_distillation_loss(self, teacher):
+        """訓練専用Teacherラベルを現在のStudent出力へ適用する。"""
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+        shadow_enabled = bool(
+            mode == "ana_den6_online"
+            and getattr(self.args, "single_plan_shadow_distillation", True)
+        )
+        if mode != "single_plan_student" and not shadow_enabled:
+            raise RuntimeError(
+                "Single-Plan蒸留はsingle_plan_studentまたはana_den6_online shadow専用である"
+            )
+        if not self.training:
+            raise RuntimeError("推論時のTeacher参照は禁止である")
+        terms = self.last_single_plan_student_terms
+        state = getattr(self, "last_actuator_voxel_state", None)
+        voxel_coords = state.get("initial_voxel_coords") if isinstance(state, dict) else None
+        if not isinstance(terms, dict) or not torch.is_tensor(voxel_coords):
+            raise RuntimeError("Single-Plan Student forward結果がない")
+        value, metrics = self.single_plan_distillation_loss_module(
+            terms, voxel_coords, teacher
+        )
+        weight = max(float(getattr(
+            self.args, "single_plan_distillation_weight", 1.0
+        )), 0.0)
+        self.last_single_plan_distillation_debug = dict(metrics)
+        self.last_single_plan_distillation_debug["weight"] = weight
+        self.last_single_plan_distillation_debug["weighted"] = float(
+            (value.detach() * weight).cpu()
+        )
+        with torch.no_grad():
+            self.single_plan_distillation_updates.add_(1)
+        return value * weight
+
+    def k_proposal_offline_distillation_loss(self, teacher):
+        """Fit K specialists from an explicitly supplied offline Actual set.
+
+        No dataset/cache is loaded here.  Training orchestration must supply a
+        current-state teacher tensor; inference never calls this method.
+        """
+        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() != "network_k_proposal_policy":
+            raise RuntimeError("K proposal distillation requires network_k_proposal_policy mode")
+        if not self.training:
+            raise RuntimeError("offline K proposal distillation is training-only")
+        if not isinstance(self.last_k_proposal_terms, dict):
+            raise RuntimeError("K proposal forward must run before distillation loss")
+        return self.k_proposal_set_loss(self.last_k_proposal_terms, teacher)
+
+    @staticmethod
+    def _network_k_replay_mode_key(record):
+        """ratio/share/order/variantでActual経験をmode分割する。"""
+        share_bins = tuple(int(round(float(value) / 0.05)) for value in record["shares"])
+        return (
+            int(record["ratio_class"]), share_bins,
+            int(record["order_class"]), int(record["variant_class"]),
+        )
+
+    def _network_k_positive_replay_source_indices(self, state_key):
+        """現在stateの正改善Actual経験から、再学習すべきsource indexだけを返す。"""
+        if state_key is None or not self.training:
+            return None
+        state_replay = self._network_k_actual_replay.get(str(state_key), {})
+        if not state_replay:
+            return None
+        mode_best = {}
+        for record in state_replay.values():
+            if float(record.get("actual_gain", 0.0)) <= 0.0:
+                continue
+            mode_key = record.get("mode_key")
+            if (
+                mode_key not in mode_best
+                or float(record["actual_gain"]) > float(mode_best[mode_key]["actual_gain"])
+            ):
+                mode_best[mode_key] = record
+        plan_limit = max(int(getattr(
+            self.args, "network_k_replay_shortlist_plan_limit", 8
+        )), 1)
+        point_limit = max(int(getattr(
+            self.args, "network_k_replay_shortlist_point_limit", 8192
+        )), 1)
+        elites = sorted(
+            mode_best.values(), key=lambda item: float(item["actual_gain"]), reverse=True
+        )[:plan_limit]
+        indices = []
+        seen = set()
+        for elite in elites:
+            for operation_indices in elite.get("source_indices", ()):
+                for value in operation_indices:
+                    index = int(value)
+                    if index in seen:
+                        continue
+                    seen.add(index)
+                    indices.append(index)
+                    if len(indices) >= point_limit:
+                        return tuple(indices)
+        return tuple(indices) if indices else None
+
+    def _store_network_k_actual_experience(self, state_key, actual_gain, terms):
+        """実際に圧縮したK planだけを重複排除して保存する。"""
+        if state_key is None or not hasattr(self, "_network_k_actual_replay"):
+            return {"stored": 0, "positive": 0, "plan_change_count": -1}
+        if actual_gain.shape[0] != 1:
+            raise RuntimeError("K Actual replayはbatch_size=1の逐次stateを前提とする")
+        executable = terms.get("executable_plan_batch")
+        plan_hashes = getattr(executable, "plan_hash", None)
+        if executable is None or plan_hashes is None:
+            raise RuntimeError("K Actual replayにはpost-collision executable plan hashが必要である")
+        state_name = str(state_key)
+        state_replay = self._network_k_actual_replay.setdefault(state_name, OrderedDict())
+        mean_parts = []
+        for name in (
+            "ratio_probability", "order_probability", "variant_probability"
+        ):
+            value = terms.get(name)
+            if torch.is_tensor(value):
+                mean_parts.append(value.detach().float().reshape(value.shape[0], value.shape[1], -1))
+        share_logits = terms.get("share_logits")
+        if torch.is_tensor(share_logits):
+            mean_parts.append(torch.softmax(
+                share_logits.detach().float(), dim=2
+            ).reshape(share_logits.shape[0], share_logits.shape[1], -1))
+        coefficient_mean = terms.get("coefficient_mean_raw")
+        if torch.is_tensor(coefficient_mean):
+            mean_parts.append(torch.tanh(
+                coefficient_mean.detach().float()
+            ).reshape(coefficient_mean.shape[0], coefficient_mean.shape[1], -1))
+        direction_mean = terms.get("direction_delta_mean")
+        if torch.is_tensor(direction_mean):
+            mean_parts.append(direction_mean.detach().float().reshape(
+                direction_mean.shape[0], direction_mean.shape[1], -1
+            ))
+        distribution_mean_delta = -1.0
+        if mean_parts:
+            current_distribution_mean = torch.cat(mean_parts, dim=2)[0].cpu()
+            if not hasattr(self, "_network_k_previous_distribution_means"):
+                self._network_k_previous_distribution_means = {}
+            previous_distribution_mean = self._network_k_previous_distribution_means.get(
+                state_name
+            )
+            if torch.is_tensor(previous_distribution_mean):
+                distribution_mean_delta = float(torch.sqrt(torch.mean(
+                    (current_distribution_mean - previous_distribution_mean).pow(2)
+                )))
+            self._network_k_previous_distribution_means[state_name] = current_distribution_mean
+        current_hashes = tuple(str(value) for value in plan_hashes[0])
+        previous_hashes = self._network_k_previous_plan_hashes.get(state_name)
+        plan_change_count = (
+            -1 if previous_hashes is None
+            else sum(left != right for left, right in zip(previous_hashes, current_hashes))
+        )
+        self._network_k_previous_plan_hashes[state_name] = current_hashes
+        stored = 0
+        positive = 0
+        coefficients = terms.get("coefficients")
+        direction_delta = terms.get("direction_delta_all")
+        for slot, plan_hash in enumerate(current_hashes):
+            gain = float(actual_gain[0, slot].detach().cpu())
+            positive += int(gain > 0.0)
+            # 悪化planはそのStepの絶対Actor/Criticで処理し、座標列をreplayへ
+            # 永続化しない。これにより多数stateでもmemoryが増え続けない。
+            if gain <= 0.0:
+                continue
+            sources = []
+            directions = []
+            for operation in range(3):
+                accepted = executable.accepted_mask[0, slot, operation].bool()
+                sources.append(tuple(
+                    int(value) for value in executable.source_index[
+                        0, slot, operation
+                    ][accepted].detach().cpu().tolist()
+                ))
+                directions.append(tuple(
+                    int(value) for value in executable.direction_index[
+                        0, slot, operation
+                    ][accepted].detach().cpu().tolist()
+                ))
+            record = {
+                "plan_hash": plan_hash,
+                "actual_gain": gain,
+                "ratio_class": int(terms["ratio_class"][0, slot].detach().cpu()),
+                "shares": tuple(float(value) for value in terms["shares"][0, slot].detach().cpu()),
+                "order_class": int(terms["order_class"][0, slot].detach().cpu()),
+                "variant_class": int(terms["variant_class"][0, slot].detach().cpu()),
+                "coefficients": (
+                    coefficients[0, slot].detach().cpu().clone()
+                    if torch.is_tensor(coefficients) else None
+                ),
+                "direction_delta": (
+                    direction_delta[0, slot].detach().cpu().clone()
+                    if torch.is_tensor(direction_delta) else None
+                ),
+                "source_indices": tuple(sources),
+                "direction_indices": tuple(directions),
+            }
+            record["mode_key"] = Network._network_k_replay_mode_key(record)
+            old = state_replay.get(plan_hash)
+            if old is None or gain > float(old["actual_gain"]):
+                state_replay[plan_hash] = record
+                state_replay.move_to_end(plan_hash)
+                stored += 1
+        capacity = max(int(getattr(
+            self.args, "network_k_elite_replay_capacity", 256
+        )), 8)
+        total_size = sum(len(records) for records in self._network_k_actual_replay.values())
+        while total_size > capacity:
+            worst_state, worst_key = min(
+                (
+                    (replay_state, plan_key)
+                    for replay_state, records in self._network_k_actual_replay.items()
+                    for plan_key in records
+                ),
+                key=lambda item: float(
+                    self._network_k_actual_replay[item[0]][item[1]]["actual_gain"]
+                ),
+            )
+            self._network_k_actual_replay[worst_state].pop(worst_key)
+            if not self._network_k_actual_replay[worst_state]:
+                self._network_k_actual_replay.pop(worst_state)
+            total_size -= 1
+        current_state_size = len(self._network_k_actual_replay.get(state_name, {}))
+        self.args._network_k_positive_experience_count = int(current_state_size)
+        minimum_positive = max(int(getattr(
+            self.args, "network_k_min_positive_before_anneal", 8
+        )), 0)
+        if current_state_size >= minimum_positive:
+            if not hasattr(self, "_network_k_anneal_unlock_steps"):
+                self._network_k_anneal_unlock_steps = {}
+            self.args._network_k_anneal_unlock_step = int(
+                self._network_k_anneal_unlock_steps.setdefault(
+                    state_name, int(getattr(self.args, "_global_train_step", 0))
+                )
+            )
+        return {
+            "stored": stored,
+            "positive": positive,
+            "state_size": len(self._network_k_actual_replay.get(state_name, {})),
+            "total_size": total_size,
+            "plan_change_count": plan_change_count,
+            "policy_mean_l2_delta": distribution_mean_delta,
+        }
+
+    def _network_k_elite_replay_loss(self, state_key, terms):
+        """正改善したmodeの最良経験だけを各specialistへ再教師化する。"""
+        reference = terms["slot_policy_log_prob"]
+        zero = reference.sum() * 0.0
+        if (
+            state_key is None
+            or not bool(getattr(self.args, "network_k_elite_enabled", True))
+            or not hasattr(self, "_network_k_actual_replay")
+        ):
+            return zero, {"elite_count": 0, "where_recall": 0.0}
+        state_replay = self._network_k_actual_replay.get(str(state_key), {})
+        mode_best = {}
+        minimum_gain = max(float(getattr(
+            self.args, "network_k_elite_min_gain_percent", 1e-6
+        )), 0.0)
+        for record in state_replay.values():
+            if float(record["actual_gain"]) <= minimum_gain:
+                continue
+            mode_key = record["mode_key"]
+            if mode_key not in mode_best or record["actual_gain"] > mode_best[mode_key]["actual_gain"]:
+                mode_best[mode_key] = record
+        elite_limit = min(
+            int(reference.shape[1]),
+            max(int(getattr(self.args, "network_k_elite_replay_count", reference.shape[1])), 1),
+        )
+        elites = sorted(
+            mode_best.values(), key=lambda item: float(item["actual_gain"]), reverse=True
+        )[:elite_limit]
+        if not elites:
+            return zero, {"elite_count": 0, "where_recall": 0.0}
+
+        ratio_logits = terms["ratio_logits"]
+        share_logits = terms["share_logits"]
+        order_logits = terms["order_logits"]
+        variant_logits = terms["variant_logits"]
+        current_shares = torch.softmax(share_logits.detach(), dim=2)
+        used_slots = set()
+        assignments = []
+        for elite in elites:
+            target_share = reference.new_tensor(elite["shares"])
+            costs = (
+                -torch.log_softmax(ratio_logits.detach()[0], 1)[:, elite["ratio_class"]]
+                -torch.log_softmax(order_logits.detach()[0], 1)[:, elite["order_class"]]
+                -torch.log_softmax(variant_logits.detach()[0], 1)[:, elite["variant_class"]]
+                + 4.0 * (current_shares[0] - target_share).abs().mean(1)
+            )
+            for slot in used_slots:
+                costs[slot] = torch.inf
+            slot = int(costs.argmin().cpu())
+            used_slots.add(slot)
+            assignments.append((slot, elite))
+
+        shortlist = terms["shortlist_indices"][0]
+        replay_where_logits = terms.get("policy_base_slot_logits", terms["slot_logits"])
+        replay_direction_field = terms.get("shared_direction_field")
+        replay_direction_mean = terms.get("direction_delta_mean")
+        replay_direction_offsets = terms.get("unit_neighbor_offsets")
+        point_count = int(terms["shared_basis"].shape[-1])
+        inverse = torch.full(
+            (point_count,), -1, device=shortlist.device, dtype=torch.long
+        )
+        inverse[shortlist] = torch.arange(shortlist.numel(), device=shortlist.device)
+        loss_rows = []
+        recalled = 0
+        source_total = 0
+        gains = reference.new_tensor([max(float(item[1]["actual_gain"]), 1e-6) for item in assignments])
+        gain_weights = gains / gains.sum().clamp_min(1e-8)
+        for row_index, (slot, elite) in enumerate(assignments):
+            row = (
+                torch.nn.functional.cross_entropy(
+                    ratio_logits[0, slot].view(1, -1),
+                    ratio_logits.new_tensor([elite["ratio_class"]], dtype=torch.long),
+                )
+                + torch.nn.functional.cross_entropy(
+                    order_logits[0, slot].view(1, -1),
+                    order_logits.new_tensor([elite["order_class"]], dtype=torch.long),
+                )
+                + torch.nn.functional.cross_entropy(
+                    variant_logits[0, slot].view(1, -1),
+                    variant_logits.new_tensor([elite["variant_class"]], dtype=torch.long),
+                )
+                - (reference.new_tensor(elite["shares"]) * torch.log_softmax(
+                    share_logits[0, slot], dim=0
+                )).sum()
+            )
+            coefficient_target = elite.get("coefficients")
+            if coefficient_target is not None and torch.is_tensor(terms.get("coefficient_mean_raw")):
+                row = row + 0.25 * torch.nn.functional.smooth_l1_loss(
+                    torch.tanh(terms["coefficient_mean_raw"][0, slot]),
+                    coefficient_target.to(terms["coefficient_mean_raw"]),
+                    beta=0.25,
+                )
+            direction_target = elite.get("direction_delta")
+            if direction_target is not None and torch.is_tensor(terms.get("direction_delta_mean")):
+                row = row + 0.25 * torch.nn.functional.smooth_l1_loss(
+                    terms["direction_delta_mean"][0, slot],
+                    direction_target.to(terms["direction_delta_mean"]),
+                    beta=0.25,
+                )
+            where_rows = []
+            direction_rows = []
+            for operation, source_values in enumerate(elite["source_indices"]):
+                if not source_values:
+                    continue
+                source = torch.as_tensor(source_values, device=inverse.device, dtype=torch.long)
+                position = inverse.index_select(0, source)
+                source_total += int(position.numel())
+                position = position[position >= 0]
+                recalled += int(position.numel())
+                if position.numel():
+                    where_rows.append(
+                        -torch.log_softmax(
+                            replay_where_logits[0, slot, operation], dim=0
+                        ).index_select(0, position).mean()
+                    )
+                direction_groups = elite.get("direction_indices", ()) or ()
+                direction_values = (
+                    direction_groups[operation]
+                    if len(direction_groups) > operation else ()
+                )
+                if (
+                    operation in (1, 2)
+                    and source.numel() == len(direction_values)
+                    and torch.is_tensor(replay_direction_field)
+                    and torch.is_tensor(replay_direction_mean)
+                    and torch.is_tensor(replay_direction_offsets)
+                ):
+                    direction_operation = 0 if operation == 1 else 1
+                    vectors = replay_direction_field[
+                        0, direction_operation, :3
+                    ].index_select(1, source).transpose(0, 1)
+                    vectors = torch.nn.functional.normalize(
+                        vectors + replay_direction_mean[
+                            0, slot, direction_operation
+                        ], dim=1, eps=1e-6
+                    )
+                    concentration = torch.nn.functional.softplus(
+                        replay_direction_field[
+                            0, direction_operation, 3
+                        ].index_select(0, source)
+                    ).unsqueeze(1) + 0.1
+                    logits = (
+                        vectors @ replay_direction_offsets.to(vectors).transpose(0, 1)
+                    ) * concentration
+                    chosen_direction = torch.as_tensor(
+                        direction_values, device=logits.device, dtype=torch.long
+                    )
+                    direction_rows.append(-torch.log_softmax(
+                        logits, dim=1
+                    ).gather(1, chosen_direction.view(-1, 1)).mean())
+            if where_rows:
+                row = row + max(float(getattr(
+                    self.args, "network_k_elite_where_weight", 0.25
+                )), 0.0) * torch.stack(where_rows).mean()
+            if direction_rows:
+                row = row + max(float(getattr(
+                    self.args, "network_k_elite_direction_weight", 0.25
+                )), 0.0) * torch.stack(direction_rows).mean()
+            loss_rows.append(row * gain_weights[row_index])
+        return torch.stack(loss_rows).sum(), {
+            "elite_count": len(assignments),
+            "where_recall": float(recalled) / max(float(source_total), 1.0),
+            "best_replay_gain": max(float(elite["actual_gain"]) for elite in elites),
+            "direction_teacher_count": sum(
+                len((item[1].get("direction_indices", ()) or ((), (), ()))[operation])
+                for item in assignments for operation in (1, 2)
+            ),
+        }
+
+    def k_proposal_all_actual_loss(self, actual_compression_percent, state_key=None):
+        """K実行planの絶対Actual rewardを各specialistへ直接返す。"""
+        if not self.training:
+            raise RuntimeError("K all-Actual lossは訓練時だけ使用できる")
+        if not bool(getattr(self.args, "network_k_all_actual_enabled", False)):
+            raise RuntimeError("network_k_all_actual_enabledが無効である")
+        terms = self.last_k_proposal_terms
+        if not isinstance(terms, dict):
+            raise RuntimeError("K proposal forwardがall-Actual lossより前に必要である")
+        log_prob = terms.get("slot_policy_log_prob")
+        predicted_gain = terms.get("predicted_plan_gain")
+        entropy = terms.get("slot_policy_entropy")
+        if not all(torch.is_tensor(value) for value in (log_prob, predicted_gain, entropy)):
+            raise RuntimeError("K proposalのslot policy/Critic Tensorが欠落した")
+        actual_loss = torch.as_tensor(
+            actual_compression_percent,
+            device=log_prob.device,
+            dtype=log_prob.dtype,
+        ).view_as(log_prob)
+        # compression lossは負が改善、gain/rewardは正が改善へ統一する。
+        actual_gain = -actual_loss
+        centered = actual_gain - actual_gain.mean(dim=1, keepdim=True)
+        relative_advantage = centered / actual_gain.std(
+            dim=1, keepdim=True
+        ).clamp_min(1e-4)
+        reward_scale = max(float(getattr(
+            self.args, "network_k_all_actual_reward_scale_percent", 1.0
+        )), 1e-4)
+        absolute_advantage = torch.tanh(actual_gain / reward_scale)
+        absolute_weight = max(float(getattr(
+            self.args, "network_k_all_actual_absolute_advantage_weight", 1.0
+        )), 0.0)
+        relative_weight = max(float(getattr(
+            self.args, "network_k_all_actual_relative_advantage_weight", 0.25
+        )), 0.0)
+        advantage = (
+            absolute_advantage * absolute_weight
+            + relative_advantage * relative_weight
+        )
+        # 8候補が全て悪化した時、最もましな悪化planを正rewardにしてはいけない。
+        advantage = torch.where(
+            actual_gain > 1e-9,
+            torch.maximum(advantage, absolute_advantage * absolute_weight),
+            torch.where(
+                actual_gain < -1e-9,
+                torch.minimum(advantage, absolute_advantage * absolute_weight),
+                torch.zeros_like(advantage),
+            ),
+        )
+        worsening_reinforced = (actual_gain <= 0.0) & (advantage > 1e-9)
+        if bool(worsening_reinforced.any()):
+            raise RuntimeError("悪化または0% planへ正のActor advantageが割り当てられた")
+        coverage_mask = terms.get("coverage_slot_mask")
+        if torch.is_tensor(coverage_mask):
+            coverage_mask = coverage_mask.to(
+                device=log_prob.device, dtype=torch.bool
+            ).view(1, -1).expand_as(log_prob)
+        else:
+            coverage_mask = torch.zeros_like(log_prob, dtype=torch.bool)
+        on_policy_mask = ~coverage_mask
+        on_policy_weight = on_policy_mask.to(log_prob.dtype)
+        spatial_log_prob = terms.get("spatial_policy_log_prob")
+        theta_log_prob = terms.get("theta_policy_log_prob")
+        positive_history_count = int(terms.get("positive_experience_count", 0) or 0)
+        minimum_positive_history = max(int(getattr(
+            self.args, "network_k_min_positive_before_anneal", 8
+        )), 0)
+        block_negative_theta = bool(
+            getattr(self.args, "network_k_freeze_negative_theta_until_positive", True)
+            and positive_history_count < minimum_positive_history
+            and torch.is_tensor(spatial_log_prob)
+            and torch.is_tensor(theta_log_prob)
+        )
+        if block_negative_theta:
+            # 改善が見つかる前は悪化planのtheta勾配だけを止め、Where/Direction
+            # の失敗教師は維持する。正改善を発見した行だけthetaも強化する。
+            actor_on_policy_log_prob = spatial_log_prob + theta_log_prob * (
+                actual_gain > 0.0
+            ).to(theta_log_prob.dtype)
+        else:
+            actor_on_policy_log_prob = log_prob
+        actor_on_policy_raw = -(
+            advantage.detach() * actor_on_policy_log_prob * on_policy_weight
+        ).sum() / on_policy_weight.sum().clamp_min(1.0)
+        # 系統探索slotは外部scheduleで選んだoff-policy標本なので、悪化時に
+        # Network分布全体を一点へ押し潰さない。正改善だけを再現対象にする。
+        coverage_positive_advantage = torch.tanh(
+            actual_gain.clamp_min(0.0) / reward_scale
+        ) * coverage_mask.to(actual_gain.dtype)
+        positive_count = (coverage_positive_advantage > 0.0).sum()
+        if bool(positive_count > 0):
+            actor_coverage_positive_raw = -(
+                coverage_positive_advantage.detach() * log_prob
+            ).sum() / positive_count.to(log_prob.dtype)
+        else:
+            actor_coverage_positive_raw = log_prob.sum() * 0.0
+        coverage_positive_weight = max(float(getattr(
+            self.args, "network_k_coverage_positive_actor_weight", 1.0
+        )), 0.0)
+        if torch.is_tensor(spatial_log_prob):
+            # θはschedule由来でも、Where/Direction/score係数はNetworkが標本化
+            # している。全8件のActualを局所mapへ返し、評価の半分を捨てない。
+            coverage_weight = coverage_mask.to(log_prob.dtype)
+            actor_coverage_spatial_raw = -(
+                advantage.detach() * spatial_log_prob * coverage_weight
+            ).sum() / coverage_weight.sum().clamp_min(1.0)
+        else:
+            actor_coverage_spatial_raw = log_prob.sum() * 0.0
+        coverage_spatial_weight = max(float(getattr(
+            self.args, "network_k_coverage_spatial_actor_weight", 1.0
+        )), 0.0)
+        coverage_pair_ranking_raw = log_prob.sum() * 0.0
+        coverage_pair_where_contrast_raw = log_prob.sum() * 0.0
+        pair_size = int(terms.get("coverage_pair_size", 0) or 0)
+        if torch.is_tensor(spatial_log_prob) and pair_size == 2:
+            pair_losses = []
+            where_contrast_losses = []
+            compact_plans = terms.get("compact_plans", {})
+            selected_masks = (
+                compact_plans.get("selected_shortlist_mask")
+                if isinstance(compact_plans, dict) else None
+            )
+            where_logits = terms.get("policy_base_slot_logits")
+            coverage_count = min(
+                int(coverage_mask[0].sum().item()), pair_size
+            )
+            for left in range(0, coverage_count - 1, pair_size):
+                right = left + 1
+                gain_difference = actual_gain[:, left] - actual_gain[:, right]
+                valid_pair = gain_difference.abs() > 1e-6
+                if bool(valid_pair.any()):
+                    log_probability_difference = (
+                        spatial_log_prob[:, left] - spatial_log_prob[:, right]
+                    )
+                    pair_losses.append(torch.nn.functional.softplus(
+                        -gain_difference.detach().sign()[valid_pair]
+                        * log_probability_difference[valid_pair]
+                    ).mean())
+                    # 同一thetaでActual差が付いた候補対について、共通Voxelを
+                    # 除いたsourceだけを比較し、局所mapへ直接順位教師を返す。
+                    if torch.is_tensor(selected_masks) and torch.is_tensor(where_logits):
+                        for batch_index in valid_pair.nonzero(as_tuple=False).flatten().tolist():
+                            if bool(gain_difference[batch_index] > 0.0):
+                                winner, loser = left, right
+                            else:
+                                winner, loser = right, left
+                            winner_mask = selected_masks[batch_index, winner]
+                            loser_mask = selected_masks[batch_index, loser]
+                            common_logits = 0.5 * (
+                                where_logits[batch_index, winner]
+                                + where_logits[batch_index, loser]
+                            )
+                            for operation in range(3):
+                                winner_only = winner_mask[operation] & ~loser_mask[operation]
+                                loser_only = loser_mask[operation] & ~winner_mask[operation]
+                                if bool(winner_only.any()) and bool(loser_only.any()):
+                                    margin = (
+                                        common_logits[operation][winner_only].mean()
+                                        - common_logits[operation][loser_only].mean()
+                                    )
+                                    where_contrast_losses.append(
+                                        torch.nn.functional.softplus(-margin)
+                                    )
+            if pair_losses:
+                coverage_pair_ranking_raw = torch.stack(pair_losses).mean()
+            if where_contrast_losses:
+                coverage_pair_where_contrast_raw = torch.stack(
+                    where_contrast_losses
+                ).mean()
+        coverage_pair_ranking_weight = max(float(getattr(
+            self.args, "network_k_coverage_pair_ranking_weight", 0.5
+        )), 0.0)
+        coverage_pair_where_contrast_weight = max(float(getattr(
+            self.args, "network_k_coverage_pair_where_contrast_weight", 0.5
+        )), 0.0)
+        actor_raw = (
+            actor_on_policy_raw
+            + actor_coverage_positive_raw * coverage_positive_weight
+            + actor_coverage_spatial_raw * coverage_spatial_weight
+            + coverage_pair_ranking_raw * coverage_pair_ranking_weight
+            + coverage_pair_where_contrast_raw
+            * coverage_pair_where_contrast_weight
+        )
+        predicted_gain_flat = predicted_gain.squeeze(-1)
+        critic_regression_raw = torch.nn.functional.smooth_l1_loss(
+            predicted_gain_flat,
+            actual_gain.detach(),
+            beta=max(float(getattr(
+                self.args, "network_k_critic_huber_beta", 0.05
+            )), 1e-4),
+        )
+        critic_sign_active = actual_gain.abs() > 1e-4
+        if bool(critic_sign_active.any()):
+            critic_sign_target = (actual_gain > 0.0).to(predicted_gain_flat.dtype)
+            critic_sign_rows = torch.nn.functional.binary_cross_entropy_with_logits(
+                predicted_gain_flat / max(float(getattr(
+                    self.args, "network_k_critic_sign_scale", 0.10
+                )), 1e-4),
+                critic_sign_target,
+                reduction="none",
+            )
+            critic_sign_rows = critic_sign_rows * torch.where(
+                critic_sign_target > 0.5,
+                critic_sign_rows.new_tensor(max(float(getattr(
+                    self.args, "network_k_critic_improvement_sign_weight", 4.0
+                )), 1.0)),
+                critic_sign_rows.new_tensor(1.0),
+            )
+            critic_sign_raw = critic_sign_rows[critic_sign_active].mean()
+        else:
+            critic_sign_raw = predicted_gain_flat.sum() * 0.0
+        critic_raw = critic_regression_raw + max(float(getattr(
+            self.args, "network_k_critic_sign_loss_weight", 0.25
+        )), 0.0) * critic_sign_raw
+        predicted_local_gain = terms.get("predicted_local_gain_all")
+        if torch.is_tensor(predicted_local_gain):
+            local_value_raw = torch.nn.functional.smooth_l1_loss(
+                predicted_local_gain, actual_gain.detach(), beta=0.25
+            )
+        else:
+            local_value_raw = actor_raw.new_zeros(())
+        pair_difference = actual_gain[:, :, None] - actual_gain[:, None, :]
+        predicted_difference = (
+            predicted_gain_flat[:, :, None]
+            - predicted_gain_flat[:, None, :]
+        )
+        pair_mask = pair_difference.abs() > 1e-6
+        if bool(pair_mask.any()):
+            ranking_raw = torch.nn.functional.softplus(
+                -pair_difference.sign()[pair_mask] * predicted_difference[pair_mask]
+            ).mean()
+        else:
+            ranking_raw = actor_raw.new_zeros(())
+        actual_best_slot = actual_gain.argmax(dim=1)
+        critic_selection_raw = torch.nn.functional.cross_entropy(
+            predicted_gain_flat / max(float(getattr(
+                self.args, "network_k_critic_selection_temperature", 0.10
+            )), 1e-3),
+            actual_best_slot.detach(),
+        )
+        entropy_raw = entropy.mean()
+        entropy_target = min(max(float(getattr(
+            self.args, "network_k_entropy_floor_target", 0.35
+        )), 0.0), 1.0)
+        normalized_entropies = {}
+        slot_logits_for_entropy = terms.get("slot_logits")
+        where_class_count = (
+            int(slot_logits_for_entropy.shape[-1])
+            if torch.is_tensor(slot_logits_for_entropy) else 2
+        )
+        entropy_denominators = {
+            "ratio": math.log(5.0),
+            "share": math.log(3.0),
+            "order": math.log(6.0),
+            "variant": math.log(6.0),
+            "where": math.log(max(where_class_count, 2)),
+            "direction": math.log(26.0),
+        }
+        for family, key in (
+            ("ratio", "ratio_policy_entropy"),
+            ("share", "share_policy_entropy"),
+            ("order", "order_policy_entropy"),
+            ("variant", "variant_policy_entropy"),
+            ("where", "where_policy_entropy"),
+            ("direction", "direction_policy_entropy"),
+        ):
+            value = terms.get(key)
+            if torch.is_tensor(value):
+                normalized_entropies[family] = (
+                    value / max(entropy_denominators[family], 1e-6)
+                ).mean()
+        if normalized_entropies:
+            entropy_floor_raw = torch.stack([
+                torch.relu(value.new_tensor(entropy_target) - value).pow(2)
+                for value in normalized_entropies.values()
+            ]).mean()
+        else:
+            entropy_floor_raw = actor_raw.new_zeros(())
+        store_experience = getattr(self, "_store_network_k_actual_experience", None)
+        elite_replay = getattr(self, "_network_k_elite_replay_loss", None)
+        replay_store_debug = (
+            store_experience(state_key, actual_gain, terms)
+            if callable(store_experience)
+            else {"stored": 0, "positive": 0, "plan_change_count": -1}
+        )
+        replay_raw, replay_debug = (
+            elite_replay(state_key, terms)
+            if callable(elite_replay)
+            else (actor_raw.new_zeros(()), {"elite_count": 0, "where_recall": 0.0})
+        )
+        signature_parts = [
+            terms.get("ratio_probability"), terms.get("shares"),
+            terms.get("order_probability"), terms.get("variant_probability"),
+        ]
+        signature_parts = [value for value in signature_parts if torch.is_tensor(value)]
+        if signature_parts:
+            signature = torch.cat(signature_parts, dim=2)
+            signature = torch.nn.functional.normalize(signature, dim=2, eps=1e-6)
+            similarity = torch.matmul(signature, signature.transpose(1, 2))
+            off_diagonal = ~torch.eye(
+                similarity.shape[1], device=similarity.device, dtype=torch.bool
+            ).unsqueeze(0)
+            diversity_raw = torch.relu(similarity[off_diagonal.expand_as(similarity)] - 0.90).pow(2).mean()
+        else:
+            diversity_raw = actor_raw.new_zeros(())
+        actor_weight = max(float(getattr(
+            self.args, "network_k_all_actual_actor_weight", 1.0
+        )), 0.0)
+        critic_weight = max(float(getattr(
+            self.args, "network_k_all_actual_critic_weight", 0.5
+        )), 0.0)
+        ranking_weight = max(float(getattr(
+            self.args, "network_k_all_actual_ranking_weight", 0.25
+        )), 0.0)
+        local_value_weight = max(float(getattr(
+            self.args, "network_k_all_actual_local_value_weight", 0.5
+        )), 0.0)
+        critic_selection_weight = max(float(getattr(
+            self.args, "network_k_all_actual_critic_selection_weight", 1.0
+        )), 0.0)
+        entropy_weight = max(float(getattr(
+            self.args, "network_k_all_actual_entropy_weight", 0.01
+        )), 0.0)
+        replay_weight = max(float(getattr(
+            self.args, "network_k_elite_replay_weight", 1.0
+        )), 0.0)
+        diversity_weight = max(float(getattr(
+            self.args, "network_k_all_actual_diversity_weight", 0.02
+        )), 0.0)
+        entropy_floor_weight = max(float(getattr(
+            self.args, "network_k_entropy_floor_weight", 1.0
+        )), 0.0)
+        total = (
+            actor_raw * actor_weight
+            + critic_raw * critic_weight
+            + ranking_raw * ranking_weight
+            + local_value_raw * local_value_weight
+            + critic_selection_raw * critic_selection_weight
+            - entropy_raw * entropy_weight
+            + replay_raw * replay_weight
+            + diversity_raw * diversity_weight
+            + entropy_floor_raw * entropy_floor_weight
+        )
+        best_slot = actual_best_slot
+        selected_slot = terms["selected_slot"].to(best_slot)
+        self.last_k_all_actual_debug = {
+            "actual_compression_percent": actual_loss.detach().cpu().tolist(),
+            "actual_gain_percent": actual_gain.detach().cpu().tolist(),
+            "actual_best_compression_percent": float(actual_loss.min().detach().cpu()),
+            "actual_mean_compression_percent": float(actual_loss.mean().detach().cpu()),
+            "actual_improving_plan_count": int((actual_loss < 0.0).sum().detach().cpu()),
+            "actual_zero_plan_count": int((actual_loss.abs() <= 1e-9).sum().detach().cpu()),
+            "actual_best_slot": best_slot.detach().cpu().tolist(),
+            "critic_selected_slot": selected_slot.detach().cpu().tolist(),
+            "critic_regret_percent": (
+                actual_gain.gather(1, best_slot.view(-1, 1))
+                - actual_gain.gather(1, selected_slot.view(-1, 1))
+            ).detach().cpu().tolist(),
+            "actor_raw": float(actor_raw.detach().cpu()),
+            "actor_on_policy_raw": float(actor_on_policy_raw.detach().cpu()),
+            "actor_coverage_positive_raw": float(
+                actor_coverage_positive_raw.detach().cpu()
+            ),
+            "actor_coverage_spatial_raw": float(
+                actor_coverage_spatial_raw.detach().cpu()
+            ),
+            "coverage_pair_ranking_raw": float(
+                coverage_pair_ranking_raw.detach().cpu()
+            ),
+            "coverage_pair_where_contrast_raw": float(
+                coverage_pair_where_contrast_raw.detach().cpu()
+            ),
+            "coverage_positive_plan_count": int(positive_count.detach().cpu()),
+            "absolute_advantage": absolute_advantage.detach().cpu().tolist(),
+            "relative_advantage": relative_advantage.detach().cpu().tolist(),
+            "combined_advantage": advantage.detach().cpu().tolist(),
+            "worsening_reinforced_count": int(worsening_reinforced.sum().detach().cpu()),
+            "negative_theta_update_blocked": bool(block_negative_theta),
+            "critic_raw": float(critic_raw.detach().cpu()),
+            "critic_regression_raw": float(critic_regression_raw.detach().cpu()),
+            "critic_sign_raw": float(critic_sign_raw.detach().cpu()),
+            "critic_mae_percent": float(
+                (predicted_gain_flat - actual_gain).abs().mean().detach().cpu()
+            ),
+            "critic_sign_match": float(
+                torch.sign(predicted_gain_flat).eq(torch.sign(actual_gain))
+                .to(torch.float32).mean().detach().cpu()
+            ),
+            "local_value_raw": float(local_value_raw.detach().cpu()),
+            "local_value_weighted": float(
+                (local_value_raw * local_value_weight).detach().cpu()
+            ),
+            "ranking_raw": float(ranking_raw.detach().cpu()),
+            "critic_selection_raw": float(critic_selection_raw.detach().cpu()),
+            "critic_selection_weighted": float(
+                (critic_selection_raw * critic_selection_weight).detach().cpu()
+            ),
+            "entropy_raw": float(entropy_raw.detach().cpu()),
+            "entropy_floor_raw": float(entropy_floor_raw.detach().cpu()),
+            "entropy_floor_weighted": float(
+                (entropy_floor_raw * entropy_floor_weight).detach().cpu()
+            ),
+            "normalized_entropy": {
+                family: float(value.detach().cpu())
+                for family, value in normalized_entropies.items()
+            },
+            "elite_replay_raw": float(replay_raw.detach().cpu()),
+            "elite_replay_weighted": float((replay_raw * replay_weight).detach().cpu()),
+            "theta_diversity_raw": float(diversity_raw.detach().cpu()),
+            "theta_diversity_weighted": float((diversity_raw * diversity_weight).detach().cpu()),
+            "replay_store": replay_store_debug,
+            "replay_elite": replay_debug,
+            "total": float(total.detach().cpu()),
+            "ratio_class": terms["ratio_class"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("ratio_class")) else [],
+            "shares": terms["shares"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("shares")) else [],
+            "order_class": terms["order_class"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("order_class")) else [],
+            "variant_class": terms["variant_class"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("variant_class")) else [],
+            "unique_executable_plan_count": int(
+                terms.get("unique_executable_plan_count", -1)
+            ),
+            "exploration_temperature": float(
+                terms["exploration_temperature"].detach().cpu()
+            ) if torch.is_tensor(terms.get("exploration_temperature")) else 0.0,
+            "exploration_anneal_blocked": bool(
+                terms.get("exploration_anneal_blocked", False)
+            ),
+            "positive_experience_count": int(
+                terms.get("positive_experience_count", 0)
+            ),
+            "exploration_anneal_progress": float(
+                terms["exploration_anneal_progress"].detach().cpu()
+            ) if torch.is_tensor(terms.get("exploration_anneal_progress")) else 0.0,
+            "coverage_slot_count": int(terms.get("coverage_slot_count", 0)),
+            "coverage_sequence_step": int(terms.get("coverage_sequence_step", -1)),
+            "coverage_theta_index": terms["coverage_theta_index"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("coverage_theta_index")) else [],
+            "coverage_permuted_theta_index": terms[
+                "coverage_permuted_theta_index"
+            ].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("coverage_permuted_theta_index")) else [],
+            "coverage_share_lattice_index": terms[
+                "coverage_share_lattice_index"
+            ].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("coverage_share_lattice_index")) else [],
+        }
+        return total
+
+    def _normalize_coord_scale(self, pts_xyz, coord_scale): # 座標スケールと点群テンソルに合わせた形に整える補助関数
+        if coord_scale is None:
+            return pts_xyz.new_ones((pts_xyz.shape[0], 1, 1))
+        if torch.is_tensor(coord_scale):
+            scale = coord_scale.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
+            if scale.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                scale = scale.expand(pts_xyz.shape[0], -1, -1)
+            return scale.clamp_min(1e-9)
+        return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), max(float(coord_scale), 1e-9))
+
+    def _should_collect_runtime_debug(self): # このStepで構造デバッグ情報を集めるか否かの判定
+        return bool(
+            (getattr(self.args, "verbose_step_logs", False) and getattr(self.args, "_log_this_step", True))
+            or getattr(self.args, "_collect_structure_debug", False)
+        )
+
+    def _timing_enabled(self): # Forward内で処理時間を測定するか否かの判定
+        return bool(
+            getattr(self.args, "debug_timing", False)
+            or getattr(self.args, "_profile_runtime_this_step", False)
+        )
+
+    @staticmethod
+    def _sync_if_cuda_tensor(tensor): # 入力テンソルがCUDA上にある場合だけ、GPU処理を同期する関数
+        if torch.is_tensor(tensor) and tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+
+    @staticmethod
+    def _first_occurrence_indices(inverse, num_unique): # Unique Voxelに対して、最初に出現した点のインデックスを1つずつ取り出す
+        order = torch.argsort(inverse, stable=True)
+        sorted_inverse = inverse.index_select(0, order)
+        first_mask = torch.ones_like(sorted_inverse, dtype=torch.bool)
+        if sorted_inverse.numel() > 1:
+            first_mask[1:] = sorted_inverse[1:] != sorted_inverse[:-1]
+        first_sorted_idx = order[first_mask]
+        if int(first_sorted_idx.numel()) != int(num_unique):
+            raise RuntimeError("Failed to recover one representative index per voxel.")
+        return first_sorted_idx
+
+    """Node/Voxel入力用関数"""
+    @staticmethod
+    def _normalize_node_voxel_coords(coords, device=None):
+        if coords is None:
+            return None
+        if not torch.is_tensor(coords):
+            coords = torch.as_tensor(coords)
+        if device is not None:
+            coords = coords.to(device=device)
+        if coords.ndim == 2:
+            if coords.shape[0] == 3:
+                coords = coords.unsqueeze(0)
+            elif coords.shape[1] == 3:
+                coords = coords.transpose(0, 1).contiguous().unsqueeze(0)
+            else:
+                return None
+        elif coords.ndim == 3:
+            if coords.shape[1] == 3:
+                coords = coords.contiguous()
+            elif coords.shape[2] == 3:
+                coords = coords.permute(0, 2, 1).contiguous()
+            else:
+                return None
+        else:
+            return None
+        return coords.to(dtype=torch.long).contiguous()
+
+    @staticmethod
+    def _normalize_unit_keys(unit_keys, batch_size, point_count, device):
+        """
+        CauseDiagnosisAggregationへ渡すunit_keysを [B, N] に揃える。
+        global_morton_keys / structural_voxel_key / point_feature_voxel_key の形状差を吸収する。
+        """
+        if unit_keys is None:
+            return None
+
+        if not torch.is_tensor(unit_keys):
+            unit_keys = torch.as_tensor(unit_keys)
+
+        unit_keys = unit_keys.to(device=device, dtype=torch.long)
+
+        if unit_keys.ndim == 1:
+            unit_keys = unit_keys.view(1, -1)
+
+        elif unit_keys.ndim == 2:
+            if unit_keys.shape[0] == 1:
+                pass
+            elif unit_keys.shape[1] == 1:
+                unit_keys = unit_keys.reshape(1, -1)
+            else:
+                pass
+
+        elif unit_keys.ndim == 3:
+            if unit_keys.shape[1] == 1:
+                unit_keys = unit_keys.squeeze(1)
+            elif unit_keys.shape[2] == 1:
+                unit_keys = unit_keys.squeeze(2)
+            else:
+                return None
+        else:
+            return None
+
+        if unit_keys.ndim != 2:
+            return None
+
+        B = int(batch_size)
+        N = int(point_count)
+
+        if unit_keys.shape[0] == 1 and B > 1:
+            unit_keys = unit_keys.expand(B, -1).contiguous()
+
+        if unit_keys.shape[0] != B:
+            return None
+
+        current_n = int(unit_keys.shape[1])
+
+        if current_n == N:
+            return unit_keys.contiguous()
+
+        if current_n <= 0:
+            return None
+
+        if current_n > N:
+            return unit_keys[:, :N].contiguous()
+
+        pad = unit_keys[:, -1:].expand(B, N - current_n)
+        return torch.cat([unit_keys, pad], dim=1).contiguous()
+
+    def _unit_keys_from_voxel_coords(self, context, batch_size, point_count, device):
+        """
+        repair_unit_keys / global_morton_keys が無い場合に、
+        global_voxel_coords から CauseDiagnosisAggregation 用の unit_keys=[B,N] を作る。
+        これは local recompute ではなく、prebuilt global voxel coords に基づく fallback である。
+        """
+        if not isinstance(context, dict):
+            return None
+
+        coords_raw = self._first_tensor_from_dict(
+            context,
+            (
+                "global_voxel_coords",
+                "subtree_global_voxel_coords",
+                "occupied_voxel_coords",
+                "full_global_voxel_coords",
+                "full_occupied_voxel_coords",
+            ),
+        )
+        if coords_raw is None:
+            return None
+
+        coords_b3n = self._normalize_node_voxel_coords(coords_raw, device=device)
+        if coords_b3n is None or coords_b3n.shape[-1] <= 0:
+            return None
+
+        coords_b3n = coords_b3n.to(device=device, dtype=torch.long)
+
+        if coords_b3n.shape[0] == 1 and int(batch_size) > 1:
+            coords_b3n = coords_b3n.expand(int(batch_size), -1, -1).contiguous()
+
+        if coords_b3n.shape[0] != int(batch_size):
+            return None
+
+        # 点数を analysis_xyz に合わせる。
+        current_n = int(coords_b3n.shape[-1])
+        target_n = int(point_count)
+
+        if current_n > target_n:
+            coords_b3n = coords_b3n[:, :, :target_n].contiguous()
+        elif current_n < target_n:
+            if current_n <= 0:
+                return None
+            pad = coords_b3n[:, :, -1:].expand(coords_b3n.shape[0], 3, target_n - current_n)
+            coords_b3n = torch.cat([coords_b3n, pad], dim=2).contiguous()
+
+        # 3次元voxel座標から安定した整数keyを作る。
+        # morton keyそのものではないが、同一voxelを同一repair unitにまとめる目的には十分である。
+        unit_keys = (
+            coords_b3n[:, 0, :] * 73856093
+            + coords_b3n[:, 1, :] * 19349663
+            + coords_b3n[:, 2, :] * 83492791
+        )
+
+        return self._normalize_unit_keys(
+            unit_keys,
+            batch_size=batch_size,
+            point_count=point_count,
+            device=device,
+        )
+    
+    @staticmethod
+    def _first_tensor_from_dict(dict_obj, keys):
+        if not isinstance(dict_obj, dict):
+            return None
+        for key in keys:
+            value = dict_obj.get(key, None)
+            if torch.is_tensor(value):
+                return value
+        return None
+
+    @staticmethod
+    def _first_value_from_dict(dict_obj, keys):
+        if not isinstance(dict_obj, dict):
+            return None
+        for key in keys:
+            if key in dict_obj and dict_obj.get(key, None) is not None:
+                return dict_obj.get(key)
+        return None
+
+    @staticmethod
+    def _child_slot_from_coords_lastdim(coords):
+        coords = coords.to(dtype=torch.long)
+        return (
+            coords[..., 0].remainder(2)
+            + 2 * coords[..., 1].remainder(2)
+            + 4 * coords[..., 2].remainder(2)
+        ).to(dtype=torch.long)
+
+    def _parent_occupancy_codes_and_child_slots(self, coords_b3n):
+        B, _, N = coords_b3n.shape
+        parent_codes = torch.zeros((B, N), device=coords_b3n.device, dtype=torch.long)
+        child_slots = torch.zeros((B, N), device=coords_b3n.device, dtype=torch.long)
+        pattern_weights = (2 ** torch.arange(8, device=coords_b3n.device, dtype=torch.long)).view(1, 8)
+        for b in range(B):
+            coords = coords_b3n[b].transpose(0, 1).contiguous().to(dtype=torch.long)
+            if coords.numel() == 0:
+                continue
+            parents = torch.div(coords, 2, rounding_mode="floor")
+            slots = self._child_slot_from_coords_lastdim(coords)
+            child_slots[b] = slots
+            unique_parents, inverse = torch.unique(parents, dim=0, sorted=True, return_inverse=True)
+            occupancy = torch.zeros(
+                (unique_parents.shape[0], 8),
+                device=coords_b3n.device,
+                dtype=torch.bool,
+            )
+            occupancy[inverse, slots.clamp(0, 7)] = True
+            codes = (occupancy.to(dtype=torch.long) * pattern_weights).sum(dim=1)
+            parent_codes[b] = codes.index_select(0, inverse)
+        return parent_codes, child_slots
+
+    def _occupancy_code_popularity_for_features(self, like_tensor, *contexts):
+        parts = []
+
+        def _add_codes(ctx, key, weight=1.0):
+            if not isinstance(ctx, dict) or key not in ctx:
+                return
+            value = ctx.get(key, None)
+            if value is None:
+                return
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            value = value.to(device=like_tensor.device, dtype=torch.long).reshape(-1)
+            value = value[(value >= 0) & (value < 256)]
+            if value.numel() <= 0:
+                return
+            repeat = max(int(round(float(weight))), 1)
+            parts.append(value.repeat(repeat))
+
+        for ctx in contexts:
+            _add_codes(ctx, "occupancy_codes", weight=3.0)
+            _add_codes(ctx, "ancestor_occupancy_codes", weight=2.0)
+            _add_codes(ctx, "sibling_occupancy_codes", weight=2.0)
+            _add_codes(ctx, "parent_occupancy_code", weight=2.0)
+
+        smoothing = max(float(getattr(self.args, "repair_pattern_prior_smoothing", 1.0)), 0.0)
+        counts = like_tensor.new_ones((256,), dtype=torch.float32) * smoothing
+        if parts:
+            codes = torch.cat(parts, dim=0)
+            counts.scatter_add_(0, codes, torch.ones_like(codes, dtype=counts.dtype))
+        popularity = torch.log1p(counts)
+        return popularity / popularity.amax().clamp_min(1e-6)
+
+    def _fit_feature_channels(self, feature, target_channels):
+        if feature.shape[1] == int(target_channels):
+            return feature
+        if feature.shape[1] > int(target_channels):
+            return feature[:, :int(target_channels), :].contiguous()
+        pad = feature.new_zeros(
+            feature.shape[0],
+            int(target_channels) - feature.shape[1],
+            feature.shape[2],
+        )
+        return torch.cat([feature, pad], dim=1).contiguous()
+
+    def _build_node_features_from_voxel_coords(
+        self,
+        coords_b3n,
+        pts_xyz,
+        node_mask=None,
+        subtree_tree=None,
+        full_octree_context=None,
+    ):
+        coords_f = coords_b3n.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        if coords_f.shape[-1] <= 0:
+            return pts_xyz.new_zeros((pts_xyz.shape[0], int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))), 0))
+
+        if node_mask is not None and torch.is_tensor(node_mask):
+            mask = node_mask.to(device=pts_xyz.device, dtype=torch.bool)
+            if mask.ndim == 3:
+                mask = mask.squeeze(1)
+        else:
+            mask = torch.ones((coords_f.shape[0], coords_f.shape[-1]), device=pts_xyz.device, dtype=torch.bool)
+
+        valid_f = mask.unsqueeze(1).to(dtype=coords_f.dtype)
+        denom = valid_f.sum(dim=2, keepdim=True).clamp_min(1.0)
+        mean = (coords_f * valid_f).sum(dim=2, keepdim=True) / denom
+        centered = coords_f - mean
+        span = centered.abs().amax(dim=2, keepdim=True).clamp_min(1.0)
+        norm = centered / span
+
+        radius = torch.linalg.norm(norm, dim=1, keepdim=True).clamp(0.0, 4.0) / 4.0
+        parity = (coords_b3n.remainder(2).to(dtype=pts_xyz.dtype) * 2.0) - 1.0
+        depth_proxy = torch.linalg.norm(coords_f - coords_f.amin(dim=2, keepdim=True), dim=1, keepdim=True)
+        depth_proxy = depth_proxy / depth_proxy.amax(dim=2, keepdim=True).clamp_min(1.0)
+
+        parent_codes, child_slots = self._parent_occupancy_codes_and_child_slots(coords_b3n)
+        slot_values = torch.arange(8, device=coords_b3n.device, dtype=torch.long).view(1, 8, 1)
+        child_slot_onehot = (child_slots.unsqueeze(1) == slot_values).to(dtype=pts_xyz.dtype)
+        parent_code_feature = (parent_codes.to(dtype=pts_xyz.dtype).unsqueeze(1) / 255.0) * 2.0 - 1.0
+        child_count = torch.zeros_like(parent_codes, dtype=pts_xyz.dtype)
+        for bit in range(8):
+            child_count = child_count + ((parent_codes >> bit) & 1).to(dtype=pts_xyz.dtype)
+        child_count = (child_count.unsqueeze(1) / 8.0).clamp(0.0, 1.0)
+        code_popularity = self._occupancy_code_popularity_for_features(
+            pts_xyz,
+            subtree_tree,
+            full_octree_context,
+        )
+        parent_popularity = code_popularity.index_select(
+            0,
+            parent_codes.reshape(-1).clamp(0, 255),
+        ).view(coords_b3n.shape[0], coords_b3n.shape[-1]).unsqueeze(1).to(dtype=pts_xyz.dtype)
+
+        base_feature = torch.cat(
+            [
+                norm,
+                norm.abs(),
+                radius,
+                parity,
+                depth_proxy,
+                child_slot_onehot,
+                parent_code_feature,
+                child_count,
+                parent_popularity,
+                valid_f,
+            ],
+            dim=1,
+        )
+        return self._fit_feature_channels(
+            base_feature,
+            int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))),
+        )
+
+    def _build_node_voxel_input(
+        self,
+        pts_xyz,
+        cache_key=None,
+        coord_scale=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
+    ):
+        """
+        subtree_tree/full_octree_context/canonical voxel coordsから
+        Network用のnode/voxel featureを作る。
+        """
+        debug = {
+            "network_voxel_node_input_requested": bool(getattr(self.args, "network_voxel_node_input", False)),
+            "network_voxel_node_input_used": False,
+            "network_voxel_node_fallback": False,
+            "network_voxel_node_fallback_reason": "",
+            "network_voxel_node_count": 0,
+            "network_voxel_node_source": "none",
+            "network_voxel_node_feature_shape": "",
+            "network_voxel_node_cache_hit": False,
+        }
+
+        if not bool(getattr(self.args, "network_voxel_node_input", False)):
+            debug["network_voxel_node_fallback_reason"] = "disabled_by_args"
+            return None, debug
+
+        allow_fallback = bool(getattr(self.args, "network_voxel_node_fallback_point", True))
+        use_subtree = bool(getattr(self.args, "voxel_node_use_subtree_context", True))
+        use_full = bool(getattr(self.args, "voxel_node_use_full_context", True))
+
+        coords_raw = None
+        source = "none"
+
+        if use_subtree and isinstance(subtree_tree, dict):
+            coords_raw = self._first_tensor_from_dict(
+                subtree_tree,
+                (
+                    "global_voxel_coords",
+                    "subtree_global_voxel_coords",
+                    "occupied_voxel_coords",
+                    "full_global_voxel_coords",
+                ),
+            )
+            if coords_raw is not None:
+                source = "subtree_tree"
+
+        if coords_raw is None and use_full and isinstance(full_octree_context, dict):
+            coords_raw = self._first_tensor_from_dict(
+                full_octree_context,
+                (
+                    "global_voxel_coords",
+                    "full_global_voxel_coords",
+                    "full_occupied_voxel_coords",
+                    "occupied_voxel_coords",
+                ),
+            )
+            if coords_raw is not None:
+                source = "full_octree_context"
+
+        # Only full-cloud canonical inputs are invariant across train steps.
+        # Subtree contexts deliberately remain uncached because their selected
+        # membership can change between steps.
+        if source == "full_octree_context" and subtree_tree is None:
+            cached_state = self._get_static_node_cache(
+                cache_key,
+                source,
+                pts_xyz.device,
+            )
+            if cached_state is not None:
+                cached_debug = dict(debug)
+                cached_debug.update(
+                    {
+                        "network_voxel_node_input_used": True,
+                        "network_voxel_node_fallback": False,
+                        "network_voxel_node_fallback_reason": "",
+                        "network_voxel_node_count": int(cached_state["node_xyz"].shape[-1]),
+                        "network_voxel_node_source": "full_octree_context_cache",
+                        "network_voxel_node_feature_shape": str(tuple(cached_state["node_features"].shape)),
+                        "network_voxel_node_cache_hit": True,
+                    }
+                )
+                return cached_state, cached_debug
+
+        meta = None
+        if coords_raw is None:
+            missing_subtree_and_full_context = (
+                subtree_tree is None
+                and full_octree_context is None
+            )
+
+            # full_octree_context がある場合は、subtree_tree が無くてもNode/Voxel経路を継続する。
+            # full cloud anchorでは full_octree_context の global_voxel_coords を使う。
+            if missing_subtree_and_full_context and allow_fallback:
+                debug["network_voxel_node_fallback"] = True
+                debug["network_voxel_node_fallback_reason"] = "missing_subtree_and_full_context"
+                return None, debug
+
+            try:
+                q_result = quantize_sparsepcgc_coords(
+                    pts_xyz,
+                    self.args,
+                    coord_scale=coord_scale,
+                    offset=None,
+                    return_metadata=True,
+                )
+                if isinstance(q_result, tuple) and len(q_result) == 2:
+                    coords_raw, meta = q_result
+                else:
+                    coords_raw = q_result
+                source = "canonical_quantize"
+            except Exception as exc:
+                if allow_fallback:
+                    debug["network_voxel_node_fallback"] = True
+                    debug["network_voxel_node_fallback_reason"] = f"canonical_quantize_failed:{type(exc).__name__}"
+                    return None, debug
+                raise
+
+        coords_b3n = self._normalize_node_voxel_coords(coords_raw, device=pts_xyz.device)
+        if coords_b3n is None or coords_b3n.shape[-1] <= 0:
+            if allow_fallback:
+                debug["network_voxel_node_fallback"] = True
+                debug["network_voxel_node_fallback_reason"] = "invalid_or_empty_voxel_coords"
+                return None, debug
+            raise ValueError("Node/Voxel input requested but voxel coords are invalid or empty.")
+
+        unique_result = unique_voxel_coords_batched(coords_b3n)
+        voxel_coords = unique_result["coords"].to(device=pts_xyz.device, dtype=torch.long)
+        node_mask = unique_result["valid_mask"].to(device=pts_xyz.device, dtype=torch.bool)
+        node_counts = unique_result["counts"].to(device=pts_xyz.device, dtype=torch.long)
+
+        if isinstance(meta, dict):
+            restore_meta = dict(meta)
+        else:
+            restore_meta = {}
+
+        context_for_meta = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+        if isinstance(context_for_meta, dict):
+            global_qs = self._first_value_from_dict(context_for_meta, ("global_qs", "effective_qs"))
+            global_offset = self._first_value_from_dict(context_for_meta, ("global_offset", "global_offset_tensor"))
+            if global_qs is not None:
+                restore_meta["global_qs"] = global_qs
+            if global_offset is not None:
+                restore_meta["global_offset"] = global_offset
+
+        try:
+            node_xyz, restore_info = restore_points_from_voxel_coords(
+                voxel_coords,
+                meta=restore_meta if restore_meta else None,
+                args=self.args,
+                center=bool(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+                unique=False,
+                dtype=pts_xyz.dtype,
+                device=pts_xyz.device,
+            )
+        except Exception as exc:
+            if allow_fallback:
+                debug["network_voxel_node_fallback"] = True
+                debug["network_voxel_node_fallback_reason"] = f"restore_failed:{type(exc).__name__}"
+                return None, debug
+            raise
+
+        node_features = self._build_node_features_from_voxel_coords(
+            voxel_coords,
+            pts_xyz=pts_xyz,
+            node_mask=node_mask,
+            subtree_tree=subtree_tree,
+            full_octree_context=full_octree_context,
+        )
+
+        debug.update(
+            {
+                "network_voxel_node_input_used": True,
+                "network_voxel_node_fallback": False,
+                "network_voxel_node_fallback_reason": "",
+                "network_voxel_node_count": int(node_xyz.shape[-1]),
+                "network_voxel_node_source": str(source),
+                "network_voxel_node_feature_shape": str(tuple(node_features.shape)),
+            }
+        )
+
+        state = {
+            "voxel_coords": voxel_coords,
+            "node_xyz": node_xyz,
+            "node_features": node_features,
+            "node_mask": node_mask,
+            "node_counts": node_counts,
+            "global_qs": restore_meta.get("global_qs", None),
+            "global_offset": restore_meta.get("global_offset", None),
+            "restore_meta": restore_meta,
+            "restore_info": restore_info,
+            "source": str(source),
+        }
+        if source == "full_octree_context" and subtree_tree is None:
+            self._put_static_node_cache(cache_key, source, state)
+            debug["network_voxel_node_cache_hit"] = False
+        return state, debug
+
+    """Encoder用関数"""
+    def _voxel_downsample_single(self, pts_xyz, coord_scale): # 1つの点群サンプルに対して、Voxel DownSamplingを行う関数
+        num_points = int(pts_xyz.shape[-1]) # 点数取得
+        max_points = max(int(getattr(self.args, "encoder_pre_downsample_max_points", 0)), 0) # Encoderに入力数最大点数
+        cdist_cap = max(int(getattr(self.args, "encoder_cdist_max_points", 0)), 0) # 距離計算を使う場合の最大点数制限を取得
+        if utils_repkpu.KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
+            max_points = min(max_points, cdist_cap) if max_points > 0 else cdist_cap
+        if max_points <= 0 or num_points <= max_points:
+            full_idx = torch.arange(num_points, device=pts_xyz.device, dtype=torch.long)
+            return pts_xyz, full_idx, 0.0
+
+        scale = self._normalize_coord_scale(pts_xyz.unsqueeze(0), coord_scale).reshape(-1)[0] # 座標スケールの正規化
+        base_voxel = ( # 規準となるVoxelサイズの計算
+            float(getattr(self.args, "encoder_pre_downsample_voxel_scale", 1.0))
+            * float(getattr(self.args, "qs", 2.0))
+            / max(float(scale.item()), 1e-9)
+        )
+        mins = pts_xyz.amin(dim=1, keepdim=True) # 各座標軸ごとの最小値
+        span = (pts_xyz.amax(dim=1, keepdim=True) - mins).amax().clamp_min(1e-9) # 点群全体の空間的な広がりの算出
+        voxel_size = max(base_voxel, float(span.item()) / max(float(max_points), 1.0) ** (1.0 / 3.0)) # 実際に使うVoxelサイズの決定
+        growth = max(float(getattr(self.args, "encoder_pre_downsample_growth", 1.5)), 1.05) # Voxelサイズを大きくしていく倍率の取得
+        max_iters = max(int(getattr(self.args, "encoder_pre_downsample_max_iters", 8)), 1) # Voxelサイズ調整を試す最大反復回数の取得
+
+        rep_idx = None # 各Voxelの代表点インデックスを保存する変数の初期化
+        for _ in range(max_iters): # Voxelサイズを調整しながらDownSamplingを行う
+            coords = torch.floor((pts_xyz - mins) / max(voxel_size, 1e-9)).long().transpose(0, 1).contiguous()
+            unique_coords, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+            voxel_count = int(unique_coords.shape[0])
+            rep_idx = self._first_occurrence_indices(inverse, voxel_count)
+            if voxel_count <= max_points:
+                break
+            voxel_size *= growth
+
+        rep_idx = torch.sort(rep_idx.unique(sorted=True)).values
+        if rep_idx.numel() > max_points:
+            rep_idx = rep_idx[:max_points]
+        coarse_xyz = pts_xyz.index_select(1, rep_idx)
+        return coarse_xyz, rep_idx, voxel_size
+
+    def _propagate_encoder_features(self, full_xyz, coarse_xyz, coarse_feat): # 粗い点群上で得た特徴を元の点群の各点へ伝播する関数
+        if coarse_xyz.shape[-1] == full_xyz.shape[-1]:
+            return coarse_feat
+        method = str(getattr(self.args, "encoder_feature_propagation", "knn_inverse_distance")).strip().lower()
+        if method not in {"knn_inverse_distance", "idw", "nearest"}:
+            raise ValueError(f"Unsupported encoder_feature_propagation: {method}")
+
+        k = max(int(getattr(self.args, "encoder_feature_propagation_k", 3)), 1)
+        k = min(k, int(coarse_xyz.shape[-1]))
+        coarse_knn, knn_idx = get_knn_pts(k, coarse_xyz, full_xyz, return_idx=True)
+        feat_knn = index_points(coarse_feat, knn_idx)
+
+        if k == 1 or method == "nearest":
+            return feat_knn[..., 0]
+
+        dist = torch.linalg.norm(full_xyz.unsqueeze(-1) - coarse_knn, dim=1).clamp_min(1e-9)
+        inv_dist = 1.0 / dist
+        weight = inv_dist / inv_dist.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        return (feat_knn * weight.unsqueeze(1)).sum(dim=-1)
+
+    def _propagate_batch_features(self, full_xyz, coarse_xyz, coarse_counts, coarse_feat): # バッチ単位で、粗い点群特徴を元点群へ伝播する関数
+        if coarse_xyz.shape[-1] == full_xyz.shape[-1]:
+            return coarse_feat
+        propagated = []
+        for b in range(full_xyz.shape[0]):
+            coarse_count = coarse_counts[b]
+            coarse_xyz_b = coarse_xyz[b:b + 1, :, :coarse_count]
+            coarse_feat_b = coarse_feat[b:b + 1, :, :coarse_count]
+            full_xyz_b = full_xyz[b:b + 1]
+            propagated.append(self._propagate_encoder_features(full_xyz_b, coarse_xyz_b, coarse_feat_b))
+        return torch.cat(propagated, dim=0)
+
+    @staticmethod
+    def _propagate_batch_features_by_index(coarse_feat, coarse_counts, full_to_coarse_idx): # 粗い点群上の特徴を元点分側へ戻す関数
+        if not full_to_coarse_idx:
+            return None
+        propagated = []
+        for b, idx in enumerate(full_to_coarse_idx):
+            if idx is None:
+                return None
+            coarse_count = int(coarse_counts[b])
+            if coarse_count <= 0:
+                return None
+            idx = idx.to(device=coarse_feat.device, dtype=torch.long).clamp(0, coarse_count - 1)
+            propagated.append(coarse_feat[b:b + 1, :, :coarse_count].index_select(2, idx))
+        return torch.cat(propagated, dim=0)
+
+    def _encoder_sparse_qs_mode_and_pos(self): # Encoder用のSparse Tensorを作る時に、どの量子化スケール・量子化モード・位置量子化倍率を使うか決める関数
+        if is_geometry_octree(self.args):
+            return geometry_step(self.args), "geometry_octree", 1
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key == "sparsepcgc":
+            voxel_size = max(float(getattr(self.args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
+            pos_q = max(int(getattr(self.args, "sparsepcgc_pos_quantscale", 1)), 1)
+            return voxel_size, "sparsepcgc_twostep", pos_q
+        if compress_key in {"gpcc", "gpcctmc3"}:
+            return max(float(getattr(self.args, "gpcc_effective_qs", getattr(self.args, "qs", 2.0))), 1e-9), "floor_relative", 1
+        return max(float(getattr(self.args, "qs", 2.0)), 1e-9), "floor_relative", 1
+
+    def _encode(self, pts_xyz, coord_scale=None): # 入力点群をEncoderに通し、特徴量などを返す関数
+        encoder_input = pts_xyz
+        encoder_feat = None
+        analysis_xyz = pts_xyz
+        analysis_counts = []
+        encoder_counts = []
+        full_counts = []
+        raw_counts = []
+        pre_sparse_counts = []
+        voxel_sizes = []
+        full_to_coarse_idx = []
+        if bool(getattr(self.args, "encoder_sparse_tensor", True)):
+            sparse_xyz_list = []
+            sparse_full_xyz_list = []
+            sparse_feat_list = []
+            scale = self._normalize_coord_scale(pts_xyz, coord_scale)
+            sparse_qs, sparse_quant_mode, sparse_pos_q = self._encoder_sparse_qs_mode_and_pos()
+            encoder_max_points = int(getattr(self.args, "encoder_pre_downsample_max_points", 0))
+            cdist_cap = max(int(getattr(self.args, "encoder_cdist_max_points", 0)), 0)
+            if utils_repkpu.KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
+                encoder_max_points = min(encoder_max_points, cdist_cap) if encoder_max_points > 0 else cdist_cap
+            for b in range(pts_xyz.shape[0]):
+                point_builder = build_geometry_point_features if is_geometry_octree(self.args) else build_sparse_point_tensor_single
+                sparse_tensor = point_builder(
+                    pts_xyz[b],
+                    scale[b:b + 1],
+                    max_points=encoder_max_points,
+                    qs=sparse_qs,
+                    raw_downsample_factor=float(getattr(self.args, "encoder_raw_downsample_factor", 1.0)),
+                    voxel_scale=float(getattr(self.args, "encoder_pre_downsample_voxel_scale", 1.0)),
+                    growth=float(getattr(self.args, "encoder_pre_downsample_growth", 1.5)),
+                    max_iters=int(getattr(self.args, "encoder_pre_downsample_max_iters", 8)),
+                    quant_mode=sparse_quant_mode,
+                    pos_quantscale=sparse_pos_q,
+                )
+                sparse_full_xyz_b = sparse_tensor["sparse_xyz"]
+                sparse_xyz_b = sparse_tensor["coords_xyz"]
+                sparse_full_xyz_list.append(sparse_full_xyz_b)
+                sparse_feat_b = sparse_tensor["feat"]
+                sparse_xyz_list.append(sparse_xyz_b)
+                sparse_feat_list.append(sparse_feat_b)
+                raw_counts.append(int(sparse_tensor.get("raw_points", pts_xyz.shape[-1])))
+                pre_sparse_counts.append(int(sparse_tensor.get("pre_downsample_points", pts_xyz.shape[-1])))
+                analysis_counts.append(int(sparse_full_xyz_b.shape[-1]))
+                encoder_counts.append(int(sparse_xyz_b.shape[-1]))
+                full_counts.append(int(pts_xyz.shape[-1]))
+                voxel_sizes.append(float(sparse_tensor["voxel_size"]))
+                full_to_coarse_idx.append(sparse_tensor.get("full_to_coarse_idx"))
+            if sparse_xyz_list:
+                max_sparse = max(x.shape[-1] for x in sparse_xyz_list)
+                padded_xyz = []
+                padded_feat = []
+                for sparse_xyz_b, sparse_feat_b in zip(sparse_xyz_list, sparse_feat_list):
+                    if sparse_xyz_b.shape[-1] == max_sparse:
+                        padded_xyz.append(sparse_xyz_b)
+                        padded_feat.append(sparse_feat_b)
+                        continue
+                    pad_count = max_sparse - sparse_xyz_b.shape[-1]
+                    pad_xyz = sparse_xyz_b[:, -1:].expand(-1, pad_count)
+                    pad_feat = sparse_feat_b[:, -1:].expand(-1, pad_count)
+                    padded_xyz.append(torch.cat([sparse_xyz_b, pad_xyz], dim=1))
+                    padded_feat.append(torch.cat([sparse_feat_b, pad_feat], dim=1))
+                encoder_input = torch.stack(padded_xyz, dim=0)
+                encoder_feat = torch.stack(padded_feat, dim=0)
+                analysis_xyz = torch.stack(sparse_full_xyz_list, dim=0)
+        elif bool(getattr(self.args, "encoder_pre_downsample", False)):
+            mode = str(getattr(self.args, "encoder_pre_downsample_mode", "voxel")).strip().lower()
+            if mode != "voxel":
+                raise ValueError(f"Unsupported encoder_pre_downsample_mode: {mode}")
+            coarse_xyz_list = []
+            scale = self._normalize_coord_scale(pts_xyz, coord_scale)
+            for b in range(pts_xyz.shape[0]):
+                coarse_xyz_b, rep_idx_b, voxel_size_b = self._voxel_downsample_single(
+                    pts_xyz[b],
+                    scale[b:b + 1],
+                )
+                coarse_xyz_list.append(coarse_xyz_b)
+                encoder_counts.append(int(coarse_xyz_b.shape[-1]))
+                analysis_counts.append(int(pts_xyz.shape[-1]))
+                full_counts.append(int(pts_xyz.shape[-1]))
+                voxel_sizes.append(float(voxel_size_b))
+            if coarse_xyz_list:
+                max_coarse = max(x.shape[-1] for x in coarse_xyz_list)
+                if len(set(x.shape[-1] for x in coarse_xyz_list)) == 1:
+                    encoder_input = torch.stack(coarse_xyz_list, dim=0)
+                else:
+                    padded = []
+                    for coarse_xyz_b in coarse_xyz_list:
+                        if coarse_xyz_b.shape[-1] == max_coarse:
+                            padded.append(coarse_xyz_b)
+                            continue
+                        pad_count = max_coarse - coarse_xyz_b.shape[-1]
+                        pad_xyz = coarse_xyz_b[:, -1:].expand(-1, pad_count)
+                        padded.append(torch.cat([coarse_xyz_b, pad_xyz], dim=1))
+                    encoder_input = torch.stack(padded, dim=0)
+        else:
+            analysis_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+            encoder_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+            full_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+            raw_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+            pre_sparse_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+            voxel_sizes = [0.0] * pts_xyz.shape[0]
+
+        if bool(getattr(self.args, "encoder_0grad", True)):
+            with torch.no_grad():
+                local_sparse, fused_sparse = self.encoder(encoder_input, feat=encoder_feat)
+            local_sparse = local_sparse.detach()
+            fused_sparse = fused_sparse.detach()
+        else:
+            local_sparse, fused_sparse = self.encoder(encoder_input, feat=encoder_feat)
+
+        local_feat = local_sparse
+        fused_feat = fused_sparse
+        keep_sparse_path = bool(
+            getattr(self.args, "encoder_sparse_tensor", True)
+            and getattr(self.args, "sparse_tensor_keep_after_encoder", True)
+        )
+        if keep_sparse_path:
+            if encoder_input.shape[-1] != analysis_xyz.shape[-1]:
+                local_by_index = self._propagate_batch_features_by_index(local_sparse, encoder_counts, full_to_coarse_idx)
+                fused_by_index = self._propagate_batch_features_by_index(fused_sparse, encoder_counts, full_to_coarse_idx)
+                if local_by_index is not None and fused_by_index is not None:
+                    local_feat = local_by_index
+                    fused_feat = fused_by_index
+                else:
+                    local_feat = self._propagate_batch_features(analysis_xyz, encoder_input, encoder_counts, local_sparse)
+                    fused_feat = self._propagate_batch_features(analysis_xyz, encoder_input, encoder_counts, fused_sparse)
+        elif encoder_input.shape[-1] != pts_xyz.shape[-1]:
+            local_feat = self._propagate_batch_features(pts_xyz, encoder_input, encoder_counts, local_sparse)
+            fused_feat = self._propagate_batch_features(pts_xyz, encoder_input, encoder_counts, fused_sparse)
+
+        with torch.no_grad():
+            if not analysis_counts:
+                analysis_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+                encoder_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+                full_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+                raw_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+                pre_sparse_counts = [int(pts_xyz.shape[-1])] * pts_xyz.shape[0]
+                voxel_sizes = [0.0] * pts_xyz.shape[0]
+            self.last_encoder_debug = {
+                "enabled": bool(getattr(self.args, "encoder_pre_downsample", False) or getattr(self.args, "encoder_sparse_tensor", True)),
+                "mode": "sparse_tensor_voxel" if bool(getattr(self.args, "encoder_sparse_tensor", True)) else str(getattr(self.args, "encoder_pre_downsample_mode", "voxel")).strip().lower(),
+                "raw_points": raw_counts,
+                "pre_sparse_points": pre_sparse_counts,
+                "analysis_points": analysis_counts,
+                "full_points": full_counts,
+                "coarse_points": encoder_counts,
+                "voxel_size": voxel_sizes,
+                "propagation": (
+                    "voxel_assignment"
+                    if keep_sparse_path and full_to_coarse_idx
+                    else str(getattr(self.args, "encoder_feature_propagation", "knn_inverse_distance")).strip().lower()
+                ),
+                "propagation_k": int(getattr(self.args, "encoder_feature_propagation_k", 3)),
+                "feature_dim": int(getattr(self.args, "encoder_input_dim", 3)),
+                "kept_sparse_after_encoder": keep_sparse_path,
+                "raw_downsample_factor": float(getattr(self.args, "encoder_raw_downsample_factor", 1.0)),
+                "sparse_quant_mode": self._encoder_sparse_qs_mode_and_pos()[1],
+            }
+        return {
+            "local_feat": local_feat,
+            "fused_feat": fused_feat,
+            "local_sparse": local_sparse,
+            "fused_sparse": fused_sparse,
+            "analysis_xyz": analysis_xyz,
+            "encoder_xyz": encoder_input,
+            "analysis_counts": analysis_counts,
+            "coarse_counts": encoder_counts,
+            "full_counts": full_counts,
+            "voxel_sizes": voxel_sizes,
+            "kept_sparse_after_encoder": keep_sparse_path,
+        }
+
+    """各モジュール用関数"""
+    def _cause_weights(self, device, dtype): # 減員推定損失で各現員カテゴリの重みをTensorとして作る関数
+        return torch.tensor(
+            [
+                float(getattr(self.args, "attr_node_weight", 1.0)),
+                float(getattr(self.args, "attr_single_weight", 1.5)),
+                float(getattr(self.args, "attr_lowprob_weight", 1.5)),
+                float(getattr(self.args, "attr_context_weight", 1.0)),
+                float(getattr(self.args, "attr_quant_weight", 1.25)),
+                float(getattr(self.args, "attr_sparse_weight", 1.0)),
+                float(getattr(self.args, "attr_outlier_weight", 1.0)),
+                float(getattr(self.args, "attr_shape_weight", 0.75)),
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+    def _direct_structure_scores(self, cause_targets):
+        """Octree原因教師をCostAttributionの予測分布と同じ表現へ変換する。"""
+        targets = torch.nan_to_num(
+            cause_targets,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        weights = self._cause_weights(targets.device, targets.dtype).view(1, -1, 1)
+        weighted = targets * weights
+        mass = weighted.sum(dim=1, keepdim=True)
+        normalized = weighted / mass.clamp_min(1e-6)
+        uniform = torch.full_like(
+            normalized,
+            1.0 / max(int(normalized.shape[1]), 1),
+        )
+        return torch.where((mass > 1e-6).expand_as(normalized), normalized, uniform).detach()
+
+    @staticmethod
+    def _normalize_point_mask(mask, batch_size, num_points, device): # 点単位のマスクをBool Tensorに整形
+        if mask is None:
+            return None
+        if mask.ndim == 3 and mask.shape[1] == 1:
+            mask = mask.squeeze(1)
+        if mask.ndim != 2 or mask.shape[0] != batch_size or mask.shape[1] != num_points:
+            raise ValueError(f"point mask must have shape [B, N], got {tuple(mask.shape)}")
+        return mask.to(device=device, dtype=torch.bool)
+
+    @staticmethod
+    def _slice_point_aligned_tensor(value, point_mask, batch_size, device):
+        """
+        full cloud 上の点・voxelに対応するTensorを、subtree maskで切り出す。
+        ここではB=1のsubtree学習を主対象にする。
+        """
+        if value is None:
+            return None
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value)
+
+        value = value.to(device=device)
+        mask = point_mask
+        if mask.ndim == 3:
+            mask = mask.squeeze(1)
+        mask = mask.to(device=device, dtype=torch.bool)
+
+        if mask.shape[0] != batch_size:
+            if mask.shape[0] == 1 and batch_size > 1:
+                mask = mask.expand(batch_size, -1)
+            else:
+                raise ValueError("subtree point_mask batch size does not match.")
+
+        # B=1以外では可変長subsetをそのままTensor化できないため、明示的に止める。
+        if batch_size != 1:
+            raise ValueError(
+                "full-cloud-coordinate subtree subset currently supports batch_size=1 only. "
+                "Use batch_size=1 for subtree training or add padding logic."
+            )
+
+        mask_b = mask[0]
+
+        # [B, 3, N] または [B, C, N]
+        if value.ndim == 3 and value.shape[0] in (1, batch_size) and value.shape[2] == mask_b.numel():
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1, -1)
+            return value[0:1, :, mask_b].contiguous()
+
+        # [B, N, K]
+        if value.ndim == 3 and value.shape[0] in (1, batch_size) and value.shape[1] == mask_b.numel():
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1, -1)
+            return value[0:1, mask_b, :].contiguous()
+
+        # [B, N]
+        if value.ndim == 2 and value.shape[0] in (1, batch_size) and value.shape[1] == mask_b.numel():
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1)
+            return value[0:1, mask_b].contiguous()
+
+        # [N]
+        if value.ndim == 1 and value.shape[0] == mask_b.numel():
+            return value[mask_b].view(1, -1).contiguous()
+
+        # 点数に対応しないメタ情報はそのまま返す。
+        return value
+
+    def _build_full_coord_subtree_context(
+        self,
+        base_context,
+        point_mask,
+        batch_size,
+        device,
+    ):
+        """
+        full cloud contextから、selected_subtree_keysに対応する点だけを切り出した
+        subtree contextを作る。
+
+        重要：
+        global_voxel_coordsを再計算しない。
+        full cloudで作ったglobal_voxel_coordsのsubsetだけを使う。
+        """
+        if not isinstance(base_context, dict):
+            return None
+
+        subtree_context = {}
+
+        point_aligned_keys = (
+            "global_voxel_coords",
+            "subtree_global_voxel_coords",
+            "occupied_voxel_coords",
+            "full_global_voxel_coords",
+            "repair_unit_keys",
+            "point_node_ids",
+            "point_subtree_keys",
+            "point_parent_node_ids",
+            "point_child_slots",
+            "point_valid_empty_child_mask",
+        )
+
+        for key, value in base_context.items():
+            if key in point_aligned_keys:
+                subtree_context[key] = self._slice_point_aligned_tensor(
+                    value,
+                    point_mask=point_mask,
+                    batch_size=batch_size,
+                    device=device,
+                )
+            else:
+                subtree_context[key] = value
+
+        # 以後の全モジュールが同じ名前を見るように正規化する。
+        if subtree_context.get("global_voxel_coords", None) is None:
+            for alt_key in ("subtree_global_voxel_coords", "occupied_voxel_coords", "full_global_voxel_coords"):
+                if subtree_context.get(alt_key, None) is not None:
+                    subtree_context["global_voxel_coords"] = subtree_context[alt_key]
+                    break
+
+        subtree_context["subtree_is_full_cloud_coord_subset"] = True
+        return subtree_context
+
+    @staticmethod
+    def _fit_point_key_rows(keys, batch_size, num_points, device):
+        if keys is None:
+            return None
+        keys = keys.to(device=device, dtype=torch.long)
+        if keys.ndim == 1:
+            keys = keys.view(1, -1)
+        elif keys.ndim == 3 and keys.shape[1] == 1:
+            keys = keys.squeeze(1)
+        if keys.ndim != 2:
+            return None
+        if keys.shape[0] == 1 and batch_size > 1:
+            keys = keys.expand(batch_size, -1)
+        if keys.shape[0] != batch_size:
+            return None
+        current = int(keys.shape[1])
+        if current == num_points:
+            return keys
+        if current <= 0:
+            return torch.zeros((batch_size, num_points), device=device, dtype=torch.long)
+        if current > num_points:
+            return keys[:, :num_points]
+        pad = keys[:, -1:].expand(batch_size, num_points - current)
+        return torch.cat([keys, pad], dim=1)
+
+    def _tree_point_keys(self, subtree_tree, key_names, batch_size, num_points, device):
+        if not isinstance(subtree_tree, dict):
+            return None
+        for key_name in key_names:
+            value = subtree_tree.get(key_name, None)
+            if value is None:
+                continue
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            fitted = self._fit_point_key_rows(value, batch_size, num_points, device)
+            if fitted is not None:
+                return fitted
+        return None
+
+    @staticmethod
+    def _masked_point_mean(values, point_mask): # 点毎の値について、マスク対象点だけの平均を算出
+        if point_mask is None:
+            return values.mean()
+        if point_mask.ndim == 2:
+            point_mask = point_mask.unsqueeze(1)
+        mask = point_mask.to(device=values.device, dtype=values.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        return (values * mask).sum() / denom
+
+    @staticmethod
+    def _argmax_count_dict(probs, names): # 確率Tensorから各点の最大確率カテゴリを選び、カテゴリ名ごとの出現回数を辞書で返す関数
+        if probs is None or int(probs.numel()) <= 0:
+            return {name: 0 for name in names}
+        labels = probs.detach().argmax(dim=1).reshape(-1)
+        return {
+            name: int((labels == idx).sum().detach().cpu())
+            for idx, name in enumerate(names)
+        }
+
+    @staticmethod
+    def _operation_by_cause(cause_scores, policy_probs): # 各現員カテゴリごとに、その原因が最大になった点だけを集め、その点群に対する平均方策確率から代表的な修復操作を推定する関数
+        if cause_scores is None or policy_probs is None or int(cause_scores.numel()) <= 0:
+            return {}
+        cause_labels = cause_scores.detach().argmax(dim=1)
+        policy_det = policy_probs.detach()
+        result = {}
+        for cause_idx, cause_name in enumerate(CAUSE_NAMES):
+            mask = cause_labels == cause_idx
+            count = int(mask.sum().detach().cpu())
+            if count <= 0:
+                result[cause_name] = {
+                    "count": 0,
+                    "operation": "none",
+                    "confidence": 0.0,
+                }
+                continue
+            mask_f = mask.unsqueeze(1).to(device=policy_det.device, dtype=policy_det.dtype)
+            policy_mean = (policy_det * mask_f).sum(dim=(0, 2)) / float(count)
+            operation_idx = int(policy_mean.argmax().detach().cpu())
+            result[cause_name] = {
+                "count": count,
+                "operation": POLICY_NAMES[operation_idx],
+                "confidence": float(policy_mean[operation_idx].detach().cpu()),
+            }
+        return result
+
+    def _patch_meta(self, pts_xyz, repair_gate, out_label): # 出力点群に対応するメタ情報を作る関数
+        B, _, N = pts_xyz.shape
+        anchor_idx = torch.arange(N, device=pts_xyz.device, dtype=torch.long).view(1, N).expand(B, N)
+        valid_mask = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
+        return {
+            "anchor_idx_local": anchor_idx,
+            "output_valid_mask": valid_mask,
+            "out_label": out_label,
+            "repair_gate": repair_gate.squeeze(1),
+        }
+
+    """原因推定/方策選択/編集制約損失"""
+    def _build_losses(self, cause_scores, cause_logits, policy_logits, policy_teacher, cause_targets, edit_loss, point_mask=None): # 減員推定損失、方策選択損失、編集制約損失をそれぞれ計算する関数
+        weights = self._cause_weights(cause_scores.device, cause_scores.dtype)
+        attr_loss = self.cost_attributor.attribution_loss(
+            cause_logits,
+            cause_targets,
+            weights=weights,
+            point_mask=point_mask,
+        )
+        policy_loss = self.policy_module.policy_loss(
+            policy_logits,
+            policy_teacher,
+            entropy_weight=float(getattr(self.args, "repair_policy_entropy_weight", 0.0)),
+            point_mask=point_mask,
+        )
+        attr_loss = attr_loss * float(getattr(self.args, "loss_attr_scale", 1.0))
+        policy_loss = policy_loss * float(getattr(self.args, "loss_policy_scale", 1.0))
+        edit_loss = edit_loss * float(getattr(self.args, "loss_repair_scale", 1.0))
+        return attr_loss, policy_loss, edit_loss
+
+    def _maybe_fast_full_cloud_oracle_forward(
+        self,
+        pts_xyz,
+        compute_internal_losses,
+        full_octree_context,
+        octree_input_mode,
+    ):
+        """
+        no-gradのFullCloud anchorで、actual oracle full overrideを採択済みなら、
+        巨大なNetwork/Actuator forwardを実測済みvoxel stateのセットだけに短絡する。
+        actual候補encodeとshadow subtreeの学習経路はそのまま残す。
+        """
+        guidance_mode = str(
+            getattr(self.args, "heuristic_guidance_mode", "")
+        ).strip().lower()
+        if guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
+            if isinstance(full_octree_context, dict) and any(
+                key.startswith("actual_oracle_")
+                for key in full_octree_context
+            ):
+                raise RuntimeError(
+                    "ana_den6_onlineにlegacy actual-oracle contextが混入した。"
+                )
+            return None
+        if not bool(getattr(self.args, "fast_full_cloud_oracle_anchor", True)):
+            return None
+        if compute_internal_losses is not False:
+            return None
+        if str(octree_input_mode or "").strip().lower() != "full_cloud":
+            return None
+        if not isinstance(full_octree_context, dict):
+            return None
+        if not bool(full_octree_context.get("fast_full_cloud_oracle_anchor", False)):
+            return None
+        if str(full_octree_context.get("actual_oracle_override_scope", "")) != "full_cloud":
+            return None
+
+        override_coords = full_octree_context.get("actual_oracle_override_final_voxel_coords", None)
+        if not torch.is_tensor(override_coords):
+            return None
+        coords_b3n = self._normalize_node_voxel_coords(override_coords, device=pts_xyz.device)
+        if coords_b3n is None or coords_b3n.ndim != 3 or coords_b3n.shape[1] != 3 or coords_b3n.shape[-1] <= 0:
+            return None
+
+        before_coords = full_octree_context.get("full_global_voxel_coords", None)
+        if before_coords is None:
+            before_coords = full_octree_context.get("global_voxel_coords", None)
+        before_b3n = self._normalize_node_voxel_coords(before_coords, device=pts_xyz.device)
+        before_count = int(before_b3n.shape[-1]) if torch.is_tensor(before_b3n) else int(pts_xyz.shape[-1])
+        after_count = int(coords_b3n.shape[-1])
+
+        valid_mask = torch.ones(
+            (coords_b3n.shape[0], coords_b3n.shape[-1]),
+            device=pts_xyz.device,
+            dtype=torch.bool,
+        )
+        voxel_state = {
+            "initial_voxel_coords": before_b3n.detach() if torch.is_tensor(before_b3n) else coords_b3n.detach(),
+            "final_voxel_coords": coords_b3n.detach(),
+            "final_voxel_valid_mask": valid_mask.detach(),
+            "voxel_edit_mode": "actual_oracle_full_cloud_fast_anchor",
+            "voxel_edit_state_enabled": True,
+            "voxel_edit_initial_count": int(before_count),
+            "voxel_edit_final_count": int(after_count),
+            "input_voxel_count": int(before_count),
+            "before_occupied_voxel_count": int(before_count),
+            "final_voxel_count": int(after_count),
+            "after_occupied_voxel_count": int(after_count),
+            "voxel_edit_drop_count": int(full_octree_context.get("actual_oracle_override_drop_count", 0) or 0),
+            "voxel_edit_add_count": int(full_octree_context.get("actual_oracle_accepted_add_count", 0) or 0),
+            "voxel_edit_move_count": int(full_octree_context.get("actual_oracle_override_move_count", 0) or 0),
+            "estimated_edit_record_bits": float(full_octree_context.get("actual_oracle_edit_record_bits", 0.0) or 0.0),
+            "final_voxel_update_mode": "actual_oracle_full_cloud_override",
+            "final_voxel_recomputed_from_pts_out": False,
+            "actuator_voxel_mode": "actual_oracle_full_cloud_override",
+            "actuator_local_recomputed": False,
+            "actuator_octree_context_source": "full_octree_context",
+            "actuator_octree_context_is_full_cloud": True,
+            "actuator_octree_context_available": True,
+            "actuator_octree_context_has_global_voxel_coords": True,
+        }
+        if "global_qs" in full_octree_context:
+            voxel_state["voxel_step"] = full_octree_context["global_qs"]
+        if "global_offset" in full_octree_context:
+            voxel_state["voxel_offset"] = full_octree_context["global_offset"]
+
+        self.last_actuator_voxel_state = voxel_state
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
+        except Exception:
+            pass
+
+        zero = pts_xyz.new_zeros(())
+        final_w = pts_xyz.new_ones((pts_xyz.shape[0], 1, pts_xyz.shape[-1]))
+        out_label = {
+            "full_cloud_oracle_fast_path": True,
+            "canonical_voxel_coords_before": before_b3n.detach() if torch.is_tensor(before_b3n) else None,
+            "canonical_voxel_coords_after": coords_b3n.detach(),
+        }
+        self.last_structure_debug = {
+            "network_voxel_node_input_requested": bool(getattr(self.args, "network_voxel_node_input", False)),
+            "network_voxel_node_input_used": False,
+            "network_voxel_node_fallback": False,
+            "network_voxel_node_fallback_reason": "fast_full_cloud_oracle_anchor",
+            "network_voxel_node_count": int(after_count),
+            "network_voxel_node_source": "actual_oracle_full_cloud_override",
+            "full_cloud_oracle_fast_path": True,
+        }
+        self.last_runtime_timing = {
+            "encode": 0.0,
+            "structure": 0.0,
+            "actuator": 0.0,
+            "total_forward": 0.0,
+            "fast_full_cloud_oracle_anchor": 1.0,
+        }
+        return pts_xyz, zero, zero, zero, final_w, zero, zero, zero, out_label
+
+    """Network"""
+    def forward( # Network全体の順伝播を行う関数
+        self,
+        pts_xyz,
+        pts_attr,
+        cache_key=None,
+        return_patch_meta=False,
+        coord_scale=None,
+        return_attr_output=True,
+        compute_internal_losses=None,
+        subtree_ref=None,
+        selected_subtree_keys=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
+    ):
+        """セットアップ"""
+        if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3: # 入力点群の形状チェック
+            raise ValueError("pts_xyz must have shape [B, 3, N]")
+
+        self.last_actuator_voxel_state = None
+        self.last_k_proposal_terms = None
+        collect_runtime_debug = self._should_collect_runtime_debug()
+        # CostAttribution/Policy used to calculate several full-cloud
+        # reductions unconditionally merely to populate debug dictionaries.
+        # Keep those diagnostics available when requested without charging
+        # every training step for them.
+        self.cost_attributor.collect_runtime_debug = bool(collect_runtime_debug)
+        self.policy_module.collect_runtime_debug = bool(collect_runtime_debug)
+        checkpoint_full_cloud_heads = bool(
+            self.training
+            and getattr(self.args, "full_cloud_activation_checkpoint", True)
+            and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
+        )
+        self.cost_attributor.activation_checkpointing = checkpoint_full_cloud_heads
+        self.policy_module.activation_checkpointing = checkpoint_full_cloud_heads
+        original_pts_xyz = pts_xyz
+        original_pts_attr = pts_attr
+        node_voxel_input_state = None
+        node_voxel_debug = {
+            "network_voxel_node_input_requested": bool(getattr(self.args, "network_voxel_node_input", False)),
+            "network_voxel_node_input_used": False,
+            "network_voxel_node_fallback": False,
+            "network_voxel_node_fallback_reason": "not_evaluated",
+            "network_voxel_node_count": 0,
+            "network_voxel_node_source": "none",
+            "network_voxel_node_feature_shape": "",
+            "network_voxel_node_cache_hit": False,
+        }
+
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", None)
+        except Exception:
+            pass
+
+        guidance_mode = str(
+            getattr(self.args, "heuristic_guidance_mode", "proxy_prior")
+        ).strip().lower()
+        direct_structure_targets = bool(
+            getattr(
+                self.args,
+                "direct_octree_structure_targets",
+                getattr(self, "direct_octree_structure_targets", True),
+            )
+        )
+        network_only_codec_mode = guidance_mode in {
+            "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"
+        }
+        den6_selection_mode = str(getattr(
+            self.args,
+            "heuristic_guidance_online_selection_mode",
+            "prior_residual",
+        )).strip().lower()
+        network_only_guidance_forward = bool(
+            guidance_mode == "ana_den6_online"
+            and not self.training
+            and getattr(self.args, "heuristic_guidance_network_only_inference", True)
+            # Actor/Critic is defined over the unordered legal candidate pool.
+            # Removing that pool only at validation evaluates a different
+            # policy and makes fixed-RD unusable as model-selection evidence.
+            # Keep the legacy cache-free inference path for prior_residual
+            # checkpoints, but evaluate Actor/Critic deterministically on the
+            # same pool used in training (sampling is disabled by eval mode).
+            and den6_selection_mode != "actor_critic"
+        )
+        # OctreeStructureAnalysis also constructs the guidance object.  Pass
+        # the phase explicitly through args so every nested builder takes the
+        # same cache-free inference path.
+        setattr(
+            self.args,
+            "_heuristic_guidance_network_only_forward",
+            network_only_guidance_forward,
+        )
+        if network_only_codec_mode and isinstance(full_octree_context, dict) and any(
+            str(key).startswith(("ana_den", "teacher", "actual_oracle"))
+            for key in full_octree_context
+        ):
+            # Never ignore an injected cached action payload.  A Network-only
+            # run fails closed instead of silently consulting or falling back
+            # to a legacy plan.
+            raise RuntimeError(
+                "network_only_codec_policy received forbidden den/teacher/oracle payload"
+            )
+        if bool(getattr(self.args, "heuristic_guidance_enabled", True)):
+            if guidance_mode == "ana_den6_online":
+                if not isinstance(full_octree_context, dict):
+                    raise RuntimeError("ana_den6_onlineにはfull-cloud canonical contextが必要である")
+                if not network_only_guidance_forward:
+                    guidance_builder = attach_geometry_octree_guidance if is_geometry_octree(self.args) else attach_ana_den6_online_guidance
+                    full_octree_context = guidance_builder(
+                        full_octree_context,
+                        self.args,
+                        device=pts_xyz.device,
+                    )
+            elif guidance_mode in {
+                "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
+            }:
+                if not isinstance(full_octree_context, dict):
+                    raise RuntimeError(
+                        f"{guidance_mode}にはfull-cloud canonical contextが必要である"
+                    )
+                full_octree_context = attach_ana_den6_reference_anchor(
+                    full_octree_context,
+                    self.args,
+                    device=pts_xyz.device,
+                )
+
+        fast_oracle_result = self._maybe_fast_full_cloud_oracle_forward(
+            pts_xyz,
+            compute_internal_losses,
+            full_octree_context,
+            octree_input_mode,
+        )
+        if fast_oracle_result is not None:
+            return fast_oracle_result
+
+        prebuilt_subtree_mode = subtree_tree is not None
+        full_unit_keys = None # Subtree Key保存用の変数初期化
+        selection_mask = None # 選択されたSubtreeに属する点だけを示すマスクの初期化
+        canonical_subtree_tree = subtree_tree
+        # full cloud forward でも、full_octree_context から repair unit key を先に用意する。
+        # repair_unit_keys / point_node_ids / global_morton_keys が無い場合は、
+        # global_voxel_coords から同一voxel単位の key を作る。
+        if isinstance(full_octree_context, dict):
+            full_unit_keys = self._tree_point_keys(
+                full_octree_context,
+                ("repair_unit_keys", "point_node_ids", "global_morton_keys"),
+                pts_xyz.shape[0],
+                pts_xyz.shape[2],
+                pts_xyz.device,
+            )
+            if full_unit_keys is None:
+                full_unit_keys = self._unit_keys_from_voxel_coords(
+                    full_octree_context,
+                    batch_size=pts_xyz.shape[0],
+                    point_count=pts_xyz.shape[2],
+                    device=pts_xyz.device,
+                )
+        prebuilt_repair_unit_keys = self._tree_point_keys(
+            subtree_tree,
+            ("repair_unit_keys", "point_node_ids"),
+            pts_xyz.shape[0],
+            pts_xyz.shape[2],
+            pts_xyz.device,
+        )
+        prebuilt_subtree_keys = self._tree_point_keys(
+            subtree_tree,
+            ("point_subtree_keys",),
+            pts_xyz.shape[0],
+            pts_xyz.shape[2],
+            pts_xyz.device,
+        )
+        if prebuilt_subtree_mode:
+            full_unit_keys = prebuilt_repair_unit_keys
+
+            if full_unit_keys is None:
+                full_unit_keys = self._tree_point_keys(
+                    subtree_tree,
+                    ("global_morton_keys",),
+                    pts_xyz.shape[0],
+                    pts_xyz.shape[2],
+                    pts_xyz.device,
+                )
+
+            if full_unit_keys is None:
+                full_unit_keys = self._unit_keys_from_voxel_coords(
+                    subtree_tree,
+                    batch_size=pts_xyz.shape[0],
+                    point_count=pts_xyz.shape[2],
+                    device=pts_xyz.device,
+                )
+
+            if full_unit_keys is None:
+                raise ValueError(
+                    "subtree_tree must provide repair_unit_keys, point_node_ids, global_morton_keys, "
+                    "or global_voxel_coords for Network prebuilt subtree mode."
+                )
+            if selected_subtree_keys is not None and prebuilt_subtree_keys is not None:
+                selected_subtree_keys = selected_subtree_keys.to(device=pts_xyz.device, dtype=prebuilt_subtree_keys.dtype).reshape(-1)
+                selection_mask = self._normalize_point_mask(
+                    subtree_membership_mask(prebuilt_subtree_keys, selected_subtree_keys),
+                    batch_size=pts_xyz.shape[0],
+                    num_points=pts_xyz.shape[2],
+                    device=pts_xyz.device,
+                )
+                canonical_subtree_tree = self._build_full_coord_subtree_context(
+                    subtree_tree,
+                    point_mask=selection_mask,
+                    batch_size=pts_xyz.shape[0],
+                    device=pts_xyz.device,
+                )
+                # canonical_subtree_tree に含まれる点数に合わせて key を取り直す。
+                canonical_point_count = pts_xyz.shape[2]
+                if isinstance(canonical_subtree_tree, dict):
+                    gv = canonical_subtree_tree.get("global_voxel_coords", None)
+                    gv_norm = self._normalize_node_voxel_coords(gv, device=pts_xyz.device)
+                    if gv_norm is not None:
+                        canonical_point_count = int(gv_norm.shape[-1])
+
+                full_unit_keys = self._tree_point_keys(
+                    canonical_subtree_tree,
+                    ("repair_unit_keys", "point_node_ids", "global_morton_keys"),
+                    pts_xyz.shape[0],
+                    canonical_point_count,
+                    pts_xyz.device,
+                )
+                if full_unit_keys is None:
+                    full_unit_keys = self._unit_keys_from_voxel_coords(
+                        canonical_subtree_tree,
+                        batch_size=pts_xyz.shape[0],
+                        point_count=canonical_point_count,
+                        device=pts_xyz.device,
+                    )
+        elif subtree_ref is not None:
+            # full_octree_contextにpoint_subtree_keysがあるなら、それを優先する。
+            # なければ従来通りpts_xyzから計算するが、これはfallbackである。
+            full_context_subtree_keys = self._tree_point_keys(
+                full_octree_context,
+                ("point_subtree_keys",),
+                pts_xyz.shape[0],
+                pts_xyz.shape[2],
+                pts_xyz.device,
+            )
+
+            full_context_repair_keys = self._tree_point_keys(
+                full_octree_context,
+                ("repair_unit_keys", "point_node_ids", "global_morton_keys"),
+                pts_xyz.shape[0],
+                pts_xyz.shape[2],
+                pts_xyz.device,
+            )
+
+            if full_context_repair_keys is not None:
+                full_unit_keys = full_context_repair_keys
+            elif full_context_subtree_keys is not None:
+                # 最後のfallbackとしてのみ使う。
+                # これはsubtree単位の粗い集約になるため、repair unitとしては精度が落ちる。
+                full_unit_keys = full_context_subtree_keys
+            else:
+                full_unit_keys = assign_octree_subtree_keys(pts_xyz, subtree_ref)
+
+            if selected_subtree_keys is not None:
+                selected_subtree_keys = selected_subtree_keys.to(device=pts_xyz.device, dtype=full_unit_keys.dtype).reshape(-1)
+                selection_mask = subtree_membership_mask(full_unit_keys, selected_subtree_keys)
+                selection_mask = self._normalize_point_mask(
+                    selection_mask,
+                    batch_size=pts_xyz.shape[0],
+                    num_points=pts_xyz.shape[2],
+                    device=pts_xyz.device,
+                )
+
+                if isinstance(full_octree_context, dict):
+                    canonical_subtree_tree = self._build_full_coord_subtree_context(
+                        full_octree_context,
+                        point_mask=selection_mask,
+                        batch_size=pts_xyz.shape[0],
+                        device=pts_xyz.device,
+                    )
+
+        timing_enabled = self._timing_enabled() # 時間計測を行うか否か取得
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_t0 = time.time()
+            
+        """Encoder"""
+        if bool(getattr(self.args, "network_voxel_node_input", False)):
+            node_voxel_input_state, node_voxel_debug = self._build_node_voxel_input(
+                pts_xyz,
+                cache_key=cache_key,
+                coord_scale=coord_scale,
+                subtree_tree=canonical_subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
+            )
+            if node_voxel_input_state is not None:
+                pts_xyz = node_voxel_input_state["node_xyz"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                pts_attr = None
+                if is_geometry_octree(self.args):
+                    full_octree_context = align_geometry_context(full_octree_context, node_voxel_input_state["voxel_coords"])
+                    canonical_subtree_tree = align_geometry_context(canonical_subtree_tree, node_voxel_input_state["voxel_coords"])
+
+                # ここで selection_mask を full cloud 用maskのまま使ってはいけない。
+                # pts_xyz はすでに subtree subset のnode_xyzになっているため、
+                # 以後のselection_maskは subset 内の有効node全体を指すmaskにする。
+                selection_mask = node_voxel_input_state["node_mask"]
+
+                # subset化済みcontextを以後の構造解析・Actuatorにも渡す。
+                subtree_tree = canonical_subtree_tree
+
+                prebuilt_subtree_mode = False
+                full_unit_keys = None
+                prebuilt_repair_unit_keys = None
+                prebuilt_subtree_keys = None
+
+        # ============================================================
+        # Phase4:
+        # CostAttributionModule に、現在の入力が点群かNode/Voxelかを伝える。
+        # これを入れないと cost_attribution.py 側の input_mode debug が常に point になりやすい。
+        # ============================================================
+        try:
+            self.cost_attributor.node_voxel_mode = bool(node_voxel_input_state is not None)
+        except Exception:
+            pass
+        """Encoder"""
+        if node_voxel_input_state is not None:
+            fused_feat_node = node_voxel_input_state["node_features"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            encode_state = {
+                "fused_feat": fused_feat_node,
+                "local_feat": fused_feat_node,
+                "analysis_xyz": pts_xyz,
+                "analysis_counts": [
+                    int(count.detach().cpu()) if torch.is_tensor(count) else int(count)
+                    for count in node_voxel_input_state["node_counts"]
+                ],
+                "encoder_counts": [
+                    int(count.detach().cpu()) if torch.is_tensor(count) else int(count)
+                    for count in node_voxel_input_state["node_counts"]
+                ],
+                "full_counts": [
+                    int(count.detach().cpu()) if torch.is_tensor(count) else int(count)
+                    for count in node_voxel_input_state["node_counts"]
+                ],
+                "raw_counts": [
+                    int(original_pts_xyz.shape[-1])
+                    for _ in range(int(pts_xyz.shape[0]))
+                ],
+                "pre_sparse_counts": [
+                    int(count.detach().cpu()) if torch.is_tensor(count) else int(count)
+                    for count in node_voxel_input_state["node_counts"]
+                ],
+                "voxel_sizes": [0.0 for _ in range(int(pts_xyz.shape[0]))],
+                "kept_sparse_after_encoder": False,
+            }
+        else:
+            encode_state = self._encode(pts_xyz, coord_scale=coord_scale)
+
+        point_transformer_feature_debug = {
+            "used": False,
+            "reason": "disabled",
+            "feature_dim": 0,
+            "flows_to_actuator": False,
+        }
+        if self.point_transformer_node_features:
+            if node_voxel_input_state is not None:
+                point_transformer_decision_features, point_transformer_feature_debug = (
+                    self._point_transformer_features_for_nodes(
+                        pts_xyz,
+                        node_voxel_input_state.get("node_counts"),
+                        coord_scale=coord_scale,
+                        cache_key=cache_key,
+                        source=node_voxel_input_state.get("source", "none"),
+                    )
+                )
+            else:
+                # Point経路では既に同じPoint Transformerを通過済みなので再計算しない。
+                point_transformer_decision_features = self._adapt_point_transformer_features(
+                    encode_state["fused_feat"]
+                )
+                point_transformer_feature_debug = {
+                    "used": True,
+                    "reason": "existing_point_encoder_output",
+                    "feature_dim": int(point_transformer_decision_features.shape[1]),
+                    "coarse_counts": tuple(int(value) for value in encode_state.get("coarse_counts", ())),
+                    "cache_hits_this_forward": 0,
+                    "cache_entries": int(len(self.point_transformer_feature_cache)),
+                    "cache_bytes": int(self._point_transformer_feature_cache_bytes),
+                    "encoder_frozen": bool(getattr(self.args, "encoder_0grad", True)),
+                    "flows_to_actuator": True,
+                }
+        else:
+            point_transformer_decision_features = pts_xyz.new_zeros(
+                (pts_xyz.shape[0], 0, pts_xyz.shape[-1])
+            )
+
+        if node_voxel_input_state is not None:
+            self.last_encoder_debug = {
+                "enabled": True,
+                "mode": "voxel_node_plus_frozen_point_transformer",
+                "raw_points": [
+                    int(original_pts_xyz.shape[-1])
+                    for _ in range(int(pts_xyz.shape[0]))
+                ],
+                "analysis_points": [
+                    int(value.detach().cpu()) if torch.is_tensor(value) else int(value)
+                    for value in node_voxel_input_state["node_counts"]
+                ],
+                "feature_dim": int(node_voxel_input_state["node_features"].shape[1]),
+                "point_transformer": dict(point_transformer_feature_debug),
+            }
+        elif isinstance(self.last_encoder_debug, dict):
+            self.last_encoder_debug["point_transformer"] = dict(
+                point_transformer_feature_debug
+            )
+
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_encode_end = time.time()
+        fused_feat = encode_state["fused_feat"] # 統合抽出
+        analysis_xyz = encode_state["analysis_xyz"] # Octree構造解析に使う点群座標を取り出す
+        analysis_counts = encode_state["analysis_counts"] # analysis_xyzの有効点数をバッチごとに取り出す
+        keep_sparse_path = bool(encode_state.get("kept_sparse_after_encoder", False))
+        if node_voxel_input_state is not None:
+            analysis_unit_keys = None
+            analysis_subtree_keys = None
+            if isinstance(node_voxel_input_state.get("voxel_coords", None), torch.Tensor):
+                coords_for_keys = node_voxel_input_state["voxel_coords"]
+                if coords_for_keys.ndim == 3 and coords_for_keys.shape[1] == 3:
+                    coords_key = coords_for_keys[:, 0, :].to(torch.long) * 73856093
+                    coords_key = coords_key + coords_for_keys[:, 1, :].to(torch.long) * 19349663
+                    coords_key = coords_key + coords_for_keys[:, 2, :].to(torch.long) * 83492791
+                    analysis_unit_keys = coords_key
+                    analysis_subtree_keys = coords_key
+
+        elif prebuilt_subtree_mode:
+            analysis_unit_keys = self._tree_point_keys(
+                subtree_tree,
+                ("repair_unit_keys", "point_node_ids"),
+                analysis_xyz.shape[0],
+                analysis_xyz.shape[2],
+                analysis_xyz.device,
+            )
+            analysis_subtree_keys = self._tree_point_keys(
+                subtree_tree,
+                ("point_subtree_keys",),
+                analysis_xyz.shape[0],
+                analysis_xyz.shape[2],
+                analysis_xyz.device,
+            )
+
+        else:
+            analysis_unit_keys = assign_octree_subtree_keys(analysis_xyz, subtree_ref) if subtree_ref is not None else None
+            analysis_subtree_keys = analysis_unit_keys
+
+        analysis_selection_mask = (
+            subtree_membership_mask(analysis_subtree_keys, selected_subtree_keys)
+            if analysis_subtree_keys is not None and selected_subtree_keys is not None
+            else None
+        )
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_structure_start = time.time()
+
+        runtime_diagnosis_total = 0.0
+        runtime_attribution_total = 0.0
+        runtime_decision_total = 0.0
+
+        if keep_sparse_path: # Sparse Tensor側の点群を規準として構造解析を行うか否か
+            """変数の初期化"""
+            # self.writer.write(f"Keep Sparse Path")
+            structure_feat_full_list = []
+            subtree_scores_full_list = []
+            policy_probs_full_list = []
+            repair_priority_full_list = []
+            snap_delta_full_list = []
+            single_proxy_full_list = []
+            node_proxy_full_list = []
+            lowprob_proxy_full_list = []
+            occupancy_nll_proxy_full_list = []
+            quant_proxy_full_list = []
+            cause_scores_means = []
+            subtree_scores_means = []
+            policy_probs_means = []
+            aggregation_unit_modes = []
+            loss_attr_terms = []
+            loss_policy_terms = []
+            cause_scores = None
+            subtree_scores = None
+            policy_probs = None
+            cause_logits = None
+            policy_logits = None
+            cause_targets = None
+            structure = None
+            
+            for b in range(pts_xyz.shape[0]): # バッチ内の各点群サンプルを1つずつ処理
+                analysis_count = analysis_counts[b] # バッチb番目の解析用点群を取得
+                analysis_xyz_b = analysis_xyz[b:b + 1, :, :analysis_count] # 解析用点群だけを取り出す
+                fused_feat_b = fused_feat[b:b + 1, :, :analysis_count] # Encoder統合特徴だけを取り出す
+                coord_scale_b = None if coord_scale is None else coord_scale[b:b + 1] # 座標スケールだけを取り出す
+
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_diag_start = time.time()
+
+                """Octree構造解析器"""
+                structure_b = self.structure_analyzer(
+                    analysis_xyz_b,
+                    coord_scale=coord_scale_b,
+                    subtree_tree=canonical_subtree_tree if b == 0 else None,
+                    full_octree_context=full_octree_context if b == 0 else None,
+                    octree_input_mode=octree_input_mode,
+                )
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_diag_end = time.time()
+                    runtime_diagnosis_total += runtime_diag_end - runtime_diag_start
+                structure_feat_b = structure_b["features"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # 構造解析結果から構造特徴を取り出す
+                
+                """圧縮非効率原因推定器"""
+                cause_targets_b = structure_b["cause_targets"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # 構造解析結果から原因教師を取り出し、DeviceとDtypeを合わせることで、原因推定損失の教師信号として扱う
+                if direct_structure_targets:
+                    cause_scores_b = self._direct_structure_scores(cause_targets_b)
+                    cause_logits_b = None
+                    self.cost_attributor.debug_tensors = {
+                        "scores_requires_grad": False,
+                        "logits_requires_grad": False,
+                        "input_mode": "node_voxel" if node_voxel_input_state is not None else "point",
+                        "source": "direct_octree_targets",
+                    }
+                    if timing_enabled:
+                        runtime_decision_start = time.time()
+                else:
+                    cause_input_b = torch.cat([fused_feat_b, structure_feat_b], dim=1) # Encoder統合特徴と構造特徴をチャネル方向に結合
+                    if timing_enabled:
+                        self._sync_if_cuda_tensor(pts_xyz)
+                        runtime_attr_start = time.time()
+                    cause_scores_b, cause_logits_b = self.cost_attributor(cause_input_b) # 各点の圧縮非効率原因スコアとlogitsを推定
+                    if timing_enabled:
+                        self._sync_if_cuda_tensor(pts_xyz)
+                        runtime_attr_end = time.time()
+                        runtime_attribution_total += runtime_attr_end - runtime_attr_start
+                        runtime_decision_start = time.time()
+                    
+                """原因スコア集約器"""
+                unit_keys_b = None if analysis_unit_keys is None else analysis_unit_keys[b:b + 1, :analysis_count]
+                aggregation_key_source_b = "analysis_unit_keys" if unit_keys_b is not None else "none"
+
+                if unit_keys_b is None:
+                    unit_keys_b = structure_b.get("structural_voxel_key", None)
+                    if unit_keys_b is not None:
+                        aggregation_key_source_b = "structure_b.structural_voxel_key"
+
+                    if unit_keys_b is None:
+                        unit_keys_b = structure_b.get("point_feature_voxel_key", None)
+                        if unit_keys_b is not None:
+                            aggregation_key_source_b = "structure_b.point_feature_voxel_key"
+
+                unit_keys_b = self._normalize_unit_keys(
+                    unit_keys_b,
+                    batch_size=analysis_xyz_b.shape[0],
+                    point_count=analysis_xyz_b.shape[-1],
+                    device=analysis_xyz_b.device,
+                )
+
+                if unit_keys_b is None:
+                    raise ValueError(
+                        "Network.forward could not provide prebuilt unit_keys to CauseDiagnosisAggregation "
+                        f"in sparse/per-sample path. analysis_xyz_b={tuple(analysis_xyz_b.shape)}, "
+                        f"structural_voxel_key={None if structure_b.get('structural_voxel_key', None) is None else tuple(structure_b.get('structural_voxel_key').shape)}, "
+                        f"point_feature_voxel_key={None if structure_b.get('point_feature_voxel_key', None) is None else tuple(structure_b.get('point_feature_voxel_key').shape)}"
+                    )
+
+                aggregated_b = self.cause_aggregator(
+                    pts_xyz=analysis_xyz_b,
+                    cause_scores=cause_scores_b,
+                    cause_targets=cause_targets_b,
+                    unit_keys=unit_keys_b,
+                    apply_learnable_refine=not direct_structure_targets,
+                )
+                aggregation_unit_modes.append(str(aggregated_b.get("unit_mode", "unknown")))
+                if isinstance(structure_b, dict):
+                    structure_b["phase4_aggregation_key_source"] = str(aggregation_key_source_b)
+                    structure_b["phase4_aggregation_unit_count"] = int(
+                        aggregated_b.get("unit_count", 0)
+                    )
+                    structure_b["phase4_aggregation_max_unit_size"] = int(
+                        aggregated_b.get("max_unit_size", 0)
+                    )
+                    structure_b["phase4_aggregation_min_unit_size"] = int(
+                        aggregated_b.get("min_unit_size", 0)
+                    )
+                subtree_scores_b = aggregated_b["scores"] # Subtree原因スコア
+                subtree_targets_b = aggregated_b["targets"] # Subtree教師
+                repair_priority_b = aggregated_b["priority"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # DeviceとDtypeを合わせる
+                
+                """方策選択器"""
+                if direct_structure_targets:
+                    policy_probs_b = self.policy_module.build_teacher(subtree_targets_b).detach()
+                    policy_logits_b = None
+                else:
+                    policy_input_b = torch.cat([fused_feat_b, structure_feat_b, subtree_scores_b, repair_priority_b], dim=1) # 統合特徴、構造特徴、原因スコア、修復優先度をチャネル方向に結合
+                    policy_probs_b, policy_logits_b = self.policy_module(policy_input_b) # 各点又は各Repai Unitに対して修復操作の確率をLogitsを出す
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_decision_end = time.time()
+                    runtime_decision_total += runtime_decision_end - runtime_decision_start
+
+                """点操作前処理"""
+                full_xyz_b = pts_xyz[b:b + 1]
+                if analysis_xyz_b.shape[-1] == full_xyz_b.shape[-1]:
+                    structure_feat_full_list.append(structure_feat_b)
+                    subtree_scores_full_list.append(subtree_scores_b)
+                    policy_probs_full_list.append(policy_probs_b)
+                    repair_priority_full_list.append(repair_priority_b)
+                    snap_delta_full_list.append(structure_b["snap_delta"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    single_proxy_full_list.append(structure_b["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    node_proxy_full_list.append(structure_b["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    lowprob_proxy_full_list.append(structure_b["lowprob_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    occupancy_nll_proxy_full_list.append(structure_b["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    quant_proxy_full_list.append(structure_b["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                else:
+                    structure_feat_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, structure_feat_b))
+                    subtree_scores_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, subtree_scores_b))
+                    policy_probs_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, policy_probs_b))
+                    repair_priority_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, repair_priority_b))
+                    snap_delta_b = structure_b["snap_delta"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    snap_delta_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, snap_delta_b))
+                    single_proxy_b = structure_b["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    node_proxy_b = structure_b["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    lowprob_proxy_b = structure_b["lowprob_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    occupancy_nll_proxy_b = structure_b["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    quant_proxy_b = structure_b["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    single_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, single_proxy_b))
+                    node_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, node_proxy_b))
+                    lowprob_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, lowprob_proxy_b))
+                    quant_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, quant_proxy_b))
+                    occupancy_nll_proxy_full_list.append(
+                        self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, occupancy_nll_proxy_b)
+                    )
+
+                """平均値の保存"""
+                cause_scores_means.append(cause_scores_b.mean(dim=2))
+                subtree_scores_means.append(subtree_scores_b.mean(dim=2))
+                policy_probs_means.append(policy_probs_b.mean(dim=2))
+                
+                """raw auxiliary internal lossの計算"""
+                if compute_internal_losses is None:
+                    compute_losses_b = self.training
+                else:
+                    compute_losses_b = compute_internal_losses
+                if compute_losses_b and not direct_structure_targets:
+                    analysis_mask_b = None
+                    if analysis_selection_mask is not None:
+                        analysis_mask_b = analysis_selection_mask[b:b + 1, :analysis_count]
+                    policy_teacher_b = self.policy_module.build_teacher(subtree_targets_b)
+                    loss_attr_terms.append(self.cost_attributor.attribution_loss(
+                        cause_logits_b,
+                        cause_targets_b,
+                        weights=self._cause_weights(cause_scores_b.device, cause_scores_b.dtype),
+                        point_mask=analysis_mask_b,
+                    ))
+                    loss_policy_terms.append(self.policy_module.policy_loss(
+                        policy_logits_b,
+                        policy_teacher_b,
+                        entropy_weight=float(getattr(self.args, "repair_policy_entropy_weight", 0.0)),
+                        point_mask=analysis_mask_b,
+                    ))
+
+            """情報結合"""
+            structure_feat_full = torch.cat(structure_feat_full_list, dim=0) # サンプルごとに保存していた全点群側の構造特徴をバッチ次元で結合
+            subtree_scores_full = torch.cat(subtree_scores_full_list, dim=0) # サンプルごとに保存していた全点群側のSubtree原因スコアを、バッチ次元で結合
+            policy_probs_full = torch.cat(policy_probs_full_list, dim=0) # サンプルごとに保存していた全点群側の修復方策確率を、バッチ次元で結合
+            repair_priority_full = torch.cat(repair_priority_full_list, dim=0) # サンプルごとに保存していた全点群側の修復優先度を、バッチ次元で結合
+            
+            structure = { # Actuatorや診断値計算で使う構造情報の辞書設定
+                "features": structure_feat_full,
+                "snap_delta": torch.cat(snap_delta_full_list, dim=0),
+                "phase4_aggregation_key_source": structure_b.get(
+                    "phase4_aggregation_key_source",
+                    "unknown",
+                ) if structure_b is not None else "unknown",
+                "phase4_aggregation_unit_count": int(
+                    structure_b.get("phase4_aggregation_unit_count", 0)
+                    if structure_b is not None
+                    else 0
+                ),
+                "phase4_aggregation_max_unit_size": int(
+                    structure_b.get("phase4_aggregation_max_unit_size", 0)
+                    if structure_b is not None
+                    else 0
+                ),
+                "phase4_aggregation_min_unit_size": int(
+                    structure_b.get("phase4_aggregation_min_unit_size", 0)
+                    if structure_b is not None
+                    else 0
+                ),
+                "phase4_structural_key_source": structure_b.get(
+                    "phase4_structural_key_source",
+                    "unknown",
+                ) if structure_b is not None else "unknown",
+                "single_proxy_full": torch.cat(single_proxy_full_list, dim=0),
+                "node_proxy_full": torch.cat(node_proxy_full_list, dim=0),
+                "lowprob_proxy_full": torch.cat(lowprob_proxy_full_list, dim=0),
+                "quant_proxy_full": torch.cat(quant_proxy_full_list, dim=0),
+                "level_debug": structure_b.get("level_debug") if structure_b is not None else None,
+                "octree_input_mode": structure_b.get("octree_input_mode", "local_recomputed") if structure_b is not None else "local_recomputed",
+                "octree_input_mode_requested": structure_b.get("octree_input_mode_requested", octree_input_mode) if structure_b is not None else octree_input_mode,
+                "structural_voxel_mode": structure_b.get("structural_voxel_mode", "local_recomputed") if structure_b is not None else "local_recomputed",
+                "point_feature_voxel_mode": structure_b.get("point_feature_voxel_mode", "local_xyz") if structure_b is not None else "local_xyz",
+                "structural_voxel_key": structure_b.get("structural_voxel_key") if structure_b is not None else None,
+                "point_feature_voxel_key": structure_b.get("point_feature_voxel_key") if structure_b is not None else None,
+                "occupancy_nll_proxy_full": torch.cat(occupancy_nll_proxy_full_list, dim=0),
+                "leaf_pattern_diag": structure_b.get("leaf_pattern_diag") if structure_b is not None else None,
+                # sparse per-sample pathでden6 exact guidanceを落とさない。
+                "heuristic_guidance": structure_b.get("heuristic_guidance") if structure_b is not None else None,
+                "ana_den6_ranked_candidate_guidance": (
+                    structure_b.get("ana_den6_ranked_candidate_guidance")
+                    if structure_b is not None else None
+                ),
+                "global_voxel_coords": (
+                    structure_b.get("global_voxel_coords")
+                    if structure_b is not None else None
+                ),
+
+                # Section2:
+                # sparse pathでは最後に処理したstructure_bのsummaryをdebugとして持つ。
+                "leaf_pattern_available": bool(structure_b.get("leaf_pattern_available", False)) if structure_b is not None else False,
+                "leaf_pattern_source": str(structure_b.get("leaf_pattern_source", "none")) if structure_b is not None else "none",
+                "leaf_pattern_reason": str(structure_b.get("leaf_pattern_reason", "")) if structure_b is not None else "",
+                "leaf_unique_parent_count": int(structure_b.get("leaf_unique_parent_count", 0) or 0) if structure_b is not None else 0,
+                "leaf_unique_pattern_count": int(structure_b.get("leaf_unique_pattern_count", 0) or 0) if structure_b is not None else 0,
+                "leaf_mean_child_count": float(structure_b.get("leaf_mean_child_count", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_single_child_parent_ratio": float(structure_b.get("leaf_single_child_parent_ratio", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_max_pattern_frequency": float(structure_b.get("leaf_max_pattern_frequency", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_candidate_available": bool(structure_b.get("leaf_candidate_available", False)) if structure_b is not None else False,
+                "leaf_delete_gain_mean": float(structure_b.get("leaf_delete_gain_mean", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_add_gain_mean": float(structure_b.get("leaf_add_gain_mean", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_move_gain_mean": float(structure_b.get("leaf_move_gain_mean", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_high_gain_candidate_ratio": float(structure_b.get("leaf_high_gain_candidate_ratio", 0.0) or 0.0) if structure_b is not None else 0.0,
+            }
+            cause_mean = torch.stack(cause_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
+            subtree_mean = torch.stack(subtree_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
+            policy_mean = torch.stack(policy_probs_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
+            if loss_attr_terms:
+                loss_attr_sparse = torch.stack(loss_attr_terms).mean()
+                loss_policy_sparse = torch.stack(loss_policy_terms).mean()
+            else:
+                loss_attr_sparse = pts_xyz.new_zeros(())
+                loss_policy_sparse = pts_xyz.new_zeros(())
+        else:
+            analysis_xyz = pts_xyz
+            if timing_enabled:
+                self._sync_if_cuda_tensor(pts_xyz)
+                runtime_diag_start = time.time()
+            structure = self.structure_analyzer(
+                analysis_xyz,
+                coord_scale=coord_scale,
+                subtree_tree=canonical_subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
+                cache_key=cache_key,
+            )
+            if timing_enabled:
+                self._sync_if_cuda_tensor(pts_xyz)
+                runtime_diag_end = time.time()
+                runtime_diagnosis_total += runtime_diag_end - runtime_diag_start
+            structure_feat = structure["features"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
+            cause_targets = structure["cause_targets"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
+
+            if direct_structure_targets:
+                cause_scores = self._direct_structure_scores(cause_targets)
+                cause_logits = None
+                self.cost_attributor.debug_tensors = {
+                    "scores_requires_grad": False,
+                    "logits_requires_grad": False,
+                    "input_mode": "node_voxel" if node_voxel_input_state is not None else "point",
+                    "source": "direct_octree_targets",
+                }
+                if timing_enabled:
+                    runtime_decision_start = time.time()
+            else:
+                cause_input = torch.cat([fused_feat, structure_feat], dim=1)
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_attr_start = time.time()
+                cause_scores, cause_logits = self.cost_attributor(cause_input)
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_attr_end = time.time()
+                    runtime_attribution_total += runtime_attr_end - runtime_attr_start
+                    runtime_decision_start = time.time()
+                
+            # ============================================================
+            # Phase4:
+            # CauseAggregation に渡す unit_keys の出所を明示する。
+            # local recomputeではなく、prebuilt/canonical keyを優先する。
+            # ============================================================
+            unit_keys = full_unit_keys
+            aggregation_key_source = "full_unit_keys" if unit_keys is not None else "none"
+
+            if unit_keys is None:
+                unit_keys = structure.get("structural_voxel_key", None)
+                if unit_keys is not None:
+                    aggregation_key_source = "structure.structural_voxel_key"
+
+            if unit_keys is None:
+                unit_keys = structure.get("point_feature_voxel_key", None)
+                if unit_keys is not None:
+                    aggregation_key_source = "structure.point_feature_voxel_key"
+
+            if unit_keys is None:
+                unit_keys = self._unit_keys_from_voxel_coords(
+                    canonical_subtree_tree,
+                    batch_size=analysis_xyz.shape[0],
+                    point_count=analysis_xyz.shape[-1],
+                    device=analysis_xyz.device,
+                )
+                if unit_keys is not None:
+                    aggregation_key_source = "canonical_subtree_tree.global_voxel_coords_hash"
+
+            if unit_keys is None:
+                unit_keys = self._unit_keys_from_voxel_coords(
+                    full_octree_context,
+                    batch_size=analysis_xyz.shape[0],
+                    point_count=analysis_xyz.shape[-1],
+                    device=analysis_xyz.device,
+                )
+                if unit_keys is not None:
+                    aggregation_key_source = "full_octree_context.global_voxel_coords_hash"
+
+            unit_keys = self._normalize_unit_keys(
+                unit_keys,
+                batch_size=analysis_xyz.shape[0],
+                point_count=analysis_xyz.shape[-1],
+                device=analysis_xyz.device,
+            )
+
+            if unit_keys is None:
+                raise ValueError(
+                    "Network.forward could not provide prebuilt unit_keys to CauseDiagnosisAggregation "
+                    f"in full-cloud path. analysis_xyz={tuple(analysis_xyz.shape)}, "
+                    f"full_unit_keys=None, "
+                    f"structural_voxel_key={None if structure.get('structural_voxel_key', None) is None else tuple(structure.get('structural_voxel_key').shape)}, "
+                    f"point_feature_voxel_key={None if structure.get('point_feature_voxel_key', None) is None else tuple(structure.get('point_feature_voxel_key').shape)}, "
+                    f"octree_input_mode={structure.get('octree_input_mode', '')}, "
+                    f"structural_voxel_mode={structure.get('structural_voxel_mode', '')}"
+                )
+
+            aggregated = self.cause_aggregator(
+                pts_xyz=analysis_xyz,
+                cause_scores=cause_scores,
+                cause_targets=cause_targets,
+                unit_keys=unit_keys,
+                apply_learnable_refine=not direct_structure_targets,
+            )
+
+            structure["aggregation_unit_keys"] = unit_keys
+            structure["aggregation_unit_mode"] = str(aggregated.get("unit_mode", "unknown"))
+
+            # ============================================================
+            # Phase4:
+            # aggregation key の出所とunit統計をdebugへ保存する。
+            # 同じ値を何度も代入しない。
+            # ============================================================
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+
+            aggregation_unit_modes = [str(aggregated.get("unit_mode", "unknown"))]
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            aggregation_unit_modes = [str(aggregated.get("unit_mode", "unknown"))]
+            subtree_scores = aggregated["scores"]
+            subtree_targets = aggregated["targets"]
+            repair_priority = aggregated["priority"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
+            if direct_structure_targets:
+                policy_probs = self.policy_module.build_teacher(subtree_targets).detach()
+                policy_logits = None
+            else:
+                policy_input = torch.cat([fused_feat, structure_feat, subtree_scores, repair_priority], dim=1)
+                policy_probs, policy_logits = self.policy_module(policy_input)
+            if timing_enabled:
+                self._sync_if_cuda_tensor(pts_xyz)
+                runtime_decision_end = time.time()
+                runtime_decision_total += runtime_decision_end - runtime_decision_start
+            structure_feat_full = structure_feat
+            subtree_scores_full = subtree_scores
+            policy_probs_full = policy_probs
+            repair_priority_full = repair_priority
+            structure["single_proxy_full"] = structure["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            structure["node_proxy_full"] = structure["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            structure["lowprob_proxy_full"] = structure["lowprob_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            structure["occupancy_nll_proxy_full"] = structure["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            structure["quant_proxy_full"] = structure["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            loss_attr_sparse = None
+            loss_policy_sparse = None
+
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_structure_end = time.time()
+
+        if node_voxel_input_state is not None and isinstance(structure, dict):
+            structure["network_voxel_node_input_used"] = True
+            structure["network_voxel_node_state"] = node_voxel_input_state
+            structure["network_voxel_coords"] = node_voxel_input_state.get("voxel_coords", None)
+            structure["network_voxel_node_mask"] = node_voxel_input_state.get("node_mask", None)
+            structure["network_voxel_node_source"] = node_voxel_input_state.get("source", "unknown")
+            if node_voxel_input_state.get("global_qs", None) is not None:
+                structure["global_qs"] = node_voxel_input_state.get("global_qs", None)
+            if node_voxel_input_state.get("global_offset", None) is not None:
+                structure["global_offset"] = node_voxel_input_state.get("global_offset", None)
+
+        # ============================================================
+        # FullCloud時は、Actuatorにもfull_octree_contextをoctree_contextとして渡す。
+        # これにより、Actuator内部のvoxel_coordsもfull cloud canonical基準に固定する。
+        # ============================================================
+        octree_mode_text = str(octree_input_mode or "auto").strip().lower()
+        is_full_cloud_forward = octree_mode_text == "full_cloud"
+
+        """点操作実行"""
+        if point_transformer_decision_features.shape[-1] != structure_feat_full.shape[-1]:
+            point_transformer_decision_features = self._propagate_encoder_features(
+                pts_xyz,
+                analysis_xyz,
+                point_transformer_decision_features,
+            )
+        if point_transformer_decision_features.shape[-1] != structure_feat_full.shape[-1]:
+            raise RuntimeError(
+                "Point Transformer feature count does not match actuator nodes: "
+                f"point={point_transformer_decision_features.shape[-1]}, "
+                f"actuator={structure_feat_full.shape[-1]}"
+            )
+        actuator_input = torch.cat(
+            [
+                structure_feat_full,
+                subtree_scores_full,
+                policy_probs_full,
+                repair_priority_full,
+            ],
+            dim=1,
+        ) # 構造特徴、原因スコア、方策、優先度を結合
+        if self.point_transformer_node_feature_dim > 0:
+            fusion_end = int(structure_feat_full.shape[1])
+            fusion_start = fusion_end - int(self.point_transformer_node_feature_dim)
+            if fusion_start < 0:
+                raise RuntimeError(
+                    "Point Transformer residual dimension exceeds structure features"
+                )
+            gate, point_transformer_warmup = self._point_transformer_fusion_gate(
+                actuator_input
+            )
+            fused_slice = (
+                actuator_input[:, fusion_start:fusion_end, :]
+                + gate * point_transformer_decision_features
+            )
+            actuator_input = torch.cat((
+                actuator_input[:, :fusion_start, :],
+                fused_slice,
+                actuator_input[:, fusion_end:, :],
+            ), dim=1)
+            if bool(getattr(self.args, "network_voxel_node_debug", False)):
+                point_transformer_feature_debug["gate_abs_max"] = float(
+                    gate.detach().abs().max().cpu()
+                )
+                point_transformer_feature_debug["warmup"] = float(
+                    point_transformer_warmup
+                )
+        network_only_policy_terms = None
+        k_proposal_terms = None
+        self.last_single_plan_student_terms = None
+        if guidance_mode == "network_only_codec_policy":
+            # Legacy diagnosis/policy tensors are fixed observations for the
+            # new codec policy.  Detaching here prevents the one-plan Actual
+            # loss from retaining/updating the old heuristic-oriented graph;
+            # gradients still flow through every NetworkOnlyCodecPolicy head.
+            actuator_input = actuator_input.detach()
+            network_only_policy_terms = self.network_only_codec_policy(
+                actuator_input,
+                self.args,
+                training=self.training,
+                fixed_features=structure.get("network_only_fixed_features"),
+            )
+        elif guidance_mode == "network_k_proposal_policy":
+            # One shared encoder/basis creates K deterministic specialized
+            # plans.  Only the Critic-selected compact plan is expanded into
+            # the existing Actuator's one-plan interface.
+            if not bool(getattr(self.args, "network_k_unfreeze_upstream", False)):
+                actuator_input = actuator_input.detach()
+            factorization_mode = str(getattr(
+                self.args, "network_k_diagnostic_factorization", "network_map_network_theta"
+            )).strip().lower()
+            if not self.training and factorization_mode != "network_map_network_theta":
+                raise RuntimeError(
+                    "推論時はHeuristic分解診断modeを使用できない"
+                )
+            current_state_key = getattr(
+                self.args, "_network_k_current_state_key", None
+            )
+            state_replay = self._network_k_actual_replay.get(
+                str(current_state_key), {}
+            ) if current_state_key is not None else {}
+            self.args._network_k_positive_experience_count = int(len(state_replay))
+            minimum_positive = max(int(getattr(
+                self.args, "network_k_min_positive_before_anneal", 8
+            )), 0)
+            if not hasattr(self, "_network_k_anneal_unlock_steps"):
+                self._network_k_anneal_unlock_steps = {}
+            if len(state_replay) >= minimum_positive and current_state_key is not None:
+                unlock_step = self._network_k_anneal_unlock_steps.setdefault(
+                    str(current_state_key),
+                    int(getattr(self.args, "_global_train_step", 0)),
+                )
+                self.args._network_k_anneal_unlock_step = int(unlock_step)
+            else:
+                self.args._network_k_anneal_unlock_step = int(getattr(
+                    self.args, "_global_train_step", 0
+                ))
+            k_proposal_terms = self.network_k_proposal_policy(
+                actuator_input,
+                self.args,
+                training=self.training,
+                fixed_features=structure.get("network_k_fixed_features"),
+                voxel_coords=structure.get("global_voxel_coords"),
+                replay_source_indices=(
+                    self._network_k_positive_replay_source_indices(current_state_key)
+                    if self.training else None
+                ),
+            )
+            self.last_k_proposal_terms = k_proposal_terms
+            network_only_policy_terms = k_proposal_terms["selected_policy_terms"]
+        elif guidance_mode == "single_plan_student":
+            # Teacher/Cacheはここへ渡さない。Student自身のlogitから作った1 planだけを
+            # 共通Executable契約へ変換し、Actuatorへ直接適用する。
+            if not bool(getattr(self.args, "single_plan_student_unfreeze_upstream", False)):
+                actuator_input = actuator_input.detach()
+            self.last_single_plan_student_terms = self.single_plan_student(
+                actuator_input,
+                structure.get("global_voxel_coords"),
+                self.args,
+                training=self.training,
+                fixed_features=structure.get("network_k_fixed_features"),
+            )
+            network_only_policy_terms = self.last_single_plan_student_terms
+        elif (
+            guidance_mode == "ana_den6_online"
+            and self.training
+            and bool(getattr(self.args, "single_plan_shadow_distillation", True))
+        ):
+            # 実行planは従来どおりExact den6 + Network residualの1 planである。
+            # 同じ入力特徴からStudentも1 planを作るが、こちらは適用せず蒸留loss
+            # だけに使用する。したがって訓練Actual値や063943経路を変更しない。
+            shadow_input = actuator_input
+            if not bool(getattr(self.args, "single_plan_student_unfreeze_upstream", False)):
+                shadow_input = shadow_input.detach()
+            shadow_fixed_features = structure.get("network_k_fixed_features")
+            if (
+                torch.is_tensor(shadow_fixed_features)
+                and not bool(getattr(self.args, "single_plan_student_unfreeze_upstream", False))
+            ):
+                shadow_fixed_features = shadow_fixed_features.detach()
+            self.last_single_plan_student_terms = self.single_plan_student(
+                shadow_input,
+                structure.get("global_voxel_coords"),
+                self.args,
+                training=True,
+                fixed_features=shadow_fixed_features,
+            )
+        full_cloud_amount_terms = None
+        if (
+            is_full_cloud_forward
+            and str(getattr(self.args, "sparsepcgc_training_mode", "subtree_selector")).strip().lower()
+            == "full_cloud_amount"
+        ):
+            pooled_full_cloud_amount = actuator_input.mean(dim=2)
+            full_cloud_amount_terms = self.full_cloud_amount_selector(pooled_full_cloud_amount)
+            full_cloud_amount_terms["enabled"] = True
+
+        if is_full_cloud_forward:
+            actuator_octree_context = full_octree_context
+            actuator_octree_context_source = "full_octree_context"
+        else:
+            actuator_octree_context = canonical_subtree_tree
+            actuator_octree_context_source = "canonical_subtree_tree"
+
+        if (
+            isinstance(structure, dict)
+            and guidance_mode in {"ana_den6_online", "ana_den6_residual"}
+        ):
+            if not is_full_cloud_forward or not isinstance(actuator_octree_context, dict):
+                raise RuntimeError(
+                    "ana_den6 online/residualは全点群canonical forwardだけを受け付ける"
+                )
+            exact_payload = actuator_octree_context.get(
+                "ana_den6_ranked_candidate_guidance", None
+            )
+            global_coords = actuator_octree_context.get("global_voxel_coords", None)
+            if not torch.is_tensor(global_coords):
+                raise RuntimeError(
+                    "ana_den6 global_voxel_coordsがActuator直前で欠落した"
+                )
+            structure["global_voxel_coords"] = global_coords
+            if not network_only_guidance_forward:
+                if not isinstance(exact_payload, dict):
+                    raise RuntimeError(
+                        "ana_den6 training guidance payloadがActuator直前で欠落した"
+                    )
+                # Training only: fixed GT features are teacher targets/base
+                # for the single evaluated plan.  They are absent at inference.
+                structure["ana_den6_ranked_candidate_guidance"] = exact_payload
+                fixed_feature_payload = actuator_octree_context.get(
+                    "ana_den6_fixed_feature_guidance", None
+                )
+                if isinstance(fixed_feature_payload, dict):
+                    structure["ana_den6_fixed_feature_guidance"] = fixed_feature_payload
+            structure["heuristic_guidance"] = build_heuristic_guidance(structure, self.args)
+
+        if (
+            is_full_cloud_forward
+            and bool(getattr(self.args, "full_cloud_require_actuator_octree_context", True))
+            and not isinstance(actuator_octree_context, dict)
+        ):
+            raise RuntimeError(
+                "FullCloud forward requires full_octree_context to be passed as "
+                "Actuator octree_context, but full_octree_context is missing."
+            )
+
+        if (
+            is_full_cloud_forward
+            and bool(getattr(self.args, "full_cloud_require_actuator_octree_context", True))
+            and isinstance(actuator_octree_context, dict)
+            and actuator_octree_context.get("global_voxel_coords", None) is None
+        ):
+            raise RuntimeError(
+                "FullCloud forward requires full_octree_context['global_voxel_coords'] "
+                "for Actuator canonical voxel path."
+            )
+
+        # Structure diagnosis creates sizeable exact integer-search workspaces.
+        # They are dead here, while the live FP32 structure/policy tensors are
+        # still referenced.  Returning only those unused allocator blocks keeps
+        # the persistent SparsePCGC CUDA worker from overlapping with stale
+        # workspace reservations.
+        if (
+            is_full_cloud_forward
+            and guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
+            and not network_only_guidance_forward
+            and bool(getattr(self.args, "den6_online_release_cuda_cache_before_actuator", True))
+            and pts_xyz.is_cuda
+        ):
+            torch.cuda.empty_cache()
+
+        offload_threshold_mb = float(
+            getattr(self.args, "full_cloud_saved_tensor_cpu_offload_mb", 0.25)
+        )
+        offload_saved_tensors = bool(
+            self.training
+            and is_full_cloud_forward
+            and guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
+            and offload_threshold_mb > 0.0
+            and pts_xyz.is_cuda
+        )
+        saved_tensor_context = selective_saved_tensor_cpu_offload(
+            offload_threshold_mb,
+            pin_memory=bool(
+                getattr(self.args, "full_cloud_saved_tensor_pin_memory", False)
+            ),
+            enabled=offload_saved_tensors,
+        )
+
+        external_executable_plan = None
+        if isinstance(k_proposal_terms, dict):
+            external_executable_plan = k_proposal_terms.get("selected_executable_plan")
+        elif (
+            guidance_mode == "single_plan_student"
+            and isinstance(self.last_single_plan_student_terms, dict)
+        ):
+            external_executable_plan = self.last_single_plan_student_terms.get(
+                "executable_plan"
+            )
+
+        with saved_tensor_context:
+            pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
+                pts_xyz=pts_xyz,
+                structure=structure,
+                cause_scores=subtree_scores_full,
+                policy_probs=policy_probs_full,
+                actuator_features=actuator_input,
+                repair_priority=repair_priority_full,
+                coord_scale=coord_scale,
+                selection_mask=selection_mask,
+                octree_context=actuator_octree_context,
+                full_octree_context=full_octree_context,
+                full_cloud_amount_terms=full_cloud_amount_terms,
+                network_only_policy_terms=network_only_policy_terms,
+                external_executable_plan=external_executable_plan,
+            )
+        if isinstance(actuator_stats, dict):
+            actuator_stats["actuator_octree_context_source"] = str(actuator_octree_context_source)
+            actuator_stats["actuator_octree_context_is_full_cloud"] = bool(is_full_cloud_forward)
+            actuator_stats["actuator_octree_context_available"] = bool(isinstance(actuator_octree_context, dict))
+            actuator_stats["actuator_octree_context_has_global_voxel_coords"] = bool(
+                isinstance(actuator_octree_context, dict)
+                and actuator_octree_context.get("global_voxel_coords", None) is not None
+            )
+            if isinstance(k_proposal_terms, dict):
+                # Tensor-valued diagnostics remain attached for offline
+                # proposal/Critic losses; integer counters are inference
+                # contract evidence and contain no cache/teacher state.
+                actuator_stats.update({
+                    "k_proposal_selected_slot": k_proposal_terms["selected_slot"],
+                    "k_proposal_predicted_gain": k_proposal_terms["predicted_gain"],
+                    "k_proposal_predicted_geometry": k_proposal_terms["predicted_geometry"],
+                    "k_proposal_predicted_interaction": k_proposal_terms["predicted_interaction"],
+                    "k_proposal_uncertainty": k_proposal_terms["uncertainty"],
+                    "k_proposal_compact_descriptor": k_proposal_terms["compact_plans"]["descriptor"],
+                    "k_proposal_accepted_count": k_proposal_terms["compact_plans"]["accepted_count"],
+                    "k_proposal_collision_count": k_proposal_terms["compact_plans"]["collision_count"],
+                    "shared_encoder_forward_count": 1,
+                    "shared_basis_forward_count": 1,
+                    "proposal_count": int(k_proposal_terms["proposal_count"]),
+                    "critic_batch_count": 1,
+                    "selected_plan_count": 1,
+                    "den6_call_count": 0,
+                    "cache_reference_count": 0,
+                    "teacher_reference_count": 0,
+                    "sparsepcgc_probe_count": 0,
+                    "candidate_actual_encode_count": 0,
+                    "k_proposal_unique_executable_plan_count": int(
+                        k_proposal_terms.get("unique_executable_plan_count", -1)
+                    ),
+                    "k_proposal_external_plan_applied": bool(
+                        actuator_stats.get("external_executable_plan_applied", False)
+                    ),
+                    "k_proposal_external_plan_hash": str(
+                        actuator_stats.get("external_executable_plan_hash", "")
+                    ),
+                })
+                selected_expected = self.network_k_proposal_policy._select_slot_tensor(
+                    k_proposal_terms["compact_plans"]["accepted_count"],
+                    k_proposal_terms["selected_slot"],
+                )
+                # Network order is Prune/Add/Adjust and matches Actuator stats.
+                executed_counts = selected_expected.new_tensor((
+                    float(actuator_stats.get("voxel_edit_drop_count", 0) or 0),
+                    float(actuator_stats.get("voxel_edit_add_count", 0) or 0),
+                    float(actuator_stats.get("voxel_edit_move_count", 0) or 0),
+                )).view(1, 3).expand_as(selected_expected)
+                actuator_stats["k_proposal_expected_count"] = selected_expected
+                actuator_stats["k_proposal_executed_count"] = executed_counts
+                actuator_stats["k_proposal_execution_count_mismatch"] = (
+                    executed_counts - selected_expected
+                ).abs().sum(dim=1)
+            if guidance_mode == "single_plan_student" and isinstance(
+                self.last_single_plan_student_terms, dict
+            ):
+                single_terms = self.last_single_plan_student_terms
+                executable = single_terms["executable_plan"]
+                expected = executable.accepted_count[:, 0]
+                executed = expected.new_tensor((
+                    float(actuator_stats.get("voxel_edit_drop_count", 0) or 0),
+                    float(actuator_stats.get("voxel_edit_add_count", 0) or 0),
+                    float(actuator_stats.get("voxel_edit_move_count", 0) or 0),
+                )).view(1, 3).expand_as(expected)
+                actuator_stats.update({
+                    "single_plan_network_forward_count": 1,
+                    "single_plan_count": 1,
+                    "single_plan_k_slot_count": 0,
+                    "single_plan_critic_count": 0,
+                    "single_plan_teacher_reference_count": 0,
+                    "single_plan_cache_reference_count": 0,
+                    "single_plan_den6_call_count": 0,
+                    "single_plan_candidate_actual_encode_count": 0,
+                    "single_plan_expected_count": expected,
+                    "single_plan_executed_count": executed,
+                    "single_plan_execution_count_mismatch": (executed - expected).abs().sum(1),
+                    "single_plan_utility_gain": single_terms["utility_absolute_gain"],
+                    "single_plan_utility_geometry": single_terms["utility_geometry_cost"],
+                    "single_plan_utility_edit": single_terms["utility_edit_cost"],
+                    "single_plan_utility_uncertainty": single_terms["utility_uncertainty"],
+                })
+            
+        # Actuatorが内部で更新したVoxel状態をLoss / compression.py 側から読めるように保存する。
+        actuator_voxel_state = {
+            key: actuator_stats.get(key, None)
+            for key in (
+                "initial_voxel_coords",
+                "final_voxel_coords",
+                "final_voxel_weights",
+                "final_voxel_valid_mask",
+                "voxel_edit_add_target_coords",
+                "voxel_edit_add_target_mask",
+                "voxel_step",
+                "voxel_offset",
+                "voxel_edit_mode",
+                "voxel_edit_state_enabled",
+                "voxel_edit_initial_count",
+                "voxel_edit_final_count",
+                "voxel_edit_drop_count",
+                "voxel_edit_add_count",
+                "voxel_edit_move_count",
+                "voxel_edit_same_voxel_move_rejected",
+                "voxel_edit_existing_target_rejected",
+                "voxel_edit_duplicate_target_rejected",
+                "voxel_edit_child_slot_rejected",
+                "voxel_edit_empty_target_rejected",
+                "point_aligned_initial_voxel_coords",
+                "point_aligned_final_voxel_coords",
+                "point_aligned_final_voxel_weights",
+                "voxel_soft_drop_score",
+                "voxel_soft_add_score",
+                "voxel_soft_move_score",
+                "voxel_soft_drop_amount",
+                "voxel_soft_add_amount",
+                "voxel_soft_move_amount",
+                "voxel_soft_edit_score",
+                "voxel_soft_edit_count_proxy",
+                "drop_ratio_soft",
+                "drop_ratio_hard",
+                "add_ratio_soft",
+                "add_ratio_hard",
+                "move_ratio_soft",
+                "move_ratio_hard",
+                "add_ratio_loss_value",
+                "add_consistency_loss_value",
+                "voxel_soft_drop_mean",
+                "voxel_soft_add_mean",
+                "voxel_soft_move_mean",
+                "operation_gate_prob",
+                "operation_gate_hard",
+                "operation_gate_logit",
+                "drop_operation_gate",
+                "add_operation_gate",
+                "move_operation_gate",
+                "raw_learned_drop_ratio",
+                "raw_learned_add_ratio",
+                "raw_learned_move_ratio",
+                "ana_den6_exact_residual_plan_debug",
+                "den6_online_policy_log_prob",
+                "den6_online_policy_entropy",
+                "den6_online_where_log_prob",
+                "den6_online_amount_log_prob",
+                "den6_online_action_log_prob",
+                "den6_online_candidate_local_credit_loss",
+                "den6_online_candidate_actor_proxy_loss",
+                "den6_online_operation_local_credit_loss",
+                "den6_online_amount_local_credit_loss",
+                "den6_online_fine_local_credit_loss",
+                "den6_online_actor_critic_plan_feature",
+                "den6_online_actor_critic_plan_value",
+                "den6_online_actor_critic_plan_log_variance",
+                "den6_online_actor_critic_changed_ratio",
+                "network_only_direction_log_prob",
+                "network_only_direction_entropy",
+                "network_only_total_ratio_raw",
+                "network_only_total_ratio",
+                "network_only_total_ratio_unconstrained",
+                "k_proposal_selected_slot",
+                "k_proposal_predicted_gain",
+                "k_proposal_predicted_geometry",
+                "k_proposal_predicted_interaction",
+                "k_proposal_uncertainty",
+                "k_proposal_compact_descriptor",
+                "k_proposal_accepted_count",
+                "k_proposal_collision_count",
+                "k_proposal_expected_count",
+                "k_proposal_executed_count",
+                "k_proposal_execution_count_mismatch",
+                "shared_encoder_forward_count",
+                "shared_basis_forward_count",
+                "proposal_count",
+                "critic_batch_count",
+                "selected_plan_count",
+                "den6_call_count",
+                "cache_reference_count",
+                "teacher_reference_count",
+                "sparsepcgc_probe_count",
+                "candidate_actual_encode_count",
+                "k_proposal_unique_executable_plan_count",
+                "network_only_total_ratio_mean",
+                "network_only_shares",
+                "network_only_shares_raw",
+                "network_only_shares_mean",
+                "network_only_priorities",
+                "network_only_temperature",
+                "network_only_where_threshold",
+                "network_only_where_sampling_temperature",
+                "network_only_exploration_fraction",
+                "network_only_predicted_local_gain_sum",
+                "network_only_interaction_correction",
+                "network_only_predicted_plan_gain",
+                "network_only_where_entropy",
+                "network_only_amount_entropy",
+                "network_only_action_entropy",
+                "network_only_direction_sampling_temperature",
+                "single_plan_network_forward_count",
+                "single_plan_count",
+                "single_plan_k_slot_count",
+                "single_plan_critic_count",
+                "single_plan_teacher_reference_count",
+                "single_plan_cache_reference_count",
+                "single_plan_den6_call_count",
+                "single_plan_candidate_actual_encode_count",
+                "single_plan_expected_count",
+                "single_plan_executed_count",
+                "single_plan_execution_count_mismatch",
+            )
+            if actuator_stats.get(key, None) is not None
+        }
+        if "voxel_edit_initial_count" in actuator_voxel_state:
+            actuator_voxel_state["input_voxel_count"] = actuator_voxel_state["voxel_edit_initial_count"]
+            actuator_voxel_state["before_occupied_voxel_count"] = actuator_voxel_state["voxel_edit_initial_count"]
+        if "voxel_edit_final_count" in actuator_voxel_state:
+            actuator_voxel_state["final_voxel_count"] = actuator_voxel_state["voxel_edit_final_count"]
+            actuator_voxel_state["after_occupied_voxel_count"] = actuator_voxel_state["voxel_edit_final_count"]
+
+        actuator_voxel_state["final_voxel_update_mode"] = actuator_stats.get(
+            "final_voxel_update_mode",
+            "unknown",
+        )
+        actuator_voxel_state["final_voxel_recomputed_from_pts_out"] = bool(
+            actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
+        )
+        actuator_voxel_state["actuator_voxel_mode"] = actuator_stats.get(
+            "actuator_voxel_mode",
+            "unknown",
+        )
+        actuator_voxel_state["actuator_local_recomputed"] = bool(
+            actuator_stats.get("local_recomputed", actuator_stats.get("actuator_local_recomputed", True))
+        )
+        actuator_voxel_state["actuator_octree_context_source"] = str(
+            actuator_stats.get("actuator_octree_context_source", "unknown")
+        )
+        actuator_voxel_state["actuator_octree_context_is_full_cloud"] = bool(
+            actuator_stats.get("actuator_octree_context_is_full_cloud", False)
+        )
+        actuator_voxel_state["actuator_octree_context_available"] = bool(
+            actuator_stats.get("actuator_octree_context_available", False)
+        )
+        actuator_voxel_state["actuator_octree_context_has_global_voxel_coords"] = bool(
+            actuator_stats.get("actuator_octree_context_has_global_voxel_coords", False)
+        )
+        self.last_actuator_voxel_state = actuator_voxel_state
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
+        except Exception:
+            pass
+        # Phase3: occupied voxel編集状態をdebug_tensorsからも参照できるようにする。
+        for key in (
+            "final_voxel_coords",
+            "final_voxel_weights",
+            "final_voxel_valid_mask",
+            "voxel_edit_mode",
+            "voxel_edit_state_enabled",
+            "voxel_edit_initial_count",
+            "voxel_edit_final_count",
+            "voxel_edit_drop_count",
+            "voxel_edit_add_count",
+            "voxel_edit_move_count",
+        ):
+            if key in actuator_voxel_state:
+                self.debug_tensors[key] = actuator_voxel_state[key]
+        if node_voxel_input_state is not None:
+            for key in (
+                "voxel_coords",
+                "node_features",
+                "node_mask",
+                "node_counts",
+            ):
+                value = node_voxel_input_state.get(key, None)
+                if torch.is_tensor(value):
+                    self.debug_tensors[f"network_voxel_node_{key}"] = value
+        # Phase7-3: Node/Voxel経路のTensor系debug。
+        # 長期保存用ではなく、直近forward確認用である。
+        if isinstance(node_voxel_debug, dict):
+            self.debug_tensors["network_voxel_node_count_tensor"] = pts_xyz.new_tensor(
+                float(node_voxel_debug.get("network_voxel_node_count", 0) or 0)
+            ).detach()
+
+        # Phase2: Actuator側で作ったcanonical voxel復元debugをNetwork側にも保存する。
+        # 戻り値形式は変えない。
+        if isinstance(actuator_stats, dict):
+            for key in (
+                "canonical_voxel_coords_before",
+                "canonical_voxel_coords_after",
+                "voxel_restore_meta",
+                "restored_xyz_debug",
+                "restore_info",
+            ):
+                if key in actuator_stats:
+                    self.debug_tensors[key] = actuator_stats[key]
+
+        actuator_local_value = actuator_stats.get("local_recomputed", False)
+        if torch.is_tensor(actuator_local_value):
+            actuator_local_recomputed = bool(float(actuator_local_value.detach().float().mean().cpu()) > 0.5)
+        else:
+            actuator_local_recomputed = bool(actuator_local_value)
+        cause_aggregation_unit_mode = ",".join(sorted(set(aggregation_unit_modes))) if aggregation_unit_modes else "unknown"
+        forward_local_recomputed = bool(
+            structure.get("local_recomputed", False)
+            or actuator_local_recomputed
+            or "local_recomputed" in cause_aggregation_unit_mode
+        )
+        if octree_mode_text == "prebuilt_subtree_tree" and forward_local_recomputed:
+            raise RuntimeError("prebuilt_subtree_tree forward used a local_recomputed path.")
+
+        if (
+            octree_mode_text == "full_cloud"
+            and bool(getattr(self.args, "full_cloud_forbid_actuator_local_recompute", True))
+            and forward_local_recomputed
+        ):
+            raise RuntimeError(
+                "full_cloud forward used a local_recomputed path. "
+                f"structure_local_recomputed={bool(structure.get('local_recomputed', False))}, "
+                f"actuator_local_recomputed={bool(actuator_local_recomputed)}, "
+                f"cause_aggregation_unit_mode={cause_aggregation_unit_mode}, "
+                f"actuator_octree_context_source={actuator_stats.get('actuator_octree_context_source', 'unknown')}, "
+                f"actuator_voxel_mode={actuator_stats.get('actuator_voxel_mode', 'unknown')}"
+            )
+        if self._should_collect_runtime_debug() and self.writer is not None and hasattr(self.writer, "write"):
+            self.writer.write(
+                "NetworkStructureMode: "
+                f"octree_input_mode={structure.get('octree_input_mode', octree_input_mode)}, "
+                f"use_subtree_tree={bool(subtree_tree is not None)}, "
+                f"use_full_octree_context={bool(full_octree_context is not None)}, "
+                f"structural_voxel_mode={structure.get('structural_voxel_mode', 'unknown')}, "
+                f"actuator_voxel_mode={actuator_stats.get('actuator_voxel_mode', 'unknown')}, "
+                f"cause_aggregation_unit_mode={cause_aggregation_unit_mode}, "
+                f"local_recomputed={forward_local_recomputed}"
+                f", voxel_node_used={bool(node_voxel_debug.get('network_voxel_node_input_used', False))}, "
+                f"voxel_node_fallback={bool(node_voxel_debug.get('network_voxel_node_fallback', False))}, "
+                f"voxel_node_reason={node_voxel_debug.get('network_voxel_node_fallback_reason', '')}, "
+                f"voxel_node_count={int(node_voxel_debug.get('network_voxel_node_count', 0) or 0)}, "
+                f"voxel_node_source={node_voxel_debug.get('network_voxel_node_source', 'none')}"
+            )
+        soft_term_keys = (
+            "add_prob_mean",
+            "add_ratio",
+            "add_shape_guard",
+            "add_direction_ce",
+            "learned_add_ratio",
+            "drop_prob",
+            "drop_prob_direct",
+            "drop_prob_proxy",
+            "drop_logit",
+            "learned_drop_logit",
+            "soft_drop_where_grad_base",
+            "soft_drop_prob_for_ste",
+            "prune_where_proxy",
+            "soft_drop_where_grad_masked",
+            "soft_drop_where_grad_direct",
+            "drop_shape_guard",
+            "learned_drop_prob",
+            "learned_drop_ratio",
+            "drop_prob_mean",
+            "drop_prob_min",
+            "drop_prob_max",
+            "drop_prob_direct_mean",
+            "drop_prob_direct_min",
+            "drop_prob_direct_max",
+            "drop_prob_proxy_mean",
+            "drop_prob_proxy_min",
+            "drop_prob_proxy_max",
+            "drop_logit_mean",
+            "drop_logit_min",
+            "drop_logit_max",
+            "keep_prob_mean",
+            "keep_prob_min",
+            "keep_prob_max",
+            "drop_entropy",
+            "soft_drop_mass",
+            "selected_drop_count_hard",
+            "prune_soft_geom",
+            "prune_soft_rate",
+            "prune_soft_node",
+            "prune_soft_single",
+            "prune_soft_bit",
+            "drop_direct_target_loss",
+            "keep_prob",
+            "move_score_mean",
+            "move_direction_ce",
+            "learned_move_ratio",
+            "soft_activity_loss",
+            "voxel_soft_drop_score",
+            "voxel_soft_add_score",
+            "voxel_soft_move_score",
+            "voxel_soft_drop_amount",
+            "voxel_soft_add_amount",
+            "voxel_soft_move_amount",
+            "voxel_soft_edit_score",
+            "voxel_soft_edit_count_proxy",
+
+            "network_drop_logit_for_outcome",
+            "codec_prune_prior_score_for_outcome",
+            "hard_drop_mask_for_outcome",
+            "hard_delete_selection_mask_for_outcome",
+            "drop_ratio_hard_for_outcome",
+            "raw_learned_drop_ratio_for_outcome",
+            "raw_learned_drop_ratio",
+            "raw_learned_add_ratio",
+            "raw_learned_move_ratio",
+            "drop_operation_gate",
+            "add_operation_gate",
+            "move_operation_gate",
+            "operation_gate_logit",
+            "operation_gate_prob",
+            "algorithmic_proposal_selector_enabled",
+            "algorithmic_proposal_selector_active",
+            "algorithmic_proposal_where_source_id",
+            "algorithmic_proposal_noop_selected",
+            "algorithmic_amount_selected_class",
+            "algorithmic_amount_selected_bin_ratio",
+            "algorithmic_amount_residual",
+            "algorithmic_amount_final_ratio",
+            "algorithmic_amount_noop_prob",
+            "algorithmic_amount_selected_prob",
+            "algorithmic_amount_teacher_class",
+            "algorithmic_amount_teacher_ratio",
+            "algorithmic_amount_selector_teacher_loss",
+            "algorithmic_amount_residual_teacher_loss",
+            "hard_drop_target_ratio_source_id",
+            "hard_drop_target_ratio_value",
+            "hard_drop_target_ratio_network_value",
+            "hard_drop_target_ratio_codec_prior_value",
+            "post_warmup_amount_hybrid_applied",
+            "post_warmup_amount_mode_id",
+            "post_warmup_amount_strategy_id",
+            "post_warmup_amount_tail_phase",
+            "post_warmup_amount_alpha",
+            "post_warmup_amount_proposal_ratio",
+            "post_warmup_amount_teacher_loss",
+            "post_warmup_amount_teacher_weight_effective",
+            "full_cloud_amount_enabled",
+            "full_cloud_amount_input_points",
+            "full_cloud_amount_selected_class",
+            "full_cloud_amount_bin",
+            "full_cloud_amount_residual_raw",
+            "full_cloud_amount_residual",
+            "full_cloud_amount_final_ratio",
+            "full_cloud_amount_noop_selected",
+            "full_cloud_amount_selected_prob",
+            "full_cloud_amount_predicted_delta",
+            "full_cloud_amount_bin_logits",
+            "full_cloud_amount_predicted_delta_per_amount",
+            "full_cloud_amount_ratio_reg_loss",
+            "amount_explore_step",
+            "amount_explore_prob",
+            "amount_explore_candidate_ratio",
+            "amount_explore_candidate_index",
+            "amount_explore_teacher_ratio",
+            "amount_explore_teacher_count",
+            "amount_explore_teacher_score",
+            "amount_explore_teacher_alpha",
+            "amount_explore_used_teacher",
+            "amount_mode_id",
+            "amount_mode_network",
+            "codec_prune_prior_base_ratio",
+            "codec_prune_prior_active_ratio",
+            "codec_prune_prior_count_alpha",
+            "learned_drop_ratio_value",
+            "codec_block_valid_point_count",
+            "codec_block_budget_points",
+            "codec_block_count",
+            "codec_block_selected_block_count",
+            "codec_block_selected_point_count",
+            "codec_block_budget_zero",
+            "codec_block_target_drop_ratio",
+            "codec_block_under_selected",
+            "network_only_direction_log_prob",
+            "network_only_total_ratio_raw",
+            "network_only_total_ratio",
+            "network_only_total_ratio_unconstrained",
+            "network_only_shares",
+            "network_only_shares_raw",
+            "network_only_priorities",
+            "network_only_temperature",
+            "network_only_predicted_local_gain_sum",
+            "network_only_interaction_correction",
+            "network_only_predicted_plan_gain",
+            "network_only_where_entropy",
+            "network_only_amount_entropy",
+            "network_only_action_entropy",
+        )
+        self.last_actuator_soft_terms = {
+            key: value
+            for key in soft_term_keys
+            for value in (actuator_stats.get(key, None),)
+            if torch.is_tensor(value)
+        }
+        try:
+            setattr(self.args, "_last_actuator_soft_terms", self.last_actuator_soft_terms)
+        except Exception:
+            pass
+
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_actuator_end = time.time()
+
+        """scaled final internal lossの計算"""
+        if compute_internal_losses is None:
+            compute_internal_losses = self.training
+        if compute_internal_losses and not direct_structure_targets:
+            if keep_sparse_path:
+                loss_attr = loss_attr_sparse * float(getattr(self.args, "loss_attr_scale", 1.0))
+                loss_policy = loss_policy_sparse * float(getattr(self.args, "loss_policy_scale", 1.0))
+                loss_repair = edit_loss * float(getattr(self.args, "loss_repair_scale", 1.0))
+            else:
+                policy_teacher = self.policy_module.build_teacher(subtree_targets)
+                loss_attr, loss_policy, loss_repair = self._build_losses(
+                    cause_scores=cause_scores,
+                    cause_logits=cause_logits,
+                    policy_logits=policy_logits,
+                    policy_teacher=policy_teacher,
+                    cause_targets=cause_targets,
+                    edit_loss=edit_loss,
+                    point_mask=selection_mask,
+                )
+        else:
+            loss_attr = pts_xyz.new_zeros(())
+            loss_policy = pts_xyz.new_zeros(())
+            loss_repair = pts_xyz.new_zeros(())
+
+        out_label = pts_xyz.new_zeros((pts_xyz.shape[0], pts_xyz.shape[2]))
+        if isinstance(actuator_stats, dict):
+            out_label = {
+                "point_label": out_label,
+                "canonical_voxel_coords_before": actuator_stats.get("canonical_voxel_coords_before", None),
+                "canonical_voxel_coords_after": actuator_stats.get("canonical_voxel_coords_after", None),
+                "voxel_restore_meta": actuator_stats.get("voxel_restore_meta", None),
+                "restored_xyz_debug": actuator_stats.get("restored_xyz_debug", None),
+                "restore_info": actuator_stats.get("restore_info", None),
+            }
+            if node_voxel_input_state is not None:
+                out_label["network_voxel_node_input_used"] = True
+                out_label["network_voxel_coords"] = node_voxel_input_state.get("voxel_coords", None)
+                out_label["network_voxel_node_mask"] = node_voxel_input_state.get("node_mask", None)
+                out_label["network_voxel_node_restore_info"] = node_voxel_input_state.get("restore_info", None)
+                if bool(getattr(self.args, "voxel_node_restore_output_debug", False)):
+                    final_coords_for_restore = actuator_voxel_state.get("final_voxel_coords", None)
+                    final_meta_for_restore = (
+                        actuator_stats.get("voxel_restore_meta", None)
+                        or node_voxel_input_state.get("restore_meta", None)
+                    )
+                    if final_coords_for_restore is not None:
+                        try:
+                            restored_voxel_xyz, restored_voxel_info = restore_points_from_voxel_coords(
+                                final_coords_for_restore,
+                                meta=final_meta_for_restore,
+                                args=self.args,
+                                center=bool(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+                                unique=True,
+                                dtype=pts_xyz.dtype,
+                                device=pts_xyz.device,
+                            )
+                            out_label["network_voxel_node_restored_xyz_debug"] = restored_voxel_xyz
+                            out_label["network_voxel_node_restored_info"] = restored_voxel_info
+                        except Exception as exc:
+                            out_label["network_voxel_node_restore_error"] = f"{type(exc).__name__}:{str(exc)[:160]}"
+
+        repair_gate = actuator_stats["repair_gate"]
+
+        def _actuator_scalar(key, default=0.0):
+            value = actuator_stats.get(key, None)
+            if torch.is_tensor(value):
+                return float(value.detach().float().mean().cpu())
+            if value is None:
+                return float(default)
+            try:
+                return float(value)
+            except Exception:
+                return float(default)
+
+        """問題スコアの算出"""
+        single_chain_score = self._masked_point_mean(
+            structure["single_proxy_full"].pow(2),
+            selection_mask,
+        )
+
+        # Occupancy NLL proxy は、低確率ratioとは別に平均値として計算する
+        occupancy_nll_score = self._masked_point_mean(
+            structure["occupancy_nll_proxy_full"],
+            selection_mask,
+        )
+
+        # Low-probability Occupancy proxy は、lowprob_proxy_full から計算する
+        lowprob_score = self._masked_point_mean(
+            structure["lowprob_proxy_full"],
+            selection_mask,
+        )
+
+        # Low-probability Occupancy Ratio は、lowprob_proxy_full が閾値を超えた点の割合として計算する
+        lowprob_ratio = self._masked_point_mean(
+            (structure["lowprob_proxy_full"] > 0.5).to(dtype=pts_xyz.dtype),
+            selection_mask,
+        )
+
+        node_score = self._masked_point_mean(
+            structure["node_proxy_full"],
+            selection_mask,
+        )
+
+        quant_score = self._masked_point_mean(
+            structure["quant_proxy_full"],
+            selection_mask,
+        )
+
+        """ログ"""
+        if self._should_collect_runtime_debug():
+            with torch.no_grad():
+                if not keep_sparse_path:
+                    policy_mean = policy_probs.mean(dim=(0, 2)).detach().cpu()
+                    cause_mean = cause_scores.mean(dim=(0, 2)).detach().cpu()
+                    subtree_mean = subtree_scores.mean(dim=(0, 2)).detach().cpu()
+                debug_cause_scores = subtree_scores_full.detach()
+                debug_policy_probs = policy_probs_full.detach()
+                policy_entropy = (
+                    -(debug_policy_probs.clamp_min(1e-6).log() * debug_policy_probs).sum(dim=1).mean()
+                )
+                cause_argmax_counts = self._argmax_count_dict(debug_cause_scores, CAUSE_NAMES)
+                policy_argmax_counts = self._argmax_count_dict(debug_policy_probs, POLICY_NAMES)
+                active_policy_count = sum(1 for value in policy_argmax_counts.values() if value > 0)
+                structure_local_recomputed = bool(structure.get("local_recomputed", False))
+                self.last_structure_debug = {
+                    "actuator_octree_context_source": str(
+                        actuator_stats.get("actuator_octree_context_source", "unknown")
+                    ),
+                    "actuator_octree_context_is_full_cloud": bool(
+                        actuator_stats.get("actuator_octree_context_is_full_cloud", False)
+                    ),
+                    "actuator_octree_context_available": bool(
+                        actuator_stats.get("actuator_octree_context_available", False)
+                    ),
+                    "actuator_octree_context_has_global_voxel_coords": bool(
+                        actuator_stats.get("actuator_octree_context_has_global_voxel_coords", False)
+                    ),
+                    "actuator_voxel_state_saved": bool(
+                        isinstance(getattr(self.args, "_last_actuator_voxel_state", None), dict)
+                    ),
+                    "actuator_final_voxel_state_available": bool(
+                        isinstance(getattr(self.args, "_last_actuator_voxel_state", None), dict)
+                        and getattr(self.args, "_last_actuator_voxel_state", {}).get("final_voxel_coords", None) is not None
+                    ),
+                    "final_voxel_update_mode": actuator_stats.get(
+                        "final_voxel_update_mode",
+                        "unknown",
+                    ),
+                    "final_voxel_recomputed_from_pts_out": bool(
+                        actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
+                    ),
+                    "voxel_edit_state_enabled": bool(actuator_stats.get("voxel_edit_state_enabled", False)),
+                    "voxel_edit_mode": str(actuator_stats.get("voxel_edit_mode", "unknown")),
+                    "voxel_edit_initial_count": int(actuator_stats.get("voxel_edit_initial_count", 0)),
+                    "voxel_edit_final_count": int(actuator_stats.get("voxel_edit_final_count", 0)),
+                    "voxel_edit_drop_count": int(actuator_stats.get("voxel_edit_drop_count", 0)),
+                    "voxel_edit_add_count": int(actuator_stats.get("voxel_edit_add_count", 0)),
+                    "voxel_edit_move_count": int(actuator_stats.get("voxel_edit_move_count", 0)),
+                    "input_voxel_count": int(actuator_stats.get("input_voxel_count", actuator_stats.get("voxel_edit_initial_count", 0))),
+                    "final_voxel_count": int(actuator_stats.get("final_voxel_count", actuator_stats.get("voxel_edit_final_count", 0))),
+                    "repair_output_voxel_restored_points": bool(actuator_stats.get("repair_output_voxel_restored_points", False)),
+
+                    "actuator_full_octree_context_available": bool(actuator_stats.get("full_octree_context_available", False)),
+                    "actuator_parent_occupancy_code": int(actuator_stats.get("actuator_parent_occupancy_code", 0)),
+                    "actuator_sibling_count": int(actuator_stats.get("actuator_sibling_count", 0)),
+                    "actuator_ancestor_count": int(actuator_stats.get("actuator_ancestor_count", 0)),
+                    "actuator_full_context_bonus_mean": float(
+                        actuator_stats.get("full_context_bonus_mean", pts_xyz.new_zeros(())).detach().cpu()
+                    )
+                    if torch.is_tensor(actuator_stats.get("full_context_bonus_mean", None))
+                    else float(actuator_stats.get("full_context_bonus_mean", 0.0)),
+                    "leaf_actuator_prior_enabled": bool(
+                        float(actuator_stats.get("leaf_actuator_prior_enabled", pts_xyz.new_zeros(())).detach().cpu()) > 0.5
+                    )
+                    if torch.is_tensor(actuator_stats.get("leaf_actuator_prior_enabled", None))
+                    else bool(actuator_stats.get("leaf_actuator_prior_enabled", False)),
+                    "leaf_actuator_drop_prior_mean": _actuator_scalar("leaf_actuator_drop_prior_mean"),
+                    "leaf_actuator_add_prior_mean": _actuator_scalar("leaf_actuator_add_prior_mean"),
+                    "leaf_actuator_move_prior_mean": _actuator_scalar("leaf_actuator_move_prior_mean"),
+                    "leaf_actuator_best_prior_mean": _actuator_scalar("leaf_actuator_best_prior_mean"),
+                    "leaf_actuator_best_prior_max": _actuator_scalar("leaf_actuator_best_prior_max"),
+                    "octree_input_mode": str(structure.get("octree_input_mode", octree_input_mode)),
+                    "use_subtree_tree": bool(subtree_tree is not None),
+                    "use_full_octree_context": bool(full_octree_context is not None),
+                    "structural_voxel_mode": str(structure.get("structural_voxel_mode", "unknown")),
+                    "actuator_voxel_mode": str(actuator_stats.get("actuator_voxel_mode", "unknown")),
+                    "cause_aggregation_unit_mode": cause_aggregation_unit_mode,
+                    "local_recomputed": bool(structure_local_recomputed or actuator_local_recomputed or "local_recomputed" in cause_aggregation_unit_mode),
+                    "structure_local_recomputed": structure_local_recomputed,
+                    "actuator_local_recomputed": actuator_local_recomputed,
+                    "prebuilt_metadata_used": bool(subtree_tree is not None and not structure_local_recomputed and not actuator_local_recomputed),
+                    "prebuilt_fallback": bool((subtree_tree is not None) and (structure_local_recomputed or actuator_local_recomputed or "local_recomputed" in cause_aggregation_unit_mode)),
+                    "repair_unit_keys_used": bool(
+                        "prebuilt" in cause_aggregation_unit_mode
+                        and (
+                            full_unit_keys is not None
+                            or structure.get("aggregation_unit_keys", None) is not None
+                            or structure.get("structural_voxel_key", None) is not None
+                            or structure.get("point_feature_voxel_key", None) is not None
+                        )
+                    ),
+                    "aggregation_unit_key_available": bool(
+                        structure.get("aggregation_unit_keys", None) is not None
+                    ),
+                    # ============================================================
+                    # Phase4:
+                    # CostAttribution / CauseAggregation / OctreeStructure が
+                    # Node/Voxel基準で動いているかを確認するdebug。
+                    # ============================================================
+                    "phase4_cost_attribution_input_mode": str(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get("input_mode", "unknown")
+                    ),
+                    "phase4_cost_scores_requires_grad": bool(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get("scores_requires_grad", False)
+                    ),
+                    "phase4_cost_logits_requires_grad": bool(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get("logits_requires_grad", False)
+                    ),
+                    "direct_octree_structure_targets": bool(direct_structure_targets),
+                    "structure_control_source": (
+                        "direct_octree_targets"
+                        if direct_structure_targets
+                        else "learned_cost_attribution_and_policy"
+                    ),
+                    "phase4_cause_entropy": float(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get(
+                            "cause_entropy",
+                            pts_xyz.new_zeros(())
+                        ).detach().cpu()
+                    )
+                    if torch.is_tensor(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get("cause_entropy", None)
+                    )
+                    else 0.0,
+                    "phase4_aggregation_key_source": str(
+                        structure.get("phase4_aggregation_key_source", "unknown")
+                    ),
+                    "phase4_aggregation_unit_count": int(
+                        structure.get("phase4_aggregation_unit_count", 0) or 0
+                    ),
+                    "phase4_aggregation_min_unit_size": int(
+                        structure.get("phase4_aggregation_min_unit_size", 0) or 0
+                    ),
+                    "phase4_aggregation_max_unit_size": int(
+                        structure.get("phase4_aggregation_max_unit_size", 0) or 0
+                    ),
+                    "phase4_structural_key_source": str(
+                        structure.get("phase4_structural_key_source", "unknown")
+                    ),
+                    "loss_attr": float(loss_attr.detach().cpu()),
+                    "loss_policy": float(loss_policy.detach().cpu()),
+                    "loss_repair": float(loss_repair.detach().cpu()),
+                        "repair_ratio": float(repair_gate.mean().detach().cpu()),
+                        "add_ratio": float(actuator_stats.get("add_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_prob_mean": float(actuator_stats.get("add_prob_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_prob_max": float(actuator_stats.get("add_prob_max", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_priority_mean": float(actuator_stats.get("add_priority_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_priority_max": float(actuator_stats.get("add_priority_max", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_count": int(actuator_stats.get("add_count", 0)),
+                    "add_effective_count": int(actuator_stats.get("add_effective_count", 0)),
+                    "add_candidate_ratio": float(actuator_stats.get("add_candidate_ratio", 0.0)),
+                    # Prune/Add/Adjustの学習済み実行量をログへ渡し、固定比率への張り付きを確認できるようにする。
+                    "learned_drop_ratio": float(actuator_stats.get("learned_drop_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "learned_drop_ratio_std": float(actuator_stats.get("learned_drop_ratio_std", pts_xyz.new_zeros(())).detach().cpu()),
+                    "learned_add_ratio": float(actuator_stats.get("learned_add_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "learned_add_ratio_std": float(actuator_stats.get("learned_add_ratio_std", pts_xyz.new_zeros(())).detach().cpu()),
+                    "learned_move_ratio": float(actuator_stats.get("learned_move_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "learned_move_ratio_std": float(actuator_stats.get("learned_move_ratio_std", pts_xyz.new_zeros(())).detach().cpu()),
+                    "drop_operation_gate": _actuator_scalar("drop_operation_gate"),
+                    "add_operation_gate": _actuator_scalar("add_operation_gate"),
+                    "move_operation_gate": _actuator_scalar("move_operation_gate"),
+                    "raw_learned_drop_ratio": _actuator_scalar("raw_learned_drop_ratio"),
+                    "raw_learned_add_ratio": _actuator_scalar("raw_learned_add_ratio"),
+                    "raw_learned_move_ratio": _actuator_scalar("raw_learned_move_ratio"),
+                    "operation_gate_oracle_loss": _actuator_scalar("operation_gate_oracle_loss"),
+                    "actual_oracle_candidate_where_loss": _actuator_scalar("actual_oracle_candidate_where_loss"),
+                    "actual_oracle_drop_amount_loss": _actuator_scalar("actual_oracle_drop_amount_loss"),
+                    "actual_oracle_add_amount_loss": _actuator_scalar("actual_oracle_add_amount_loss"),
+                    "actual_oracle_move_amount_loss": _actuator_scalar("actual_oracle_move_amount_loss"),
+                    "actual_oracle_drop_amount_logit_loss": _actuator_scalar("actual_oracle_drop_amount_logit_loss"),
+                    "actual_oracle_add_amount_logit_loss": _actuator_scalar("actual_oracle_add_amount_logit_loss"),
+                    "actual_oracle_amount_supervision_loss": _actuator_scalar("actual_oracle_amount_supervision_loss"),
+                    "actual_oracle_bad_candidate_count": int(actuator_stats.get("actual_oracle_bad_candidate_count", 0)),
+                    "actual_oracle_improving_candidate_count": int(actuator_stats.get("actual_oracle_improving_candidate_count", 0)),
+                    "actual_oracle_combo_extra_count": int(actuator_stats.get("actual_oracle_combo_extra_count", 0)),
+                    "actual_oracle_drop_bad_count": int(actuator_stats.get("actual_oracle_drop_bad_count", 0)),
+                    "actual_oracle_add_bad_count": int(actuator_stats.get("actual_oracle_add_bad_count", 0)),
+                    "actual_oracle_move_bad_count": int(actuator_stats.get("actual_oracle_move_bad_count", 0)),
+                    "actual_oracle_drop_reason": str(actuator_stats.get("actual_oracle_drop_reason", "")),
+                    "actual_oracle_operation": str(actuator_stats.get("actual_oracle_operation", "")),
+                    "actual_oracle_scheduled_operation": str(
+                        actuator_stats.get("actual_oracle_scheduled_operation", "")
+                    ),
+                    "actual_oracle_apply_teacher_actions": bool(
+                        _actuator_scalar("actual_oracle_apply_teacher_actions") > 0.5
+                    ),
+                    "actual_gate_prune_enabled": bool(
+                        _actuator_scalar("actual_gate_prune_enabled") > 0.5
+                    ),
+                    "actual_gate_prune_allowed": bool(
+                        _actuator_scalar("actual_gate_prune_allowed") > 0.5
+                    ),
+                    "codec_prune_prior_enabled": bool(
+                        _actuator_scalar("codec_prune_prior_enabled") > 0.5
+                    ),
+                    "codec_prune_prior_phase": _actuator_scalar("codec_prune_prior_phase"),
+                    "codec_prune_prior_ratio": _actuator_scalar("codec_prune_prior_ratio"),
+                    "codec_prune_prior_block_size": int(
+                        round(_actuator_scalar("codec_prune_prior_block_size"))
+                    ),
+                    "codec_prune_prior_block_count_mean": _actuator_scalar(
+                        "codec_prune_prior_block_count_mean"
+                    ),
+                    "operation_amount_consistency_loss": float(actuator_stats.get("operation_amount_consistency_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "operation_entropy": float(actuator_stats.get("operation_entropy", pts_xyz.new_zeros(())).detach().cpu()),
+                    "operation_prob_floor_applied": bool(actuator_stats.get("operation_prob_floor_applied", False)),
+                    "temperature": float(actuator_stats.get("temperature", 0.0)),
+                    "exploration_noise": float(actuator_stats.get("exploration_noise", 0.0)),
+                    "sparsepcgc_add_experiment_enabled": bool(actuator_stats.get("sparsepcgc_add_experiment_enabled", False)),
+                    "sparsepcgc_add_warmup": float(actuator_stats.get("sparsepcgc_add_warmup", 1.0)),
+                        "add_score_noise": float(actuator_stats.get("add_score_noise", 0.0)),
+                        "add_weight_random_mix": float(actuator_stats.get("add_weight_random_mix", 0.0)),
+                        "drop_score_noise": float(actuator_stats.get("drop_score_noise", 0.0)),
+                        # Adjust score探索ノイズ量を記録し、初期探索が効いているか確認する。
+                        "move_score_noise": float(actuator_stats.get("move_score_noise", 0.0)),
+                        "drop_random_mix": float(actuator_stats.get("drop_random_mix", 0.0)),
+                        "add_enabled": bool(actuator_stats.get("add_enabled", False)),
+                        "prune_enabled": bool(actuator_stats.get("prune_enabled", False)),
+                        "disp_enabled": bool(actuator_stats.get("disp_enabled", False)),
+                        "actuator_stage": str(actuator_stats.get("actuator_stage", "unknown")),
+                        "actuator_stage_raw": str(actuator_stats.get("actuator_stage_raw", "unknown")),
+                        "actuator_strength": float(actuator_stats.get("actuator_strength", 0.0)),
+                        "force_joint_actuator": bool(actuator_stats.get("force_joint_actuator", False)),
+                        "add_drop_conflict_loss": float(actuator_stats.get("add_drop_conflict_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "added_keep_loss": float(actuator_stats.get("added_keep_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "add_min_offset_loss": float(actuator_stats.get("add_min_offset_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                        "drop_ratio": float(actuator_stats["drop_prob"].mean().detach().cpu()),
+                        "hard_drop_ratio": float(actuator_stats.get("hard_drop_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                        "hard_drop_count": int(actuator_stats.get("hard_drop_count", 0)),
+                        "keep_ratio": float(actuator_stats["keep_prob"].mean().detach().cpu()),
+                    "delta_norm": float(actuator_stats["delta"].norm(dim=1).mean().detach().cpu()),
+                        "move_ratio": float(actuator_stats.get("move_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                        "hard_move_count": int(actuator_stats.get("hard_move_count", 0)),
+                        "move_score_mean": float(actuator_stats.get("move_score_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                    "move_target_valid_ratio": float(actuator_stats.get("move_target_valid_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "moved_delta_mean": float(actuator_stats.get("moved_delta_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                    "before_occupied_voxel_count": int(actuator_stats.get("before_occupied_voxel_count", 0)),
+                    "after_occupied_voxel_count": int(actuator_stats.get("after_occupied_voxel_count", 0)),
+                    "occupied_voxel_delta": int(actuator_stats.get("occupied_voxel_delta", 0)),
+                    "delete_target_voxel_count": int(actuator_stats.get("delete_target_voxel_count", 0)),
+                    "delete_emptied_voxel_count": int(actuator_stats.get("delete_emptied_voxel_count", 0)),
+                    "delete_removed_point_count": int(actuator_stats.get("delete_removed_point_count", 0)),
+                    "add_target_voxel_count": int(actuator_stats.get("add_target_voxel_count", 0)),
+                    "add_actual_point_count": int(actuator_stats.get("add_actual_point_count", 0)),
+                    "move_source_voxel_count": int(actuator_stats.get("move_source_voxel_count", 0)),
+                    "move_target_voxel_count": int(actuator_stats.get("move_target_voxel_count", 0)),
+                    "adjusted_point_count": int(actuator_stats.get("adjusted_point_count", actuator_stats.get("hard_move_count", 0))),
+                    "adjusted_point_rate": float(actuator_stats.get("adjusted_point_rate", pts_xyz.new_zeros(())).detach().cpu()) if torch.is_tensor(actuator_stats.get("adjusted_point_rate", None)) else float(actuator_stats.get("adjusted_point_rate", 0.0)),
+                    "raw_hard_move_count_before_sparsepcgc_guard": int(actuator_stats.get("raw_hard_move_count_before_sparsepcgc_guard", actuator_stats.get("hard_move_count", 0))),
+                    "source_unique_voxel_count": int(actuator_stats.get("source_unique_voxel_count", 0)),
+                    "target_unique_voxel_count": int(actuator_stats.get("target_unique_voxel_count", 0)),
+                    "target_duplicate_voxel_count": int(actuator_stats.get("target_duplicate_voxel_count", 0)),
+                    "target_voxel_duplicate_rate": float(actuator_stats.get("target_voxel_duplicate_rate", pts_xyz.new_zeros(())).detach().cpu()) if torch.is_tensor(actuator_stats.get("target_voxel_duplicate_rate", None)) else float(actuator_stats.get("target_voxel_duplicate_rate", 0.0)),
+                    "target_existing_occupied_count": int(actuator_stats.get("target_existing_occupied_count", 0)),
+                    "target_existing_occupied_rate": float(actuator_stats.get("target_existing_occupied_rate", pts_xyz.new_zeros(())).detach().cpu()) if torch.is_tensor(actuator_stats.get("target_existing_occupied_rate", None)) else float(actuator_stats.get("target_existing_occupied_rate", 0.0)),
+                    "target_empty_voxel_count": int(actuator_stats.get("target_empty_voxel_count", 0)),
+                    "target_empty_voxel_rate": float(actuator_stats.get("target_empty_voxel_rate", pts_xyz.new_zeros(())).detach().cpu()) if torch.is_tensor(actuator_stats.get("target_empty_voxel_rate", None)) else float(actuator_stats.get("target_empty_voxel_rate", 0.0)),
+                    "empty_target_violation_loss": float(actuator_stats.get("empty_target_violation_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "target_duplicate_voxel_loss": float(actuator_stats.get("target_duplicate_voxel_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "enable_sparsepcgc_empty_target_guard": bool(actuator_stats.get("enable_sparsepcgc_empty_target_guard", False)),
+                    "enable_sparsepcgc_target_duplicate_guard": bool(actuator_stats.get("enable_sparsepcgc_target_duplicate_guard", False)),
+                    "sparsepcgc_empty_target_guard_rejected_count": int(actuator_stats.get("sparsepcgc_empty_target_guard_rejected_count", 0)),
+                    "sparsepcgc_target_duplicate_guard_rejected_count": int(actuator_stats.get("sparsepcgc_target_duplicate_guard_rejected_count", 0)),
+                    "sparsepcgc_guard_rejected_count": int(actuator_stats.get("sparsepcgc_guard_rejected_count", 0)),
+                    "sparsepcgc_move_existing_target_only": bool(actuator_stats.get("sparsepcgc_move_existing_target_only", False)),
+                    "repair_move_require_empty_target": bool(actuator_stats.get("repair_move_require_empty_target", True)),
+                    "repair_move_require_empty_target_effective": bool(actuator_stats.get("repair_move_require_empty_target_effective", True)),
+                    "repair_move_max_points_per_voxel": int(actuator_stats.get("repair_move_max_points_per_voxel", 0)),
+                    "repair_move_warmup": float(actuator_stats.get("repair_move_warmup", 1.0)),
+                    "target_move_ratio": float(actuator_stats.get("target_move_ratio", 0.0)),
+                    "max_move_ratio": float(actuator_stats.get("max_move_ratio", 0.0)),
+                    "repair_move_hard_threshold": float(actuator_stats.get("repair_move_hard_threshold", 0.0)),
+                    "moved_different_voxel_count": int(actuator_stats.get("moved_different_voxel_count", 0)),
+                    "same_voxel_adjust_count": int(actuator_stats.get("same_voxel_adjust_count", 0)),
+                    "preserve_ratio": float(actuator_stats.get("preserve_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "quant_score": float(quant_score.detach().cpu()),
+                    "quant_move_conflict_loss": float(actuator_stats.get("quant_move_conflict_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "local_edit_guard": float(actuator_stats.get("local_edit_guard", pts_xyz.new_zeros(())).detach().cpu()),
+                    "analysis_points_mean": float(sum(analysis_counts) / max(len(analysis_counts), 1)) if keep_sparse_path else float(pts_xyz.shape[-1]),
+                    "cause_mean": {
+                        name: float(cause_mean[i])
+                        for i, name in enumerate(CAUSE_NAMES)
+                    },
+                    "subtree_cause_mean": {
+                        name: float(subtree_mean[i])
+                        for i, name in enumerate(CAUSE_NAMES)
+                    },
+                    "policy_mean": {
+                        name: float(policy_mean[i])
+                        for i, name in enumerate(POLICY_NAMES)
+                    },
+                    "cause_argmax_counts": cause_argmax_counts,
+                    "policy_argmax_counts": policy_argmax_counts,
+                    "operation_by_cause": self._operation_by_cause(debug_cause_scores, debug_policy_probs),
+                    "policy_entropy": float(policy_entropy.detach().cpu()),
+                    "occupancy_nll_proxy": float(occupancy_nll_score.detach().cpu()),
+                    "lowprob_occupancy_score": float(lowprob_score.detach().cpu()),
+                    "lowprob_occupancy_ratio": float(lowprob_ratio.detach().cpu()),
+                    "single_chain_score": float(single_chain_score.detach().cpu()),
+                    "node_score": float(node_score.detach().cpu()),
+                    "policy_diversity": int(active_policy_count),
+                    "octree_level_debug": structure.get("level_debug"),
+                    "use_subtree_tree": bool(subtree_tree is not None),
+                    "use_full_octree_context": bool(full_octree_context is not None),
+                    "octree_input_mode": str(structure.get("octree_input_mode", "local_recomputed")),
+
+                    # Section1:
+                    # full cloud canonical voxel coordsに基づくleaf pattern診断のdebug。
+                    "leaf_pattern_available": bool(structure.get("leaf_pattern_available", False)),
+                    "leaf_pattern_source": str(structure.get("leaf_pattern_source", "none")),
+                    "leaf_pattern_reason": str(structure.get("leaf_pattern_reason", "")),
+                    "leaf_unique_parent_count": int(structure.get("leaf_unique_parent_count", 0) or 0),
+                    "leaf_unique_pattern_count": int(structure.get("leaf_unique_pattern_count", 0) or 0),
+                    "leaf_mean_child_count": float(structure.get("leaf_mean_child_count", 0.0) or 0.0),
+                    "leaf_single_child_parent_ratio": float(structure.get("leaf_single_child_parent_ratio", 0.0) or 0.0),
+                    "leaf_max_pattern_frequency": float(structure.get("leaf_max_pattern_frequency", 0.0) or 0.0),
+
+                    # Section2/3:
+                    "leaf_candidate_available": bool(structure.get("leaf_candidate_available", False)),
+                    "leaf_delete_gain_mean": float(structure.get("leaf_delete_gain_mean", 0.0) or 0.0),
+                    "leaf_add_gain_mean": float(structure.get("leaf_add_gain_mean", 0.0) or 0.0),
+                    "leaf_move_gain_mean": float(structure.get("leaf_move_gain_mean", 0.0) or 0.0),
+                    "leaf_high_gain_candidate_ratio": float(structure.get("leaf_high_gain_candidate_ratio", 0.0) or 0.0),
+                    "leaf_feature_integration_used": bool(structure.get("leaf_feature_integration_used", False)),
+                    "leaf_feature_best_gain_mean": float(structure.get("leaf_feature_best_gain_mean", 0.0) or 0.0),
+                    "leaf_feature_best_gain_max": float(structure.get("leaf_feature_best_gain_max", 0.0) or 0.0),
+
+                    # Section4:
+                    "leaf_actuator_prior_enabled": bool(
+                        _actuator_scalar("leaf_actuator_prior_enabled") > 0.5
+                    ),
+                    "leaf_actuator_drop_prior_mean": _actuator_scalar("leaf_actuator_drop_prior_mean"),
+                    "leaf_actuator_add_prior_mean": _actuator_scalar("leaf_actuator_add_prior_mean"),
+                    "leaf_actuator_move_prior_mean": _actuator_scalar("leaf_actuator_move_prior_mean"),
+                    "leaf_actuator_best_prior_mean": _actuator_scalar("leaf_actuator_best_prior_mean"),
+                    "leaf_actuator_best_prior_max": _actuator_scalar("leaf_actuator_best_prior_max"),
+
+                    # Section5:
+                    "leaf_target_direction_prior_enabled": bool(
+                        _actuator_scalar("leaf_target_direction_prior_enabled") > 0.5
+                    ),
+                    "leaf_add_target_match_ratio": _actuator_scalar("leaf_add_target_match_ratio"),
+                    "leaf_move_target_match_ratio": _actuator_scalar("leaf_move_target_match_ratio"),
+                    "leaf_add_target_bias_mean": _actuator_scalar("leaf_add_target_bias_mean"),
+                    "leaf_move_target_bias_mean": _actuator_scalar("leaf_move_target_bias_mean"),
+
+                    "network_voxel_node_input_requested": bool(node_voxel_debug.get("network_voxel_node_input_requested", False)),
+                    "leaf_actuator_prior_enabled": bool(
+                        _actuator_scalar("leaf_actuator_prior_enabled") > 0.5
+                    ),
+                    "leaf_actuator_drop_prior_mean": _actuator_scalar("leaf_actuator_drop_prior_mean"),
+                    "leaf_actuator_add_prior_mean": _actuator_scalar("leaf_actuator_add_prior_mean"),
+                    "leaf_actuator_move_prior_mean": _actuator_scalar("leaf_actuator_move_prior_mean"),
+                    "leaf_actuator_best_prior_mean": _actuator_scalar("leaf_actuator_best_prior_mean"),
+                    "leaf_actuator_best_prior_max": _actuator_scalar("leaf_actuator_best_prior_max"),
+
+                    "network_voxel_node_input_used": bool(node_voxel_debug.get("network_voxel_node_input_used", False)),
+                    "full_cloud_anchor_node_voxel_used": bool(
+                        str(octree_input_mode or "").strip().lower() == "full_cloud"
+                        and bool(node_voxel_debug.get("network_voxel_node_input_used", False))
+                    ),
+                    "subtree_node_voxel_used": bool(
+                        str(octree_input_mode or "").strip().lower() != "full_cloud"
+                        and bool(node_voxel_debug.get("network_voxel_node_input_used", False))
+                    ),
+                    "phase7_node_voxel_debug_available": True,
+                    "network_voxel_node_fallback": bool(node_voxel_debug.get("network_voxel_node_fallback", False)),
+                    "network_voxel_node_fallback_reason": str(node_voxel_debug.get("network_voxel_node_fallback_reason", "")),
+                    "network_voxel_node_count": int(node_voxel_debug.get("network_voxel_node_count", 0) or 0),
+                    "network_voxel_node_source": str(node_voxel_debug.get("network_voxel_node_source", "none")),
+                    "network_voxel_node_feature_shape": str(node_voxel_debug.get("network_voxel_node_feature_shape", "")),
+                    "octree_input_mode_requested": str(structure.get("octree_input_mode_requested", octree_input_mode)),
+                    "structural_voxel_mode": str(structure.get("structural_voxel_mode", "local_recomputed")),
+                    "point_feature_voxel_mode": str(structure.get("point_feature_voxel_mode", "local_xyz")),
+                    "structural_voxel_key_available": bool(structure.get("structural_voxel_key") is not None),
+                    "point_feature_voxel_key_available": bool(structure.get("point_feature_voxel_key") is not None),
+                    "selected_subtree_key": str((subtree_tree or {}).get("subtree_key", "")),
+                    "selected_subtree_path": str((subtree_tree or {}).get("subtree_path", "")),
+                    "root_to_subtree_path": " > ".join((full_octree_context or {}).get("root_to_subtree_path", [])),
+                    "global_offset": str((subtree_tree or full_octree_context or {}).get("global_offset", "")),
+                    "local_offset": "encoder_or_point_feature_local_xyz",
+                    "global_depth": int((subtree_tree or full_octree_context or {}).get("global_depth", 0) or 0),
+                    "local_depth": int(getattr(self.structure_analyzer, "max_depth", 0)),
+                    "parent_occupancy_code": int((full_octree_context or {}).get("parent_occupancy_code", 0) or 0),
+                    "sibling_count": int(len((full_octree_context or {}).get("sibling_paths", []))),
+                    "enable_sparsepcgc_exact_occupancy_teacher": bool(getattr(self.args, "enable_sparsepcgc_exact_occupancy_teacher", False)),
+                    "sparsepcgc_exact_teacher_mode": str(getattr(self.args, "_current_exact_teacher_mode", getattr(self.args, "sparsepcgc_exact_teacher_mode", "auto"))),
+                    "exact_teacher_uses_full_context": bool(getattr(self.args, "_current_exact_teacher_uses_full_context", False)),
+                    "exact_teacher_fallback_reason": str(getattr(self.args, "_current_exact_teacher_fallback_reason", "")),
+                }
+                for key in (
+                    "actual_oracle_bad_candidate_count",
+                    "actual_oracle_improving_candidate_count",
+                    "actual_oracle_combo_extra_count",
+                    "actual_oracle_generated_candidate_count",
+                    "actual_oracle_accepted_candidate_count",
+                    "actual_oracle_accepted_prune_count",
+                    "actual_oracle_accepted_add_count",
+                    "actual_oracle_accepted_adjust_count",
+                    "actual_oracle_accepted_subtree_move_count",
+                    "actual_oracle_accepted_parent_collapse_count",
+                    "actual_oracle_accepted_pattern_canonicalize_count",
+                    "actual_oracle_noop_label_count",
+                    "actual_oracle_high_rate_mppov_count",
+                    "actual_oracle_low_prob_occupied_count",
+                    "actual_oracle_single_child_chain_count",
+                    "actual_oracle_context_pattern_candidate_count",
+                    "actual_oracle_eval_count",
+                    "actual_oracle_eval_max",
+                ):
+                    self.last_structure_debug[key] = int(round(_actuator_scalar(key, 0.0)))
+                for key in (
+                    "actual_oracle_noop_label_weight",
+                    "actual_oracle_time",
+                    "actual_oracle_edit_record_bits",
+                    "actual_oracle_raw_percent",
+                    "actual_oracle_delta_actual_percent",
+                    "actual_oracle_proxy_percent",
+                    "actual_oracle_geometry_percent",
+                    "actual_oracle_original_actual_bits",
+                    "actual_oracle_edited_actual_bits",
+                    "operation_entropy_loss",
+                    "operation_entropy_weight_effective",
+                ):
+                    self.last_structure_debug[key] = _actuator_scalar(key, 0.0)
+                for key in (
+                    "phase0_network_prune_mode",
+                    "actual_oracle_force_no_edit_used",
+                    "actual_oracle_has_drop",
+                    "hard_prune_actual_allowed",
+                    "phase0_network_mode_but_hard_drop_zero",
+                    "phase0_noop_only_collapse_detected",
+                    "drop_score_gate_applied_to_hard_selection",
+                    "min_hard_drop_count_floor_applied",
+                    "amount_mode_network",
+                    "codec_block_budget_zero",
+                    "codec_block_under_selected",
+                    "post_warmup_amount_hybrid_applied",
+                    "amount_explore_step",
+                    "amount_explore_used_teacher",
+                    "algorithmic_proposal_selector_enabled",
+                    "algorithmic_proposal_selector_active",
+                    "algorithmic_proposal_noop_selected",
+                    "external_executable_plan_applied",
+                ):
+                    self.last_structure_debug[key] = bool(_actuator_scalar(key, 0.0) > 0.5)
+                for key in (
+                    "prune_after_prior_mode",
+                    "hard_drop_block_reason",
+                    "collapse_reason",
+                    "hard_drop_count_trace",
+                    "delete_candidate_empty_reason",
+                    "external_executable_plan_hash",
+                ):
+                    self.last_structure_debug[key] = str(actuator_stats.get(key, ""))
+                for key in (
+                    "codec_prune_prior_base_ratio",
+                    "codec_prune_prior_active_ratio",
+                    "codec_prune_prior_count_alpha",
+                    "learned_drop_ratio_before_floor",
+                    "learned_drop_ratio_after_floor",
+                    "learned_drop_ratio_before_gate",
+                    "learned_drop_ratio_after_gate",
+                    "learned_drop_ratio_value",
+                    "effective_drop_ratio_for_hard_count",
+                    "algorithmic_proposal_where_source_id",
+                    "algorithmic_amount_selected_class",
+                    "algorithmic_amount_selected_bin_ratio",
+                    "algorithmic_amount_residual",
+                    "algorithmic_amount_final_ratio",
+                    "algorithmic_amount_noop_prob",
+                    "algorithmic_amount_selected_prob",
+                    "algorithmic_amount_teacher_class",
+                    "algorithmic_amount_teacher_ratio",
+                    "algorithmic_amount_selector_teacher_loss",
+                    "algorithmic_amount_residual_teacher_loss",
+                    "hard_drop_target_ratio_source_id",
+                    "hard_drop_target_ratio_value",
+                    "hard_drop_target_ratio_network_value",
+                    "hard_drop_target_ratio_codec_prior_value",
+                    "post_warmup_amount_strategy_id",
+                    "post_warmup_amount_mode_id",
+                    "post_warmup_amount_tail_phase",
+                    "post_warmup_amount_alpha",
+                    "post_warmup_amount_proposal_ratio",
+                    "post_warmup_amount_teacher_loss",
+                    "post_warmup_amount_teacher_weight_effective",
+                    "amount_explore_prob",
+                    "amount_explore_candidate_ratio",
+                    "amount_explore_candidate_index",
+                    "amount_explore_teacher_ratio",
+                    "amount_explore_teacher_count",
+                    "amount_explore_teacher_score",
+                    "amount_explore_teacher_alpha",
+                    "amount_mode_id",
+                    "network_prune_ratio_floor",
+                    "network_prune_min_hard_count",
+                    "network_prune_floor_steps",
+                    "network_prune_floor_decay_steps",
+                    "voxel_count",
+                    "codec_block_valid_point_count",
+                    "codec_block_budget_points",
+                    "codec_block_count",
+                    "codec_block_selected_block_count",
+                    "codec_block_selected_point_count",
+                    "codec_block_target_drop_ratio",
+                    "delete_candidate_count",
+                    "delete_candidate_point_count",
+                    "hard_delete_selection_count",
+                    "pre_round_target_count",
+                    "post_round_target_count",
+                    "hard_mask_count",
+                    "final_hard_drop_count",
+                    "selected_drop_count_hard",
+                    "voxel_edit_drop_count",
+                    "voxel_edit_add_count",
+                    "voxel_edit_move_count",
+                ):
+                    self.last_structure_debug[key] = _actuator_scalar(key, 0.0)
+        else:
+            self.last_structure_debug = {
+                "network_voxel_node_input_requested": bool(node_voxel_debug.get("network_voxel_node_input_requested", False)),
+                "network_voxel_node_input_used": bool(node_voxel_debug.get("network_voxel_node_input_used", False)),
+                "network_voxel_node_fallback": bool(node_voxel_debug.get("network_voxel_node_fallback", False)),
+                "network_voxel_node_fallback_reason": str(node_voxel_debug.get("network_voxel_node_fallback_reason", "")),
+                "network_voxel_node_count": int(node_voxel_debug.get("network_voxel_node_count", 0) or 0),
+                "network_voxel_node_source": str(node_voxel_debug.get("network_voxel_node_source", "none")),
+                "network_voxel_node_feature_shape": str(node_voxel_debug.get("network_voxel_node_feature_shape", "")),
+                "phase4_cost_attribution_input_mode": str(
+                    getattr(self.cost_attributor, "debug_tensors", {}).get("input_mode", "unknown")
+                ),
+                "phase4_aggregation_key_source": str(
+                    structure.get("phase4_aggregation_key_source", "unknown")
+                    if isinstance(structure, dict)
+                    else "unknown"
+                ),
+                "phase4_aggregation_unit_count": int(
+                    structure.get("phase4_aggregation_unit_count", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "phase4_aggregation_min_unit_size": int(
+                    structure.get("phase4_aggregation_min_unit_size", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "phase4_aggregation_max_unit_size": int(
+                    structure.get("phase4_aggregation_max_unit_size", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "phase4_structural_key_source": str(
+                    structure.get("phase4_structural_key_source", "unknown")
+                    if isinstance(structure, dict)
+                    else "unknown"
+                ),
+
+                # Section1:
+                # full cloud canonical voxel coordsに基づくleaf pattern診断のdebug。
+                "leaf_pattern_available": bool(
+                    structure.get("leaf_pattern_available", False)
+                    if isinstance(structure, dict)
+                    else False
+                ),
+                "leaf_pattern_source": str(
+                    structure.get("leaf_pattern_source", "none")
+                    if isinstance(structure, dict)
+                    else "none"
+                ),
+                "leaf_pattern_reason": str(
+                    structure.get("leaf_pattern_reason", "")
+                    if isinstance(structure, dict)
+                    else "missing"
+                ),
+                "leaf_unique_parent_count": int(
+                    structure.get("leaf_unique_parent_count", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "leaf_unique_pattern_count": int(
+                    structure.get("leaf_unique_pattern_count", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "leaf_mean_child_count": float(
+                    structure.get("leaf_mean_child_count", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_single_child_parent_ratio": float(
+                    structure.get("leaf_single_child_parent_ratio", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_max_pattern_frequency": float(
+                    structure.get("leaf_max_pattern_frequency", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_candidate_available": bool(
+                    structure.get("leaf_candidate_available", False)
+                    if isinstance(structure, dict)
+                    else False
+                ),
+                "leaf_delete_gain_mean": float(
+                    structure.get("leaf_delete_gain_mean", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_add_gain_mean": float(
+                    structure.get("leaf_add_gain_mean", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_move_gain_mean": float(
+                    structure.get("leaf_move_gain_mean", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_high_gain_candidate_ratio": float(
+                    structure.get("leaf_high_gain_candidate_ratio", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_feature_integration_used": bool(
+                    structure.get("leaf_feature_integration_used", False)
+                    if isinstance(structure, dict)
+                    else False
+                ),
+                "leaf_feature_best_gain_mean": float(
+                    structure.get("leaf_feature_best_gain_mean", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_feature_best_gain_max": float(
+                    structure.get("leaf_feature_best_gain_max", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+            }
+
+        if isinstance(self.last_structure_debug, dict):
+            self.last_structure_debug.update({
+                "point_transformer_features_used": bool(
+                    point_transformer_feature_debug.get("used", False)
+                ),
+                "point_transformer_features_flow_to_actuator": bool(
+                    point_transformer_feature_debug.get("flows_to_actuator", False)
+                ),
+                "point_transformer_feature_dim": int(
+                    point_transformer_feature_debug.get("feature_dim", 0)
+                ),
+                "point_transformer_feature_source": str(
+                    point_transformer_feature_debug.get("reason", "disabled")
+                ),
+                "point_transformer_feature_cache_hits": int(
+                    point_transformer_feature_debug.get("cache_hits_this_forward", 0)
+                ),
+                "point_transformer_feature_cache_entries": int(
+                    point_transformer_feature_debug.get("cache_entries", 0)
+                ),
+                "point_transformer_feature_cache_bytes": int(
+                    point_transformer_feature_debug.get("cache_bytes", 0)
+                ),
+                "fixed_structure_cache_hit": bool(
+                    structure.get("fixed_structure_cache_hit", False)
+                    if isinstance(structure, dict) else False
+                ),
+                "fixed_structure_cache_entries": int(
+                    structure.get("fixed_structure_cache_entries", 0)
+                    if isinstance(structure, dict) else 0
+                ),
+                "fixed_structure_cache_bytes": int(
+                    structure.get("fixed_structure_cache_bytes", 0)
+                    if isinstance(structure, dict) else 0
+                ),
+                "fixed_structure_cache_source": str(
+                    structure.get("fixed_structure_cache_source", "miss")
+                    if isinstance(structure, dict) else "miss"
+                ),
+            })
+
+        if timing_enabled:
+            actuator_runtime = getattr(self.actuator, "last_runtime_timing", {}) or {}
+            self.last_runtime_timing = {
+                "encode": round(runtime_encode_end - runtime_t0, 6),
+                "structure": round(runtime_structure_end - runtime_structure_start, 6),
+                "actuator": round(runtime_actuator_end - runtime_structure_end, 6),
+                "total_forward": round(runtime_actuator_end - runtime_t0, 6),
+                "feature_extraction": round(runtime_encode_end - runtime_t0, 6),
+                "structure_diagnosis": round(runtime_diagnosis_total, 6),
+                "codec_cost_attribution": round(runtime_attribution_total, 6),
+                "point_edit_decision": round(runtime_decision_total, 6),
+                "delete_module": round(float(actuator_runtime.get("delete", 0.0)), 6),
+                "add_module": round(float(actuator_runtime.get("add", 0.0)), 6),
+                "adjust_move_module": round(float(actuator_runtime.get("adjust_move", 0.0)), 6),
+                "postprocess": round(float(actuator_runtime.get("postprocess", 0.0)), 6),
+                "actuator_setup": round(float(actuator_runtime.get("setup", 0.0)), 6),
+                "fixed_structure_cache_hit": float(
+                    bool(structure.get("fixed_structure_cache_hit", False))
+                    if isinstance(structure, dict) else False
+                ),
+                "fixed_structure_disk_cache_hit": float(
+                    str(structure.get("fixed_structure_cache_source", ""))
+                    == "disk"
+                    if isinstance(structure, dict) else False
+                ),
+            }
+        else:
+            self.last_runtime_timing = {}
+
+        if return_attr_output and pts_attr is not None and pts_attr.shape[-1] == pts_out.shape[-1]:
+            if pts_attr.shape[1] > 3:
+                attr_channels = pts_attr[:, 3:, :]
+            elif pts_attr.shape[1] > 0:
+                attr_channels = pts_attr
+            else:
+                attr_channels = None
+            pts_out_full = torch.cat([pts_out, attr_channels], dim=1) if attr_channels is not None else pts_out
+        else:
+            pts_out_full = pts_out
+
+        output = (
+            pts_out_full,
+            loss_attr,
+            loss_policy,
+            loss_repair,
+            final_w,
+            single_chain_score,
+            lowprob_score,
+            node_score,
+            out_label,
+        )
+        if return_patch_meta:
+            return (*output, self._patch_meta(pts_xyz, repair_gate, out_label))
+        return output

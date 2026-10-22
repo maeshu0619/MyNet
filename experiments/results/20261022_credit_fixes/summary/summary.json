@@ -1,0 +1,3401 @@
+{
+  "00_baseline": {
+    "steps": 6,
+    "completed": false,
+    "strict_pairs": 0,
+    "groups": {
+      "WhereAll": 3,
+      "Fine": 1,
+      "Amount": 1,
+      "Gate": 1
+    },
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.618495152398053e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.00015417644805104782,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0012404738831236206,
+        "update_rate_max": 0.00035861759059257673
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 9.818720931631134e-05,
+        "update_nonzero": 5,
+        "update_l2_max": 0.0004193034229232636,
+        "update_rate_max": 0.00011879953548350034
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 0,
+        "update_l2_max": 0.0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.119201161574385,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0030847540425026033,
+        "update_rate_max": 0.0006611896782959705
+      },
+      "AddWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 8.537652271404988e-05,
+        "update_nonzero": 6,
+        "update_l2_max": 0.003387567588870341,
+        "update_rate_max": 0.00029612091879532756
+      },
+      "PruneWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 8.649856769794132e-09,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0009388381293974608,
+        "update_rate_max": 0.00012330738159889792
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.00020214874836004375,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005421102709407303,
+        "update_rate_max": 0.0005382137865695003
+      },
+      "AddAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 4.873200668552676e-05,
+        "update_rate_max": 1.0837046249655156
+      },
+      "PruneAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 5.3157608220846707e-05,
+        "update_rate_max": 0.9186049424329341
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 4.882371206821135e-05,
+        "update_rate_max": 1.103304227102055
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00017860772227736629,
+        "update_rate_max": 3.64801192336936e-05
+      },
+      "Gate": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 0.0002361891215457282,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0031744810800440498,
+        "update_rate_max": 0.00047854795892582645
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 1.1104925648382635e-16,
+        "update_nonzero": 0,
+        "update_l2_max": 0.0,
+        "update_rate_max": 0
+      }
+    }
+  },
+  "00_baseline24": {
+    "steps": 0,
+    "completed": false,
+    "strict_pairs": 0,
+    "groups": {},
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 0,
+    "max_adam_clone_error": null,
+    "max_decomposition_relative_error": null,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 0,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": {
+      "train.py": true,
+      "models/network.py": true,
+      "models/modules/structure_actuator.py": true,
+      "models/utils/training/train_runtime.py": true,
+      "models/utils/config/args.py": true
+    },
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "Gate": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      }
+    }
+  },
+  "00_baseline24_serial": {
+    "steps": 24,
+    "completed": true,
+    "strict_pairs": 0,
+    "groups": {
+      "WhereAll": 10,
+      "Fine": 5,
+      "Amount": 5,
+      "Gate": 4
+    },
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.749378018365443e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 24,
+        "changed": [
+          "models/network.py",
+          "models/utils/training/sparsepcgc_actual_credit.py"
+        ]
+      }
+    ],
+    "frozen_source_verified": {
+      "train.py": true,
+      "models/network.py": true,
+      "models/modules/structure_actuator.py": true,
+      "models/utils/training/train_runtime.py": true,
+      "models/utils/config/args.py": true
+    },
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 7,
+        "actual_l2_max": 0.0007653979906414416,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0012933430626288526,
+        "update_rate_max": 0.00037386690041909973
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 0.0005764780254415666,
+        "update_nonzero": 23,
+        "update_l2_max": 0.0011648163273537857,
+        "update_rate_max": 0.0003298107343157155
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 0,
+        "update_l2_max": 0.0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 2.139067140786127,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004522281279046637,
+        "update_rate_max": 0.0009673323461454926
+      },
+      "AddWhere": {
+        "actual_nonzero": 7,
+        "actual_l2_max": 0.00013926202626880004,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0033875677803150814,
+        "update_rate_max": 0.0002961209355302816
+      },
+      "PruneWhere": {
+        "actual_nonzero": 7,
+        "actual_l2_max": 1.9724994089859417e-08,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0009388380410255797,
+        "update_rate_max": 0.000123307369990035
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 7,
+        "actual_l2_max": 0.0014723437321138904,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005421101602297663,
+        "update_rate_max": 0.000538213676648218
+      },
+      "AddAmount": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.015605337866370098,
+        "update_nonzero": 24,
+        "update_l2_max": 4.873200668552676e-05,
+        "update_rate_max": 1.0837046249655156
+      },
+      "PruneAmount": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.11505756902579212,
+        "update_nonzero": 24,
+        "update_l2_max": 5.3157608220846707e-05,
+        "update_rate_max": 0.9186049424329341
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.009629977320393245,
+        "update_nonzero": 24,
+        "update_l2_max": 4.882371206821135e-05,
+        "update_rate_max": 1.103304227102055
+      },
+      "AmountSelector": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 2.0408218546199883,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00017860772195653186,
+        "update_rate_max": 3.6480119168164075e-05
+      },
+      "Gate": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 0.23093861791748085,
+        "update_nonzero": 24,
+        "update_l2_max": 0.003259416594133478,
+        "update_rate_max": 0.0004912761350669052
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 1.4652070098662817e-13,
+        "update_nonzero": 16,
+        "update_l2_max": 1.1188899391994978e-09,
+        "update_rate_max": 3.0447359647298205e-10
+      }
+    },
+    "validation": {
+      "value": -2.238504333937767,
+      "geometry_value": 0.02568104024976492,
+      "fixed_objective": 1.6136517035269708,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 218,
+            "Prune": 589,
+            "Adjust": 43
+          },
+          "ratios": {
+            "Add": 0.0006318840579710145,
+            "Prune": 0.0017072463768115942,
+            "Adjust": 0.0001246376811594203
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 217,
+            "Prune": 594,
+            "Adjust": 43
+          },
+          "ratios": {
+            "Add": 0.0006296918572427622,
+            "Prune": 0.001723672641484796,
+            "Adjust": 0.00012477764913105426
+          }
+        }
+      ]
+    }
+  },
+  "00_baseline_validation": {
+    "steps": 0,
+    "completed": true,
+    "strict_pairs": 0,
+    "groups": {},
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 0,
+    "max_adam_clone_error": null,
+    "max_decomposition_relative_error": null,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 0,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "Gate": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      }
+    },
+    "validation": {
+      "value": -2.2850924918389555,
+      "geometry_value": 0.02648061141371727,
+      "fixed_objective": 1.686999220218635,
+      "count": 1,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply"
+      ],
+      "sample_signature": "71d462d7fe1a222596e4b78cbbfee1850aef4efef1c4c36c81ec7e1540207c03",
+      "diagnostic_policy": "network"
+    }
+  },
+  "01_matched": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 3,
+    "groups": {
+      "WhereAll": 2,
+      "Fine": 2,
+      "Amount": 2
+    },
+    "candidate_direct_nonzero": 1,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.9393493878971344e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05668239239173463,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0011124812719223386,
+        "update_rate_max": 0.00032162416366698297
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 0.2837741459945946,
+        "update_nonzero": 4,
+        "update_l2_max": 0.000604523261560326,
+        "update_rate_max": 0.0001712771199472905
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.052141384266496844,
+        "update_nonzero": 1,
+        "update_l2_max": 0.001495070384214261,
+        "update_rate_max": 0.00043543891240002377
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.1356285106186483,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0033249394320443728,
+        "update_rate_max": 0.0007125868135260054
+      },
+      "AddWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.07497901968248098,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005028368538602339,
+        "update_rate_max": 0.0004395499344494563
+      },
+      "PruneWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.00020266663136635958,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0023441550325136442,
+        "update_rate_max": 0.0003078822663120422
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.045035020966001545,
+        "update_nonzero": 6,
+        "update_l2_max": 0.006091116022878527,
+        "update_rate_max": 0.0006047343895216642
+      },
+      "AddAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 27.211940531962377,
+        "update_nonzero": 6,
+        "update_l2_max": 4.933866432795593e-05,
+        "update_rate_max": 2.446528890536105
+      },
+      "PruneAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 106.04626930355425,
+        "update_nonzero": 6,
+        "update_l2_max": 5.3157608220846707e-05,
+        "update_rate_max": 0.9230616307293863
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 87.72535059947768,
+        "update_nonzero": 6,
+        "update_l2_max": 4.8657662953637434e-05,
+        "update_rate_max": 2.1381524855485115
+      },
+      "AmountSelector": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 117.33833441538454,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0001981713733420157,
+        "update_rate_max": 4.047581456226156e-05
+      },
+      "Gate": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 13.500298510725411,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0029664491134774582,
+        "update_rate_max": 0.0004471874718157925
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 3.9824176612656967e-13,
+        "update_nonzero": 3,
+        "update_l2_max": 8.9998625312386e-11,
+        "update_rate_max": 2.4490527769025248e-11
+      }
+    },
+    "validation": {
+      "value": -2.2850924918389555,
+      "geometry_value": 0.026483511552214622,
+      "fixed_objective": 1.687434240993238,
+      "count": 1,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply"
+      ],
+      "sample_signature": "71d462d7fe1a222596e4b78cbbfee1850aef4efef1c4c36c81ec7e1540207c03",
+      "diagnostic_policy": "network"
+    }
+  },
+  "04_where": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 3,
+    "groups": {
+      "WhereAll": 2,
+      "Fine": 2,
+      "Amount": 2
+    },
+    "candidate_direct_nonzero": 1,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.92483006312619e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05685277926702888,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0011127472248753454,
+        "update_rate_max": 0.00032170105205894464
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 0.28262325105962566,
+        "update_nonzero": 4,
+        "update_l2_max": 0.0006045233000597254,
+        "update_rate_max": 0.00017127713085516894
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05264476649912737,
+        "update_nonzero": 1,
+        "update_l2_max": 0.0014949356673244867,
+        "update_rate_max": 0.00043539967613624345
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.1356285106186395,
+        "update_nonzero": 6,
+        "update_l2_max": 0.003324947702513261,
+        "update_rate_max": 0.0007125885862503795
+      },
+      "AddWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.07497944965553532,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0050283804631552735,
+        "update_rate_max": 0.0004395509768407477
+      },
+      "PruneWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05949898734014366,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004270774801270407,
+        "update_rate_max": 0.0005609252048055478
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.04503501381271158,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0060910433545960695,
+        "update_rate_max": 0.0006047271748713703
+      },
+      "AddAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 27.221629826412787,
+        "update_nonzero": 6,
+        "update_l2_max": 4.933808818269691e-05,
+        "update_rate_max": 2.4465288993539276
+      },
+      "PruneAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 106.03232786642812,
+        "update_nonzero": 6,
+        "update_l2_max": 5.3157608220846707e-05,
+        "update_rate_max": 0.9230616307293863
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 87.73796599736158,
+        "update_nonzero": 6,
+        "update_l2_max": 4.8657662953637434e-05,
+        "update_rate_max": 2.138152571480033
+      },
+      "AmountSelector": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 117.32713666918853,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00019817137485131866,
+        "update_rate_max": 4.047581487044968e-05
+      },
+      "Gate": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 13.5025458281829,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0029664491134774582,
+        "update_rate_max": 0.0004471874718157925
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 3.9821014195311416e-13,
+        "update_nonzero": 4,
+        "update_l2_max": 1.0913936421275139e-10,
+        "update_rate_max": 2.9699127299651087e-11
+      }
+    },
+    "validation": {
+      "value": -2.2850924918389555,
+      "geometry_value": 0.026483511552214622,
+      "fixed_objective": 1.687434240993238,
+      "count": 1,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply"
+      ],
+      "sample_signature": "71d462d7fe1a222596e4b78cbbfee1850aef4efef1c4c36c81ec7e1540207c03",
+      "diagnostic_policy": "network"
+    }
+  },
+  "05_amount": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 3,
+    "groups": {
+      "WhereAll": 2,
+      "Fine": 2,
+      "Amount": 2
+    },
+    "candidate_direct_nonzero": 1,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.593649185556015e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.056853504998299165,
+        "update_nonzero": 6,
+        "update_l2_max": 0.001112643859555972,
+        "update_rate_max": 0.000321671168603614
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 0.28262575628120523,
+        "update_nonzero": 4,
+        "update_l2_max": 0.0006045232911033026,
+        "update_rate_max": 0.00017127712831758207
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05264566276828204,
+        "update_nonzero": 1,
+        "update_l2_max": 0.0014949342697405943,
+        "update_rate_max": 0.0004353992690902498
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.1352571669797857,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0033255023834497335,
+        "update_rate_max": 0.0007127074602954292
+      },
+      "AddWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.07497950092549209,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005028379773234971,
+        "update_rate_max": 0.00043955091653203693
+      },
+      "PruneWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.0595080614591823,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004270766592359956,
+        "update_rate_max": 0.0005609241266443812
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.04503501377338158,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00609104326575173,
+        "update_rate_max": 0.0006047271660600109
+      },
+      "AddAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 27.214352824504996,
+        "update_nonzero": 6,
+        "update_l2_max": 5.088567508818599e-05,
+        "update_rate_max": 2.6327745881767535
+      },
+      "PruneAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 105.96799127775097,
+        "update_nonzero": 6,
+        "update_l2_max": 5.3157608220846707e-05,
+        "update_rate_max": 0.9233182499140546
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 87.81042682814112,
+        "update_nonzero": 6,
+        "update_l2_max": 4.8665806647131715e-05,
+        "update_rate_max": 2.5148222154869275
+      },
+      "AmountSelector": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 109.37074680288619,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0002586160316718423,
+        "update_rate_max": 5.282145226329477e-05
+      },
+      "Gate": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 13.524147810672169,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0029664491134774582,
+        "update_rate_max": 0.0004471874718157925
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 4.489360708112104e-13,
+        "update_nonzero": 4,
+        "update_l2_max": 1.0913936421275139e-10,
+        "update_rate_max": 2.9699127299651087e-11
+      }
+    },
+    "validation": {
+      "value": -2.2850924918389555,
+      "geometry_value": 0.026483511552214622,
+      "fixed_objective": 1.687434240993238,
+      "count": 1,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply"
+      ],
+      "sample_signature": "71d462d7fe1a222596e4b78cbbfee1850aef4efef1c4c36c81ec7e1540207c03",
+      "diagnostic_policy": "network",
+      "operation_distribution": []
+    }
+  },
+  "06_adapter": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 3,
+    "groups": {
+      "WhereAll": 2,
+      "Fine": 2,
+      "Amount": 2
+    },
+    "candidate_direct_nonzero": 1,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.7516359561299203e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.056857391723253936,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0011133387960599083,
+        "update_rate_max": 0.00032187207838756294
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 0.28262459021035036,
+        "update_nonzero": 4,
+        "update_l2_max": 0.0006045232964766535,
+        "update_rate_max": 0.00017127712983999174
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05264428470273014,
+        "update_nonzero": 1,
+        "update_l2_max": 0.0014949351910511007,
+        "update_rate_max": 0.0004353995374217271
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.1352571669797857,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0033255023834497335,
+        "update_rate_max": 0.0007127074602954292
+      },
+      "AddWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.07498098526938045,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005028383311115618,
+        "update_rate_max": 0.0004395512257708505
+      },
+      "PruneWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05949283397462166,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004270797447333936,
+        "update_rate_max": 0.0005609281786996511
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.04503671919605333,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0060902026057006765,
+        "update_rate_max": 0.0006046437043007885
+      },
+      "AddAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 27.214345776383958,
+        "update_nonzero": 6,
+        "update_l2_max": 5.0888779510811834e-05,
+        "update_rate_max": 2.6326217269594285
+      },
+      "PruneAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 105.967991278898,
+        "update_nonzero": 6,
+        "update_l2_max": 5.3157609432386717e-05,
+        "update_rate_max": 0.9234535048476517
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 87.81042682909555,
+        "update_nonzero": 6,
+        "update_l2_max": 4.866582067647685e-05,
+        "update_rate_max": 2.5158817672253537
+      },
+      "AmountSelector": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 109.3707451208578,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00025861605971682944,
+        "update_rate_max": 5.282145798952208e-05
+      },
+      "Gate": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 13.52414710222084,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0029664493312356495,
+        "update_rate_max": 0.00044718750464249266
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 1.5725693604930122e-08,
+        "update_nonzero": 6,
+        "update_l2_max": 2.3246310693487472e-05,
+        "update_rate_max": 6.325812455490943e-06
+      }
+    },
+    "validation": {
+      "value": -2.2850924918389555,
+      "geometry_value": 0.026483511552214622,
+      "fixed_objective": 1.687434240993238,
+      "count": 1,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply"
+      ],
+      "sample_signature": "71d462d7fe1a222596e4b78cbbfee1850aef4efef1c4c36c81ec7e1540207c03",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 214,
+            "Prune": 597,
+            "Adjust": 43
+          },
+          "ratios": {
+            "Add": 0.0006202898550724638,
+            "Prune": 0.0017304347826086956,
+            "Adjust": 0.0001246376811594203
+          }
+        }
+      ]
+    }
+  },
+  "07_geometry": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 3,
+    "groups": {
+      "WhereAll": 2,
+      "Fine": 2,
+      "Amount": 2
+    },
+    "candidate_direct_nonzero": 1,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.5441985067570434e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": [
+          "models/network.py"
+        ]
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05685438892890662,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0011129705229235185,
+        "update_rate_max": 0.0003217656086945606
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 0.2826179966512261,
+        "update_nonzero": 4,
+        "update_l2_max": 0.000604523302746683,
+        "update_rate_max": 0.00017127713161645375
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.052645716302068914,
+        "update_nonzero": 1,
+        "update_l2_max": 0.0014949370684213445,
+        "update_rate_max": 0.00043540008420538747
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.147321494591285,
+        "update_nonzero": 6,
+        "update_l2_max": 0.003324950285109427,
+        "update_rate_max": 0.000712589140052932
+      },
+      "AddWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.07498132237390978,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005028392035346934,
+        "update_rate_max": 0.0004395519884091476
+      },
+      "PruneWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.059502883941715067,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004270783891341731,
+        "update_rate_max": 0.0005609263984906574
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.04503500216520995,
+        "update_nonzero": 6,
+        "update_l2_max": 0.006090133750342023,
+        "update_rate_max": 0.0006046368682115875
+      },
+      "AddAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 27.3098685472653,
+        "update_nonzero": 6,
+        "update_l2_max": 4.9025075012683896e-05,
+        "update_rate_max": 2.3971236258618096
+      },
+      "PruneAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 106.02376789107997,
+        "update_nonzero": 6,
+        "update_l2_max": 5.3157609432386717e-05,
+        "update_rate_max": 0.9234535048476517
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 82.58567047658825,
+        "update_nonzero": 6,
+        "update_l2_max": 4.866582067647685e-05,
+        "update_rate_max": 2.3199460567527845
+      },
+      "AmountSelector": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 111.63428160143498,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00022313580181081036,
+        "update_rate_max": 4.557478308315612e-05
+      },
+      "Gate": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 12.954857844181484,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0029660236244072966,
+        "update_rate_max": 0.0004471233300172004
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 1.5227861098829857e-08,
+        "update_nonzero": 6,
+        "update_l2_max": 2.109224735648023e-05,
+        "update_rate_max": 5.7396458183638295e-06
+      }
+    },
+    "validation": {
+      "value": -2.273002055374199,
+      "geometry_value": 0.026591649278998375,
+      "fixed_objective": 1.7157453364755573,
+      "count": 1,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply"
+      ],
+      "sample_signature": "71d462d7fe1a222596e4b78cbbfee1850aef4efef1c4c36c81ec7e1540207c03",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 213,
+            "Prune": 597,
+            "Adjust": 43
+          },
+          "ratios": {
+            "Add": 0.000617391304347826,
+            "Prune": 0.0017304347826086956,
+            "Adjust": 0.0001246376811594203
+          }
+        }
+      ]
+    }
+  },
+  "07_geometry_dedup": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 3,
+    "groups": {
+      "WhereAll": 2,
+      "Fine": 2,
+      "Amount": 2
+    },
+    "candidate_direct_nonzero": 1,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.1809816048403983e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05685250193572103,
+        "update_nonzero": 6,
+        "update_l2_max": 0.001113254409136205,
+        "update_rate_max": 0.00032184768168584264
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 0.2826161471082994,
+        "update_nonzero": 4,
+        "update_l2_max": 0.0006045232982684179,
+        "update_rate_max": 0.0001712771303476451
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05264500510615503,
+        "update_nonzero": 1,
+        "update_l2_max": 0.0014949333285050948,
+        "update_rate_max": 0.00043539899495562275
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.147321494591285,
+        "update_nonzero": 6,
+        "update_l2_max": 0.003324950285109427,
+        "update_rate_max": 0.000712589140052932
+      },
+      "AddWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.07497966672971106,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0050283975737507175,
+        "update_rate_max": 0.0004395524725251941
+      },
+      "PruneWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.05949072669541597,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004270803842932753,
+        "update_rate_max": 0.0005609290186982264
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.04503501580651767,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00609020706171773,
+        "update_rate_max": 0.0006046441467008759
+      },
+      "AddAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 27.309878248064656,
+        "update_nonzero": 6,
+        "update_l2_max": 4.90276929218792e-05,
+        "update_rate_max": 2.3971236258618096
+      },
+      "PruneAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 106.02376789107997,
+        "update_nonzero": 6,
+        "update_l2_max": 5.3157609432386717e-05,
+        "update_rate_max": 0.9234535048476517
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 82.58567047658825,
+        "update_nonzero": 6,
+        "update_l2_max": 4.866582067647685e-05,
+        "update_rate_max": 2.3199460567527845
+      },
+      "AmountSelector": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 111.6342782387624,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0002231358013581536,
+        "update_rate_max": 4.557478299070241e-05
+      },
+      "Gate": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 12.954858220845603,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0029660236244072966,
+        "update_rate_max": 0.0004471233300172004
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 1.5227906744192926e-08,
+        "update_nonzero": 6,
+        "update_l2_max": 3.0729338654703005e-05,
+        "update_rate_max": 8.36210136571086e-06
+      }
+    },
+    "validation": {
+      "value": -2.273002055374199,
+      "geometry_value": 0.026591649278998375,
+      "fixed_objective": 1.7157453364755573,
+      "count": 1,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply"
+      ],
+      "sample_signature": "71d462d7fe1a222596e4b78cbbfee1850aef4efef1c4c36c81ec7e1540207c03",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 213,
+            "Prune": 597,
+            "Adjust": 43
+          },
+          "ratios": {
+            "Add": 0.000617391304347826,
+            "Prune": 0.0017304347826086956,
+            "Adjust": 0.0001246376811594203
+          }
+        }
+      ]
+    }
+  },
+  "08_final24": {
+    "steps": 24,
+    "completed": true,
+    "strict_pairs": 12,
+    "groups": {
+      "WhereAll": 10,
+      "Fine": 6,
+      "Amount": 4,
+      "Gate": 4
+    },
+    "candidate_direct_nonzero": 5,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.597929491235852e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 24,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.24035397213641288,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0011130297640847856,
+        "update_rate_max": 0.0003217827356246295
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 21,
+        "actual_l2_max": 0.42256615884729604,
+        "update_nonzero": 21,
+        "update_l2_max": 0.000926858986913184,
+        "update_rate_max": 0.0002625445177141123
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 0.07738779291116653,
+        "update_nonzero": 5,
+        "update_l2_max": 0.0014949337746749175,
+        "update_rate_max": 0.00043539912490248305
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 2.1748211227448997,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004428323355763869,
+        "update_rate_max": 0.0009473459497429166
+      },
+      "AddWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.10272048275582735,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005028383026803192,
+        "update_rate_max": 0.0004395512009395295
+      },
+      "PruneWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.14715707710831202,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004270741050878346,
+        "update_rate_max": 0.0005609207720412622
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.8723901358312239,
+        "update_nonzero": 24,
+        "update_l2_max": 0.006091043149611493,
+        "update_rate_max": 0.0006047271545294111
+      },
+      "AddAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 27.309878248064656,
+        "update_nonzero": 24,
+        "update_l2_max": 4.90276929218792e-05,
+        "update_rate_max": 2.3971236258618096
+      },
+      "PruneAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 106.02376789107997,
+        "update_nonzero": 24,
+        "update_l2_max": 5.3157609432386717e-05,
+        "update_rate_max": 0.9234535048476517
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 82.58567047658825,
+        "update_nonzero": 24,
+        "update_l2_max": 4.866582067647685e-05,
+        "update_rate_max": 2.3199460567527845
+      },
+      "AmountSelector": {
+        "actual_nonzero": 3,
+        "actual_l2_max": 113.58878610760165,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00022313580209347916,
+        "update_rate_max": 4.557478314089033e-05
+      },
+      "Gate": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 12.954858220845603,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0029660236244072966,
+        "update_rate_max": 0.0004471233300172004
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 1.9471762568785637e-07,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0002722561524860303,
+        "update_rate_max": 7.408713284197941e-05
+      }
+    },
+    "validation": {
+      "value": -2.22032450519436,
+      "geometry_value": 0.02567068301141262,
+      "fixed_objective": 1.6302779465175332,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 212,
+            "Prune": 595,
+            "Adjust": 42
+          },
+          "ratios": {
+            "Add": 0.0006144927536231884,
+            "Prune": 0.0017246376811594203,
+            "Adjust": 0.00012173913043478261
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 212,
+            "Prune": 594,
+            "Adjust": 42
+          },
+          "ratios": {
+            "Add": 0.0006151828282740349,
+            "Prune": 0.001723672641484796,
+            "Adjust": 0.00012187584333730881
+          }
+        }
+      ]
+    }
+  },
+  "09_mature_control": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 0,
+    "groups": {
+      "Fine": 6
+    },
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 6,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 1.4481687585482193e-09,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": {
+      "train.py": true,
+      "models/network.py": true,
+      "models/modules/structure_actuator.py": true,
+      "models/utils/training/train_runtime.py": true,
+      "models/utils/config/args.py": true
+    },
+    "input_checkpoint_verified": {
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth": true,
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth.actor_critic_runtime.pth": true
+    },
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0014951667075505334,
+        "update_rate_max": 0.000179831650001594
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.138915113819712,
+        "update_nonzero": 6,
+        "update_l2_max": 0.001603059769803214,
+        "update_rate_max": 0.0004042088258990486
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 0,
+        "update_l2_max": 0.0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 20.89299478800959,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004120613495169993,
+        "update_rate_max": 0.0005726951559608899
+      },
+      "AddWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.006584927271818253,
+        "update_rate_max": 0.0004454208224609099
+      },
+      "PruneWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0020842435162492855,
+        "update_rate_max": 0.0002489944364803108
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00507391689458088,
+        "update_rate_max": 0.00025533684287453454
+      },
+      "AddAmount": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 5.950702794355926e-11,
+        "update_nonzero": 6,
+        "update_l2_max": 8.535712389193177e-09,
+        "update_rate_max": 8.630956635166464e-08
+      },
+      "PruneAmount": {
+        "actual_nonzero": 3,
+        "actual_l2_max": 2.556183159696211e-10,
+        "update_nonzero": 2,
+        "update_l2_max": 3.2795252020766976e-08,
+        "update_rate_max": 2.9912542593803576e-07
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 4.686366993310711e-10,
+        "update_nonzero": 6,
+        "update_l2_max": 1.8570488066396887e-07,
+        "update_rate_max": 2.3150420413166453e-06
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0003587199422454347,
+        "update_rate_max": 7.18765262744309e-05
+      },
+      "Gate": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 207.07146645712774,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004047123200433824,
+        "update_rate_max": 0.0005671635973629167
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 1.2197259165463517e-09,
+        "update_nonzero": 6,
+        "update_l2_max": 2.376565815671496e-06,
+        "update_rate_max": 5.598368998688588e-07
+      }
+    },
+    "validation": {
+      "value": -2.135117187339524,
+      "geometry_value": 0.025398432277143,
+      "fixed_objective": 1.6746476542319262,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 123,
+            "Prune": 530,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003565217391304348,
+            "Prune": 0.001536231884057971,
+            "Adjust": 7.246376811594203e-05
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 124,
+            "Prune": 529,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003598239184244355,
+            "Prune": 0.001535055264891342,
+            "Adjust": 7.25451448436362e-05
+          }
+        }
+      ]
+    }
+  },
+  "10_mature_fixed": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 3,
+    "groups": {
+      "Fine": 6
+    },
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 6,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 6.303132729224361e-10,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": {
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth": true,
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth.actor_critic_runtime.pth": true
+    },
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0014951672619814339,
+        "update_rate_max": 0.00017983171668594644
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 4.598154386755029,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0016030597702570931,
+        "update_rate_max": 0.0004042088260134935
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 0,
+        "update_l2_max": 0.0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 21.742890461297247,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004120613495876291,
+        "update_rate_max": 0.0005726951560590534
+      },
+      "AddWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00658496096240971,
+        "update_rate_max": 0.00044542310137612594
+      },
+      "PruneWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005085426537534571,
+        "update_rate_max": 0.0006075311762294048
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005073920387767671,
+        "update_rate_max": 0.00025533701866363505
+      },
+      "AddAmount": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.5852944777137054e-09,
+        "update_nonzero": 5,
+        "update_l2_max": 6.461365409233456e-07,
+        "update_rate_max": 6.53346273638643e-06
+      },
+      "PruneAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 0,
+        "update_l2_max": 0.0,
+        "update_rate_max": 0
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 4.3546970902906744e-08,
+        "update_nonzero": 6,
+        "update_l2_max": 6.963458128569711e-06,
+        "update_rate_max": 8.68081678763868e-05
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.00021387852470365309,
+        "update_rate_max": 4.285472757430531e-05
+      },
+      "Gate": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.0005507547125083636,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004090896160922559,
+        "update_rate_max": 0.0005733205909102439
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 5.1610601460689884e-12,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0008189908753412789,
+        "update_rate_max": 0.00019291838548409125
+      }
+    },
+    "validation": {
+      "value": -2.135117187339524,
+      "geometry_value": 0.025398432277143,
+      "fixed_objective": 1.6746476542319262,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 123,
+            "Prune": 530,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003565217391304348,
+            "Prune": 0.001536231884057971,
+            "Adjust": 7.246376811594203e-05
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 124,
+            "Prune": 529,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003598239184244355,
+            "Prune": 0.001535055264891342,
+            "Adjust": 7.25451448436362e-05
+          }
+        }
+      ]
+    }
+  },
+  "11_mature24_control": {
+    "steps": 24,
+    "completed": true,
+    "strict_pairs": 0,
+    "groups": {
+      "Fine": 22,
+      "WhereAll": 2
+    },
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 22,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 1.7966853093529263e-09,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 24,
+        "changed": [
+          "models/modules/structure_actuator.py",
+          "models/utils/training/sparsepcgc_actual_credit.py"
+        ]
+      }
+    ],
+    "frozen_source_verified": {
+      "train.py": true,
+      "models/network.py": true,
+      "models/modules/structure_actuator.py": true,
+      "models/utils/training/train_runtime.py": true,
+      "models/utils/config/args.py": true
+    },
+    "input_checkpoint_verified": {
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth": true,
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth.actor_critic_runtime.pth": true
+    },
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.0005843828693228899,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0014951667075505334,
+        "update_rate_max": 0.000179831650001594
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 2.138915113819712,
+        "update_nonzero": 24,
+        "update_l2_max": 0.001603059769803214,
+        "update_rate_max": 0.0004042088258990486
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 0,
+        "update_l2_max": 0.0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 20.89299478800959,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004120613495169993,
+        "update_rate_max": 0.0005726951559608899
+      },
+      "AddWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.00012663408141593092,
+        "update_nonzero": 24,
+        "update_l2_max": 0.006584927106952742,
+        "update_rate_max": 0.0004454208113089976
+      },
+      "PruneWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 2.9190407737132038e-06,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0020842438064806778,
+        "update_rate_max": 0.0002489944711528438
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.0002325726950215513,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005073916898997419,
+        "update_rate_max": 0.0002553368430967899
+      },
+      "AddAmount": {
+        "actual_nonzero": 22,
+        "actual_l2_max": 3.735821841706325e-09,
+        "update_nonzero": 21,
+        "update_l2_max": 3.896647419625927e-07,
+        "update_rate_max": 3.940120598128286e-06
+      },
+      "PruneAmount": {
+        "actual_nonzero": 16,
+        "actual_l2_max": 1.6788616952187898e-09,
+        "update_nonzero": 20,
+        "update_l2_max": 5.270035084805781e-07,
+        "update_rate_max": 4.806808895229183e-06
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 22,
+        "actual_l2_max": 2.996612576298915e-08,
+        "update_nonzero": 24,
+        "update_l2_max": 2.6662973610239916e-06,
+        "update_rate_max": 3.323978490377864e-05
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0003587199422454347,
+        "update_rate_max": 7.18765262744309e-05
+      },
+      "Gate": {
+        "actual_nonzero": 22,
+        "actual_l2_max": 207.07146645712774,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004047123200433824,
+        "update_rate_max": 0.0005671635973629167
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 1.4158057291982095e-08,
+        "update_nonzero": 24,
+        "update_l2_max": 1.3014108329617269e-05,
+        "update_rate_max": 3.0656733930952786e-06
+      }
+    },
+    "validation": {
+      "value": -2.135117187339524,
+      "geometry_value": 0.025411326438188553,
+      "fixed_objective": 1.6765817783887589,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 123,
+            "Prune": 530,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003565217391304348,
+            "Prune": 0.001536231884057971,
+            "Adjust": 7.246376811594203e-05
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 123,
+            "Prune": 529,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.00035692211263069006,
+            "Prune": 0.001535055264891342,
+            "Adjust": 7.25451448436362e-05
+          }
+        }
+      ]
+    }
+  },
+  "11_mature_runtime_fixed_ablation": {
+    "steps": 0,
+    "completed": true,
+    "strict_pairs": 0,
+    "groups": {},
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 0,
+    "max_adam_clone_error": null,
+    "max_decomposition_relative_error": null,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 0,
+        "changed": [
+          "models/modules/structure_actuator.py",
+          "models/network.py",
+          "models/utils/training/sparsepcgc_actual_credit.py"
+        ]
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "Gate": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      }
+    },
+    "validation": {
+      "value": -2.135117187339524,
+      "geometry_value": 0.025411326438188553,
+      "fixed_objective": 1.6765817783887589,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 123,
+            "Prune": 530,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003565217391304348,
+            "Prune": 0.001536231884057971,
+            "Adjust": 7.246376811594203e-05
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 123,
+            "Prune": 529,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.00035692211263069006,
+            "Prune": 0.001535055264891342,
+            "Adjust": 7.25451448436362e-05
+          }
+        }
+      ]
+    }
+  },
+  "12_mature24_fixed": {
+    "steps": 24,
+    "completed": true,
+    "strict_pairs": 12,
+    "groups": {
+      "Fine": 22,
+      "WhereAll": 2
+    },
+    "candidate_direct_nonzero": 1,
+    "global_clip_count": 24,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.0149132078574308e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 24,
+        "changed": [
+          "models/utils/training/sparsepcgc_actual_credit.py"
+        ]
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": {
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth": true,
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth.actor_critic_runtime.pth": true
+    },
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 1.1288185989647448,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0014951672619814339,
+        "update_rate_max": 0.00017983171668594644
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 4.5981554416182435,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0016030597702570931,
+        "update_rate_max": 0.0004042088260134935
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.44028123816485104,
+        "update_nonzero": 1,
+        "update_l2_max": 0.0014965788999541459,
+        "update_rate_max": 0.00041288039146708517
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 21.742890461297247,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004120613495876291,
+        "update_rate_max": 0.0005726951560590534
+      },
+      "AddWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.2216286152219628,
+        "update_nonzero": 24,
+        "update_l2_max": 0.006584933145538584,
+        "update_rate_max": 0.00044542121977392995
+      },
+      "PruneWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 11.189541610156217,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005085332365285613,
+        "update_rate_max": 0.0006075199259288144
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.009420337173169018,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005073918425054172,
+        "update_rate_max": 0.00025533691989318235
+      },
+      "AddAmount": {
+        "actual_nonzero": 22,
+        "actual_l2_max": 6.062138590575234e-07,
+        "update_nonzero": 23,
+        "update_l2_max": 1.3060309538769644e-05,
+        "update_rate_max": 0.000132018457787256
+      },
+      "PruneAmount": {
+        "actual_nonzero": 12,
+        "actual_l2_max": 3.541176034333105e-07,
+        "update_nonzero": 18,
+        "update_l2_max": 1.0203664483390619e-05,
+        "update_rate_max": 9.30930432395603e-05
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 22,
+        "actual_l2_max": 2.860808251266944e-06,
+        "update_nonzero": 24,
+        "update_l2_max": 1.2094070631891737e-05,
+        "update_rate_max": 0.00015082846287209814
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00022140667777611437,
+        "update_rate_max": 4.436437416016665e-05
+      },
+      "Gate": {
+        "actual_nonzero": 20,
+        "actual_l2_max": 169.50273940260342,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004090896160922559,
+        "update_rate_max": 0.0005733205909102439
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 9.932562361847388e-05,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0019272537027175125,
+        "update_rate_max": 0.000453779667524951
+      }
+    },
+    "validation": {
+      "value": 0.0,
+      "geometry_value": 0.0,
+      "fixed_objective": 0.0,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 0,
+            "Prune": 0,
+            "Adjust": 0
+          },
+          "ratios": {
+            "Add": 0.0,
+            "Prune": 0.0,
+            "Adjust": 0.0
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 0,
+            "Prune": 0,
+            "Adjust": 0
+          },
+          "ratios": {
+            "Add": 0.0,
+            "Prune": 0.0,
+            "Adjust": 0.0
+          }
+        }
+      ]
+    }
+  },
+  "12_mature_feature_off_ablation": {
+    "steps": 0,
+    "completed": true,
+    "strict_pairs": 0,
+    "groups": {},
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 0,
+    "max_adam_clone_error": null,
+    "max_decomposition_relative_error": null,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 0,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "Gate": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      }
+    },
+    "validation": {
+      "value": 0.0,
+      "geometry_value": 0.0,
+      "fixed_objective": 0.0,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 0,
+            "Prune": 0,
+            "Adjust": 0
+          },
+          "ratios": {
+            "Add": 0.0,
+            "Prune": 0.0,
+            "Adjust": 0.0
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 0,
+            "Prune": 0,
+            "Adjust": 0
+          },
+          "ratios": {
+            "Add": 0.0,
+            "Prune": 0.0,
+            "Adjust": 0.0
+          }
+        }
+      ]
+    }
+  },
+  "12_mature_runtime_control_ablation": {
+    "steps": 0,
+    "completed": true,
+    "strict_pairs": 0,
+    "groups": {},
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 0,
+    "max_adam_clone_error": null,
+    "max_decomposition_relative_error": null,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 0,
+        "changed": [
+          "models/modules/structure_actuator.py",
+          "models/network.py",
+          "models/utils/training/sparsepcgc_actual_credit.py"
+        ]
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AddAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "PruneAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "Gate": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0,
+        "update_nonzero": 0,
+        "update_l2_max": 0,
+        "update_rate_max": 0
+      }
+    },
+    "validation": {
+      "value": 0.0,
+      "geometry_value": 0.0,
+      "fixed_objective": 0.0,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 0,
+            "Prune": 0,
+            "Adjust": 0
+          },
+          "ratios": {
+            "Add": 0.0,
+            "Prune": 0.0,
+            "Adjust": 0.0
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 0,
+            "Prune": 0,
+            "Adjust": 0
+          },
+          "ratios": {
+            "Add": 0.0,
+            "Prune": 0.0,
+            "Adjust": 0.0
+          }
+        }
+      ]
+    }
+  },
+  "13_stable_amount_mature": {
+    "steps": 6,
+    "completed": true,
+    "strict_pairs": 3,
+    "groups": {
+      "Fine": 6
+    },
+    "candidate_direct_nonzero": 0,
+    "global_clip_count": 6,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 6.15609189276859e-10,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 6,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": {
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth": true,
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth.actor_critic_runtime.pth": true
+    },
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0014951672619814339,
+        "update_rate_max": 0.00017983171668594644
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 4.59815693147325,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0016030597702570931,
+        "update_rate_max": 0.0004042088260134935
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 0,
+        "update_l2_max": 0.0,
+        "update_rate_max": 0
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 21.742890461297247,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004120613495876291,
+        "update_rate_max": 0.0005726951560590534
+      },
+      "AddWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.006584934602396632,
+        "update_rate_max": 0.0004454213183194238
+      },
+      "PruneWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005085439714594293,
+        "update_rate_max": 0.0006075327504286452
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.005073945321313013,
+        "update_rate_max": 0.0002553382734048698
+      },
+      "AddAmount": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 2.5149782388838244e-09,
+        "update_nonzero": 5,
+        "update_l2_max": 6.292130005238947e-07,
+        "update_rate_max": 6.362338966773375e-06
+      },
+      "PruneAmount": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 1.9677159137102324e-08,
+        "update_nonzero": 6,
+        "update_l2_max": 3.967881549128192e-06,
+        "update_rate_max": 3.6191032381673426e-05
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 4.527092712669894e-08,
+        "update_nonzero": 6,
+        "update_l2_max": 7.132820999011737e-06,
+        "update_rate_max": 8.891948673806535e-05
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0002138785247673206,
+        "update_rate_max": 4.2854727587062336e-05
+      },
+      "Gate": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.0005507541299895507,
+        "update_nonzero": 6,
+        "update_l2_max": 0.004090895467776908,
+        "update_rate_max": 0.0005733204937690166
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 6,
+        "actual_l2_max": 5.161062066834004e-12,
+        "update_nonzero": 6,
+        "update_l2_max": 0.0008189912758989677,
+        "update_rate_max": 0.00019291847981670241
+      }
+    },
+    "validation": {
+      "value": -2.135117187339524,
+      "geometry_value": 0.025398432277143,
+      "fixed_objective": 1.6746476542319262,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 123,
+            "Prune": 530,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003565217391304348,
+            "Prune": 0.001536231884057971,
+            "Adjust": 7.246376811594203e-05
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 124,
+            "Prune": 529,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003598239184244355,
+            "Prune": 0.001535055264891342,
+            "Adjust": 7.25451448436362e-05
+          }
+        }
+      ]
+    }
+  },
+  "14_final_initial": {
+    "steps": 24,
+    "completed": true,
+    "strict_pairs": 12,
+    "groups": {
+      "WhereAll": 10,
+      "Fine": 6,
+      "Amount": 4,
+      "Gate": 4
+    },
+    "candidate_direct_nonzero": 5,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.5300189643246315e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 24,
+        "changed": [
+          "models/modules/structure_actuator.py",
+          "models/network.py",
+          "models/utils/training/sparsepcgc_actual_credit.py"
+        ]
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.24035855995367955,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0011123506631487612,
+        "update_rate_max": 0.0003215864039864196
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 21,
+        "actual_l2_max": 0.4225497428073503,
+        "update_nonzero": 21,
+        "update_l2_max": 0.0009268226639972731,
+        "update_rate_max": 0.00026253427481024984
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 0.07738522710506386,
+        "update_nonzero": 5,
+        "update_l2_max": 0.0014949333382392404,
+        "update_rate_max": 0.00043539899779069044
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 2.1748211227448997,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004428322974856837,
+        "update_rate_max": 0.000947345870221883
+      },
+      "AddWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.10254919275570877,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005028373875532954,
+        "update_rate_max": 0.00043955040097204477
+      },
+      "PruneWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.14687350107424685,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004270780105896726,
+        "update_rate_max": 0.0005609259012949703
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.8724944485648299,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00609111656257107,
+        "update_rate_max": 0.0006047344430993839
+      },
+      "AddAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 27.309866375209147,
+        "update_nonzero": 24,
+        "update_l2_max": 4.902769376887381e-05,
+        "update_rate_max": 2.3971236636509574
+      },
+      "PruneAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 106.02379382995963,
+        "update_nonzero": 24,
+        "update_l2_max": 5.3157609432386717e-05,
+        "update_rate_max": 0.9234534971757357
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 82.58569743903237,
+        "update_nonzero": 24,
+        "update_l2_max": 4.866581975992845e-05,
+        "update_rate_max": 2.3199460109389074
+      },
+      "AmountSelector": {
+        "actual_nonzero": 3,
+        "actual_l2_max": 113.58878125452816,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0002231358017073635,
+        "update_rate_max": 4.557478306202744e-05
+      },
+      "Gate": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 12.95486028542394,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00296602347402425,
+        "update_rate_max": 0.00044712330734719604
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 1.9473505804960937e-07,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00027251279325508183,
+        "update_rate_max": 7.415697053740383e-05
+      }
+    },
+    "validation": {
+      "value": -2.22032450519436,
+      "geometry_value": 0.02567068301141262,
+      "fixed_objective": 1.6302779465175332,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 212,
+            "Prune": 595,
+            "Adjust": 42
+          },
+          "ratios": {
+            "Add": 0.0006144927536231884,
+            "Prune": 0.0017246376811594203,
+            "Adjust": 0.00012173913043478261
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 212,
+            "Prune": 594,
+            "Adjust": 42
+          },
+          "ratios": {
+            "Add": 0.0006151828282740349,
+            "Prune": 0.001723672641484796,
+            "Adjust": 0.00012187584333730881
+          }
+        }
+      ]
+    }
+  },
+  "15_final_mature": {
+    "steps": 24,
+    "completed": true,
+    "strict_pairs": 12,
+    "groups": {
+      "Fine": 22,
+      "WhereAll": 2
+    },
+    "candidate_direct_nonzero": 1,
+    "global_clip_count": 24,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 3.262817579945308e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 24,
+        "changed": [
+          "models/modules/structure_actuator.py",
+          "models/network.py",
+          "models/utils/training/sparsepcgc_actual_credit.py"
+        ]
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": {
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth": true,
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth.actor_critic_runtime.pth": true
+    },
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 1.1288516936546475,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0014951672619814339,
+        "update_rate_max": 0.00017983171668594644
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 4.5981554416182435,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0016030597702570931,
+        "update_rate_max": 0.0004042088260134935
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 1,
+        "actual_l2_max": 0.44028154484220594,
+        "update_nonzero": 1,
+        "update_l2_max": 0.0014979871532626748,
+        "update_rate_max": 0.0004132689043462445
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 21.742890461297247,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004120613495876291,
+        "update_rate_max": 0.0005726951560590534
+      },
+      "AddWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.2216353312106436,
+        "update_nonzero": 24,
+        "update_l2_max": 0.006584933620898306,
+        "update_rate_max": 0.0004454212519284412
+      },
+      "PruneWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 11.189115301908169,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005085332105855003,
+        "update_rate_max": 0.0006075198949359012
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.009420341575407764,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005073918435373909,
+        "update_rate_max": 0.00025533692041250684
+      },
+      "AddAmount": {
+        "actual_nonzero": 22,
+        "actual_l2_max": 6.02208963832562e-07,
+        "update_nonzero": 23,
+        "update_l2_max": 1.3022112619554126e-05,
+        "update_rate_max": 0.00013163531533277894
+      },
+      "PruneAmount": {
+        "actual_nonzero": 22,
+        "actual_l2_max": 3.4884035423862613e-07,
+        "update_nonzero": 24,
+        "update_l2_max": 1.0054861001051259e-05,
+        "update_rate_max": 9.17229817075409e-05
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 22,
+        "actual_l2_max": 2.858753366178818e-06,
+        "update_nonzero": 24,
+        "update_l2_max": 1.2105254319018674e-05,
+        "update_rate_max": 0.00015096867875676555
+      },
+      "AmountSelector": {
+        "actual_nonzero": 0,
+        "actual_l2_max": 0.0,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0002214066826585807,
+        "update_rate_max": 4.436437513849748e-05
+      },
+      "Gate": {
+        "actual_nonzero": 20,
+        "actual_l2_max": 169.50272737291786,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004090895574164121,
+        "update_rate_max": 0.0005733205086787032
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 9.93257398391957e-05,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0019272531738117693,
+        "update_rate_max": 0.00045377954282439917
+      }
+    },
+    "validation": {
+      "value": 0.0,
+      "geometry_value": 0.0,
+      "fixed_objective": 0.0,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 0,
+            "Prune": 0,
+            "Adjust": 0
+          },
+          "ratios": {
+            "Add": 0.0,
+            "Prune": 0.0,
+            "Adjust": 0.0
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 0,
+            "Prune": 0,
+            "Adjust": 0
+          },
+          "ratios": {
+            "Add": 0.0,
+            "Prune": 0.0,
+            "Adjust": 0.0
+          }
+        }
+      ]
+    }
+  },
+  "16_verified_initial": {
+    "steps": 24,
+    "completed": true,
+    "strict_pairs": 12,
+    "groups": {
+      "WhereAll": 10,
+      "Fine": 6,
+      "Amount": 4,
+      "Gate": 4
+    },
+    "candidate_direct_nonzero": 5,
+    "global_clip_count": 0,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 2.901841130736418e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 24,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": null,
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.2403514656149987,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0011124127900311866,
+        "update_rate_max": 0.00032160436519359283
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 21,
+        "actual_l2_max": 0.42257396470806263,
+        "update_nonzero": 21,
+        "update_l2_max": 0.000926802162050368,
+        "update_rate_max": 0.0002625284319185722
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 5,
+        "actual_l2_max": 0.07739202499524576,
+        "update_nonzero": 5,
+        "update_l2_max": 0.0014949361335559028,
+        "update_rate_max": 0.0004353998119260383
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 2.1748211227449525,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004428322593177926,
+        "update_rate_max": 0.0009473457884889874
+      },
+      "AddWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.10656705492401176,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005028370128144103,
+        "update_rate_max": 0.00043955007339770526
+      },
+      "PruneWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.14681054105775346,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004270789597878105,
+        "update_rate_max": 0.0005609271479768332
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 8,
+        "actual_l2_max": 0.8723455911646817,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00609111700319708,
+        "update_rate_max": 0.0006047344868532741
+      },
+      "AddAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 27.30982914758568,
+        "update_nonzero": 24,
+        "update_l2_max": 4.9027694974330515e-05,
+        "update_rate_max": 2.3971236636509574
+      },
+      "PruneAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 106.02379382995963,
+        "update_nonzero": 24,
+        "update_l2_max": 5.3157609432386717e-05,
+        "update_rate_max": 0.9234534971757357
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 82.58566291573655,
+        "update_nonzero": 24,
+        "update_l2_max": 4.866581975992845e-05,
+        "update_rate_max": 2.3199460109389074
+      },
+      "AmountSelector": {
+        "actual_nonzero": 3,
+        "actual_l2_max": 113.58877033823966,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0002231358016291152,
+        "update_rate_max": 4.5574783046045466e-05
+      },
+      "Gate": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 12.95485434170838,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00296602347402425,
+        "update_rate_max": 0.00044712330734719604
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 1.9471278713053214e-07,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0002722419606031255,
+        "update_rate_max": 7.40832712107928e-05
+      }
+    },
+    "validation": {
+      "value": -2.22032450519436,
+      "geometry_value": 0.02567068301141262,
+      "fixed_objective": 1.6302779465175332,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 212,
+            "Prune": 595,
+            "Adjust": 42
+          },
+          "ratios": {
+            "Add": 0.0006144927536231884,
+            "Prune": 0.0017246376811594203,
+            "Adjust": 0.00012173913043478261
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 212,
+            "Prune": 594,
+            "Adjust": 42
+          },
+          "ratios": {
+            "Add": 0.0006151828282740349,
+            "Prune": 0.001723672641484796,
+            "Adjust": 0.00012187584333730881
+          }
+        }
+      ]
+    }
+  },
+  "17_verified_mature": {
+    "steps": 24,
+    "completed": true,
+    "strict_pairs": 12,
+    "groups": {
+      "Fine": 16,
+      "WhereAll": 4,
+      "Amount": 2,
+      "Gate": 2
+    },
+    "candidate_direct_nonzero": 2,
+    "global_clip_count": 21,
+    "max_adam_clone_error": 0.0,
+    "max_decomposition_relative_error": 4.972210582083293e-07,
+    "source_integrity": [
+      {
+        "kind": "integrity",
+        "step": 24,
+        "changed": []
+      }
+    ],
+    "frozen_source_verified": null,
+    "input_checkpoint_verified": {
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth": true,
+      "/data/maejima/log/20261020/MyNetwork_train/pretrained/043722_SparsePCGC/381.pth.actor_critic_runtime.pth": true
+    },
+    "modules": {
+      "head:den6_candidate_actor": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 1.2176759451660477,
+        "update_nonzero": 24,
+        "update_l2_max": 0.0014951672619814339,
+        "update_rate_max": 0.00017983171668594644
+      },
+      "head:den6_candidate_critic": {
+        "actual_nonzero": 23,
+        "actual_l2_max": 3.6049798239683337,
+        "update_nonzero": 23,
+        "update_l2_max": 0.0016030597702570931,
+        "update_rate_max": 0.0004042088260134935
+      },
+      "head:den6_candidate_proposal": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.4168226311768703,
+        "update_nonzero": 2,
+        "update_l2_max": 0.0014978658773448549,
+        "update_rate_max": 0.000413235446405319
+      },
+      "head:den6_plan_critic": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 20.096515910650428,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004120613495876291,
+        "update_rate_max": 0.0005726951560590534
+      },
+      "AddWhere": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 1.0075585735834338,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00658493364451978,
+        "update_rate_max": 0.00044542125352625635
+      },
+      "PruneWhere": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 19.045546520040926,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005085332446339821,
+        "update_rate_max": 0.0006075199356119663
+      },
+      "AdjustWhere": {
+        "actual_nonzero": 4,
+        "actual_l2_max": 0.04983263379104606,
+        "update_nonzero": 24,
+        "update_l2_max": 0.005073918442028496,
+        "update_rate_max": 0.0002553369207473884
+      },
+      "AddAmount": {
+        "actual_nonzero": 16,
+        "actual_l2_max": 3.45126461934214e-07,
+        "update_nonzero": 23,
+        "update_l2_max": 8.464165860130755e-06,
+        "update_rate_max": 8.559460575771156e-05
+      },
+      "PruneAmount": {
+        "actual_nonzero": 16,
+        "actual_l2_max": 2.396704597844128e-07,
+        "update_nonzero": 24,
+        "update_l2_max": 7.913934607189743e-06,
+        "update_rate_max": 7.218540192726401e-05
+      },
+      "AdjustAmount": {
+        "actual_nonzero": 16,
+        "actual_l2_max": 1.9061572981363464e-06,
+        "update_nonzero": 24,
+        "update_l2_max": 1.1792949447476451e-05,
+        "update_rate_max": 0.00014706854073934038
+      },
+      "AmountSelector": {
+        "actual_nonzero": 2,
+        "actual_l2_max": 0.18239468015038413,
+        "update_nonzero": 24,
+        "update_l2_max": 0.00022306532020964845,
+        "update_rate_max": 4.4695748035931535e-05
+      },
+      "Gate": {
+        "actual_nonzero": 20,
+        "actual_l2_max": 174.73822705485873,
+        "update_nonzero": 24,
+        "update_l2_max": 0.004090896160922559,
+        "update_rate_max": 0.0005733205909102439
+      },
+      "module:point_transformer_feature_adapter": {
+        "actual_nonzero": 24,
+        "actual_l2_max": 8.328845270158734e-05,
+        "update_nonzero": 24,
+        "update_l2_max": 0.002083817036581515,
+        "update_rate_max": 0.0004907533553192262
+      }
+    },
+    "validation": {
+      "value": -2.135117187339524,
+      "geometry_value": 0.025398432277143,
+      "fixed_objective": 1.6746476542319262,
+      "count": 2,
+      "sample_names": [
+        "BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+        "BlueBackpack_UVG_vox9_25_0_250_0101.ply"
+      ],
+      "sample_signature": "a92d8679cfa4d386382ec548312e4344aac449272eac0f0087b358ffdcba7744",
+      "diagnostic_policy": "network",
+      "operation_distribution": [
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0100.ply",
+          "counts": {
+            "Add": 123,
+            "Prune": 530,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003565217391304348,
+            "Prune": 0.001536231884057971,
+            "Adjust": 7.246376811594203e-05
+          }
+        },
+        {
+          "input_file": "/data/maejima/data/ground/UVG/BlueBackpack/BlueBackpack_UVG_vox9_25_0_250_0101.ply",
+          "counts": {
+            "Add": 124,
+            "Prune": 529,
+            "Adjust": 25
+          },
+          "ratios": {
+            "Add": 0.0003598239184244355,
+            "Prune": 0.001535055264891342,
+            "Adjust": 7.25451448436362e-05
+          }
+        }
+      ]
+    }
+  }
+}

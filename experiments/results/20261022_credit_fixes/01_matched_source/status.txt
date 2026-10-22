@@ -1,0 +1,16 @@
+ M models/utils/config/args.py
+ M train.py
+?? experiments/audit_sparsepcgc_gradient_routing.py
+?? experiments/audit_sparsepcgc_training_gradients.py
+?? experiments/results/20261020_sparsepcgc_gradient_routing/
+?? experiments/results/20261020_sparsepcgc_gradient_routing_cpu/
+?? experiments/results/20261020_sparsepcgc_gradient_routing_v2/
+?? experiments/results/20261020_sparsepcgc_gradients_audit_v2/
+?? experiments/results/20261020_sparsepcgc_gradients_audit_v3/
+?? experiments/results/20261022_credit_fixes/
+?? experiments/summarize_sparsepcgc_gradient_routing.py
+?? experiments/summarize_training_gradient_audit.py
+?? experiments/verify_sparsepcgc_credit_fixes.py
+?? models/utils/training/sparsepcgc_actual_credit.py
+?? reports/20261020_sparsepcgc_gradient_credit_audit.md
+?? tests/test_sparsepcgc_credit_fixes.py

@@ -1,0 +1,12 @@
+{
+  "value": -2.2850924918389555,
+  "geometry_value": 0.026483511552214622,
+  "fixed_objective": 1.687434240993238,
+  "count": 1,
+  "sample_names": [
+    "BlueBackpack_UVG_vox9_25_0_250_0100.ply"
+  ],
+  "sample_signature": "71d462d7fe1a222596e4b78cbbfee1850aef4efef1c4c36c81ec7e1540207c03",
+  "diagnostic_policy": "network",
+  "operation_distribution": []
+}

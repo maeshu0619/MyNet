@@ -1,0 +1,16051 @@
+import hashlib
+import itertools
+import json
+import math
+import time
+from collections import OrderedDict
+
+import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+from models.utils.pointcloud.sparsepcgc_voxel import (
+    canonical_sparsepcgc_voxel_coords,
+    restore_points_from_voxel_coords,
+    sparsepcgc_effective_qs_value,
+    sparsepcgc_effective_qs_tensor,
+)
+from .executable_voxel_plan import (
+    apply_selected_executable_plan,
+    executable_plan_hashes,
+    scatter_amax_1d_compat_,
+)
+
+
+def normalized_fine_log_prob(mean, sample, sigma):
+    """Use the same Normal density and bounded score gradient for both plans."""
+    sigma = max(float(sigma), 1e-6)
+    raw = torch.distributions.Normal(mean, mean.new_tensor(sigma)).log_prob(
+        sample.detach()
+    )
+    return raw.detach() + sigma * (raw - raw.detach())
+
+
+def amount_forward_authority(confidence, evidence, floor):
+    """Keep the bounded learned Amount reachable even without Where alignment."""
+    authority = float(confidence) + (1.0 - float(confidence)) * float(evidence)
+    return max(authority, min(max(float(floor), 0.0), 1.0))
+
+
+def matched_plan_comparison_hash(group, selected_ids, selected_counts,
+                                 requested_counts, operation_order, pool_hash):
+    """Hash only factors held fixed in the executed counterfactual."""
+    explored_operation = group[:-5] if group.endswith("Where") else ""
+    fixed_groups = {
+        name: ids for name, ids in selected_ids.items()
+        if name != explored_operation
+    }
+    counts = dict(selected_counts)
+    if group == "WhereAll":
+        fixed_groups = {}
+        counts = dict(requested_counts)
+    elif group in {"Amount", "Gate", "Fine"}:
+        fixed_groups = {}
+        counts = {}
+    payload = json.dumps({
+        "selected_fixed_groups": fixed_groups,
+        "executed_counts": counts,
+        "operation_order": tuple(operation_order),
+        "pool_identity_hash": str(pool_hash),
+        "factorized_group": str(group),
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def smooth_exploration_phase(
+    progress, fraction, tail_fraction=0.25, plateau_fraction=0.0
+):
+    """Exploration phase with an optional plateau and a C2-smooth landing.
+
+    ``plateau_fraction`` is measured inside the configured exploration window,
+    not over the full training run.  Holding the multiplier at one early in
+    that window gives every factorized decision group time to collect Actual
+    comparisons before the stochastic perturbation starts contracting.
+    """
+    fraction = min(max(float(fraction), 0.0), 1.0)
+    if fraction <= 0.0:
+        return 1.0
+    normalized = min(max(float(progress) / fraction, 0.0), 1.0)
+    plateau = min(max(float(plateau_fraction), 0.0), 0.90)
+    if normalized <= plateau:
+        return 0.0
+    normalized = (normalized - plateau) / max(1.0 - plateau, 1e-8)
+    tail = min(max(float(tail_fraction), 0.0), 1.0)
+    if tail <= 0.0 or normalized <= 1.0 - tail:
+        return normalized
+    # multiplier=1-phaseを、線形部の値・1階・2階微分を保ったまま
+    # 終端で値・1階・2階微分が0になるquinticへ接続する。
+    x = (normalized - (1.0 - tail)) / tail
+    tail_multiplier_unit = (
+        1.0 - x - 4.0 * x ** 3 + 7.0 * x ** 4 - 3.0 * x ** 5
+    )
+    multiplier = tail * max(tail_multiplier_unit, 0.0)
+    return min(max(1.0 - multiplier, 0.0), 1.0)
+
+
+def policy_exploration_multiplier(
+    *, training, schedule_mode, constant_multiplier, annealed_phase
+):
+    """Resolve behavior-policy noise without coupling metrics to wall-clock time."""
+    if not bool(training):
+        return 0.0
+    mode = str(schedule_mode).strip().lower()
+    if mode == "constant":
+        return min(max(float(constant_multiplier), 0.0), 1.0)
+    if mode == "annealed":
+        return min(max(1.0 - float(annealed_phase), 0.0), 1.0)
+    raise ValueError("repair_policy_exploration_mode must be constant or annealed")
+
+
+def adaptive_exploration_candidate_changes(max_changes, learning_factor):
+    """Return an evidence-controlled factorized Where perturbation budget.
+
+    ``learning_factor`` is one for an uncalibrated Actual policy and contracts
+    toward the configured exploration floor as matched Actual ordering becomes
+    reliable.  Consequently this budget is not a function of Episode or wall
+    clock time: an unlearned group keeps exploring, while a calibrated group
+    changes only a small number of candidates around its incumbent plan.
+    """
+    maximum = max(int(max_changes), 0)
+    if maximum <= 0:
+        return 0
+    factor = min(max(float(learning_factor), 0.0), 1.0)
+    return min(max(int(math.ceil(float(maximum) * factor)), 1), maximum)
+
+
+def exploration_candidate_change_budget(
+    max_changes, requested_count, requested_fraction, learning_factor
+):
+    """Scale a Where perturbation with the size of the executed operation.
+
+    A fixed budget changed only a small fraction of a normal den6 plan. Use a
+    fraction of the incumbent instead, then apply the exploration multiplier
+    so the perturbation reaches exactly zero at the end of the configured
+    window. A positive optional cap can still bound unusually large plans.
+    """
+    requested = max(int(requested_count), 0)
+    fraction = min(max(float(requested_fraction), 0.0), 1.0)
+    factor = min(max(float(learning_factor), 0.0), 1.0)
+    if requested <= 0 or fraction <= 0.0 or factor <= 0.0:
+        return 0
+    # A non-positive configured cap means "uncapped", not "disable
+    # exploration". The plan size and requested fraction remain strict bounds.
+    configured_maximum = int(max_changes)
+    maximum = (
+        requested
+        if configured_maximum <= 0
+        else min(configured_maximum, requested)
+    )
+    initial_budget = min(
+        maximum,
+        max(int(math.ceil(float(requested) * fraction)), 1),
+    )
+    return adaptive_exploration_candidate_changes(
+        initial_budget, factor
+    )
+
+
+def exploration_proposal_count(valid_count, ordinary_count, broaden_safe_pool):
+    """Expose every safe candidate only for the currently explored group."""
+    valid = max(int(valid_count), 0)
+    ordinary = min(max(int(ordinary_count), 0), valid)
+    return valid if bool(broaden_safe_pool) else ordinary
+
+
+def evidence_driven_post_window_multiplier(floor, evidence_target, group_states):
+    """Keep only a tiny post-window probe while an Actual group is unlearned."""
+    floor = min(max(float(floor), 0.0), 0.10)
+    target = max(int(evidence_target), 1)
+    maximum_need = 0.0
+    for state in group_states:
+        comparisons = max(int(state.get("comparisons", 0)), 0)
+        evidence_deficit = 1.0 - min(float(comparisons) / float(target), 1.0)
+        authority_deficit = 1.0 - min(max(float(
+            state.get("authority", 0.0)
+        ), 0.0), 1.0)
+        uncertainty = min(max(float(state.get("uncertainty", 1.0)), 0.0), 1.0)
+        maximum_need = max(
+            maximum_need,
+            evidence_deficit,
+            authority_deficit * uncertainty,
+        )
+    return float(floor * maximum_need), float(maximum_need)
+
+
+def candidate_listwise_local_credit(prediction, utility_target):
+    """Train one operation pool from relative, non-heuristic RD utility."""
+    prediction = prediction.float().reshape(-1)
+    utility_target = utility_target.detach().float().reshape(-1)
+    if int(prediction.numel()) != int(utility_target.numel()):
+        raise ValueError("candidate prediction/target size mismatch")
+    if int(prediction.numel()) <= 1:
+        return prediction.sum() * 0.0
+    target_centered = utility_target - utility_target.mean()
+    target_scale = target_centered.square().mean().sqrt().clamp_min(
+        torch.finfo(target_centered.dtype).eps
+    )
+    target_prob = torch.softmax(target_centered / target_scale, dim=0)
+    prediction_log_prob = torch.log_softmax(prediction, dim=0)
+    return torch.sum(
+        target_prob * (
+            torch.log(target_prob.clamp_min(torch.finfo(target_prob.dtype).tiny))
+            - prediction_log_prob
+        )
+    )
+
+
+def candidate_pairwise_local_credit(prediction, utility_target, max_pairs=256):
+    """Prefer clearly better local-RD candidates without targeting entropy.
+
+    Only the opposite tails of the measured utility ordering are paired.  The
+    target is detached and no heuristic rank is used.  This complements the
+    listwise distribution loss when a large candidate pool makes every
+    individual soft target probability very small.
+    """
+    prediction = prediction.float().reshape(-1)
+    utility_target = utility_target.detach().float().reshape(-1)
+    if int(prediction.numel()) != int(utility_target.numel()):
+        raise ValueError("candidate prediction/target size mismatch")
+    pair_count = min(max(int(max_pairs), 0), int(prediction.numel()) // 2)
+    if pair_count <= 0:
+        return prediction.sum() * 0.0
+    ordered = torch.argsort(utility_target)
+    lower = ordered[:pair_count]
+    upper = ordered[-pair_count:].flip(0)
+    target_gap = (utility_target[upper] - utility_target[lower]).clamp_min(0.0)
+    valid = torch.isfinite(target_gap) & (target_gap > 0.0)
+    if not bool(valid.any()):
+        return prediction.sum() * 0.0
+    target_gap = target_gap[valid]
+    predicted_gap = prediction[upper[valid]] - prediction[lower[valid]]
+    # Larger, unambiguous RD gaps receive more credit, but normalize by the
+    # observed pool scale so candidate count and codec scale do not change the
+    # effective loss weight.
+    weights = (target_gap / target_gap.mean().clamp_min(
+        torch.finfo(target_gap.dtype).eps
+    )).clamp(max=4.0)
+    return (weights * torch.nn.functional.softplus(-predicted_gap)).mean()
+
+
+class StructureRepairActuator(nn.Module):
+    """Apply small geometry-preserving movements that realize repair policies.
+
+    The actuator predicts both a small displacement and a point-wise keep/drop
+    gate.  This lets the downstream compression loss reach actual deletion
+    decisions instead of only moving every point.
+    """
+
+    def __init__(self, in_channels, hidden_dim=64, args=None):
+        super().__init__()
+        self.args = args
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        if is_geometry_octree(args) and getattr(args, 'geometry_octree_joint_policy', True):
+            from ..utils.pointcloud.geometry_joint_policy import GeometryJointContext
+            self.geometry_joint_context = GeometryJointContext()
+        self.last_runtime_timing = {}
+        neighbor_offsets = [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+            if not (dx == 0 and dy == 0 and dz == 0)
+        ]
+        self.register_buffer(
+            "neighbor_offsets",
+            torch.tensor(neighbor_offsets, dtype=torch.float32),
+            persistent=False,
+        )
+        self._den6_fallback_direction_indices = tuple(
+            neighbor_offsets.index(offset)
+            for offset in (
+                (1, 0, 0), (-1, 0, 0),
+                (0, 1, 0), (0, -1, 0),
+                (0, 0, 1), (0, 0, -1),
+            )
+        )
+
+        self.move_voxel_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, len(neighbor_offsets), 1),
+        )
+        self.drop_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, 1, 1),
+        )
+        self.add_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, 1, 1),
+        )
+        self.add_voxel_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, len(neighbor_offsets), 1),
+        )
+        self.operation_gate_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, 3, 1),
+        )
+        self.subtree_move_source_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, 1, 1),
+        )
+        # Exact-online Actor/Critic.  Heuristicは候補の安全性と入力特徴だけを
+        # 与え、最終順位には直接加えない。candidate featureは
+        # [point-head value, heuristic feature, rate proxy, geometry risk,
+        #  operation one-hot(3)] の7次元である。
+        actor_hidden = max(int(getattr(
+            self.args, "heuristic_guidance_online_actor_hidden_dim", 32
+        )), 8)
+        self.den6_candidate_actor = nn.Sequential(
+            nn.Linear(7, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 1),
+        )
+        self.den6_candidate_critic = nn.Sequential(
+            nn.Linear(7, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 2),
+        )
+        # Keep the dense codec-proxy warm start separate from the value head
+        # that is allowed to control Actual-RD uncertainty/proposal authority.
+        # Otherwise the proxy ordering silently re-enters the policy through
+        # Candidate-Critic uncertainty even when Actor proxy loss is disabled.
+        self.den6_candidate_proxy_critic = nn.Sequential(
+            nn.Linear(7, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 2),
+        )
+        # Proposal is distinct from both the value Critic and final Actor.  It
+        # controls which members of the den6 safety reservoir are presented to
+        # the Actor; adding a Critic residual to an Actor logit is not Proposal.
+        self.den6_candidate_proposal = nn.Sequential(
+            nn.Linear(7, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 1),
+        )
+        # selected candidate集合、operation share、Amount、No-opから
+        # composite Actual RDを予測する。出力は(mean, log-variance)。
+        self.den6_plan_critic = nn.Sequential(
+            nn.Linear(18, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 2),
+        )
+        # Actor is deliberately not bootstrapped with the heuristic/proxy
+        # ordering.  A small ordinary initialization breaks exact ties inside
+        # the already safety-filtered pool; local RD and Actual feedback must
+        # teach the ordering itself.
+        nn.init.normal_(self.den6_candidate_actor[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.den6_candidate_actor[-1].bias)
+        nn.init.zeros_(self.den6_candidate_critic[-1].weight)
+        nn.init.zeros_(self.den6_candidate_critic[-1].bias)
+        nn.init.constant_(self.den6_candidate_critic[-1].bias[1], 0.0)
+        nn.init.zeros_(self.den6_candidate_proxy_critic[-1].weight)
+        nn.init.zeros_(self.den6_candidate_proxy_critic[-1].bias)
+        nn.init.constant_(self.den6_candidate_proxy_critic[-1].bias[1], 0.0)
+        nn.init.normal_(self.den6_candidate_proposal[-1].weight, mean=0.0, std=0.005)
+        nn.init.zeros_(self.den6_candidate_proposal[-1].bias)
+        nn.init.zeros_(self.den6_plan_critic[-1].weight)
+        nn.init.zeros_(self.den6_plan_critic[-1].bias)
+        self._den6_factorized_group_counts = {}
+        self._den6_factorized_group_uncertainty = {}
+        # This is updated only from an executed plan compared with an earlier
+        # plan for the same frame.  Dense local proxy supervision must not end
+        # behavior exploration before Actual RD has supplied evidence.
+        self._den6_actual_action_evidence = 0.0
+        self._den6_actual_action_comparisons = 0
+        # Candidate Critic may assist proposal ordering only after executed
+        # Actual-RD preferences show above-chance ranking accuracy.  It starts
+        # with zero authority, so its dense proxy warm start cannot recreate
+        # the den6 ranking under another name.
+        self._den6_actual_candidate_critic_quality = 0.0
+        self._den6_actual_candidate_critic_comparisons = 0
+        self._den6_matched_actual_pair_accuracy = 0.0
+        self._den6_matched_actual_pair_count = 0
+        # Actual evidence is action conditional.  A failed Adjust comparison
+        # must not revoke an already calibrated Add Actor (and vice versa),
+        # nor may sparse Proposal evidence globally freeze Amount/Gate/Fine.
+        # Each row stores weighted Bernoulli observations from strict
+        # same-frame, one-factor comparisons only.
+        self._den6_actual_group_stats = {
+            group: {
+                "comparisons": 0,
+                "evidence": 0.0,
+                "actor_correct": 0.0,
+                "critic_correct": 0.0,
+                "proposal_correct": 0.0,
+                "proposal_comparisons": 0,
+            }
+            for group in (
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            )
+        }
+        self._den6_noop_actual_evidence = 0.0
+        # Bounded runtime state used to finish a counterfactual on the next
+        # visit of the same frame.  This is evidence-driven, not Episode-driven.
+        self._den6_matched_anchor_plan_memory = OrderedDict()
+        self._den6_pending_matched_groups = OrderedDict()
+        self._den6_proposal_coverage_visits = OrderedDict()
+        self._den6_completed_matched_pairs = OrderedDict()
+        self._den6_fixed_rd_safe_authority = 0.0
+        self._den6_fixed_rd_authority_rejected = False
+        self._den6_fixed_rd_reject_evidence = 0.0
+        # Per-operation gate for the cache-derived local RD candidate feature.
+        # It is a Network parameter (not a fixed heuristic weight): tanh(0)
+        # makes the fresh policy exactly unchanged, then local/Actual credit
+        # can strengthen, suppress, or reverse it independently by operation.
+        self.candidate_local_utility_gate_logits = nn.Parameter(torch.zeros(3))
+        # Pruneの実行量をActuator特徴から推定し、削除割合も学習対象にする。
+        self.drop_amount_head = nn.Conv1d(in_channels, 1, 1)
+        algorithmic_amount_bins = self._algorithmic_amount_bin_values_from_args(args)
+        self.algorithmic_amount_bin_count = max(int(len(algorithmic_amount_bins)), 1)
+        self.algorithmic_amount_selector_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, self.algorithmic_amount_bin_count + 1, 1),
+        )
+        self.algorithmic_amount_residual_head = nn.Conv1d(in_channels, 1, 1)
+        # Addの実行量をActuator特徴から推定し、固定比率に張り付かないようにする。
+        self.add_amount_head = nn.Conv1d(in_channels, 1, 1)
+        # Adjustの実行量をActuator特徴から推定し、source選択数も学習対象にする。
+        self.move_amount_head = nn.Conv1d(in_channels, 1, 1)
+        nn.init.zeros_(self.move_voxel_head[-1].weight)
+        nn.init.zeros_(self.move_voxel_head[-1].bias)
+        nn.init.zeros_(self.drop_head[-1].weight)
+        nn.init.zeros_(self.add_head[-1].weight)
+        nn.init.zeros_(self.add_voxel_head[-1].weight)
+        nn.init.zeros_(self.add_voxel_head[-1].bias)
+        nn.init.zeros_(self.operation_gate_head[-1].weight)
+        nn.init.zeros_(self.subtree_move_source_head[-1].weight)
+        if (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        ):
+            # zero最終層では全候補scoreが同値となり、stable sortが
+            # Heuristic pool順を未学習Networkの最終方策にしてしまう。
+            # 小さい入力依存初期値だけを与え、他moduleのRNGは変えない。
+            init_std = max(float(getattr(
+                self.args, "heuristic_guidance_network_score_init_std", 0.001
+            )), 0.0)
+            if init_std > 0.0:
+                with torch.random.fork_rng(devices=[], enabled=True):
+                    torch.manual_seed(int(getattr(self.args, "seed", 0)) + 7919)
+                    for head in (
+                        self.drop_head,
+                        self.add_voxel_head,
+                        self.move_voxel_head,
+                        self.subtree_move_source_head,
+                    ):
+                        nn.init.normal_(head[-1].weight, mean=0.0, std=init_std)
+        nn.init.zeros_(self.algorithmic_amount_selector_head[-1].weight)
+        nn.init.zeros_(self.algorithmic_amount_selector_head[-1].bias)
+        init_selector_ratio = min(
+            max(float(getattr(self.args, "sparsepcgc_algorithmic_amount_init_ratio", 0.03)), 0.0),
+            0.30,
+        )
+        init_selector_class = 1
+        if algorithmic_amount_bins:
+            init_selector_class = 1 + min(
+                range(len(algorithmic_amount_bins)),
+                key=lambda idx: abs(float(algorithmic_amount_bins[idx]) - init_selector_ratio),
+            )
+        nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[0], -1.0)
+        if 0 <= init_selector_class < int(self.algorithmic_amount_selector_head[-1].bias.numel()):
+            nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[init_selector_class], 1.0)
+        if (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+            and str(getattr(
+                self.args, "heuristic_guidance_online_selection_mode", "prior_residual"
+            )).strip().lower() == "actor_critic"
+            and algorithmic_amount_bins
+        ):
+            # Safe initialization only: after construction these are ordinary
+            # Actor parameters.  No Heuristic amount is added during forward.
+            actor_init_class = 1 + len(algorithmic_amount_bins) // 2
+            nn.init.zeros_(self.algorithmic_amount_selector_head[-1].bias)
+            nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[0], -0.5)
+            nn.init.constant_(
+                self.algorithmic_amount_selector_head[-1].bias[actor_init_class], 0.5
+            )
+        nn.init.zeros_(self.algorithmic_amount_residual_head.weight)
+        nn.init.zeros_(self.algorithmic_amount_residual_head.bias)
+        # onlineのAmountはden6 profileに対するresidualである。初期weightの乱数が
+        # profileの0.10/0.10/0.05%をStep 1から2倍以上へずらさないよう0初期化し、
+        # 以後はActual/Surrogate勾配で入力依存residualを学習する。
+        nn.init.zeros_(self.drop_amount_head.weight)
+        nn.init.zeros_(self.add_amount_head.weight)
+        nn.init.zeros_(self.move_amount_head.weight)
+        target_repair_ratio = float(
+            getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20))
+        )
+        init_drop_ratio = float(getattr(self.args, "repair_init_drop_ratio", 0.05))
+        init_drop = init_drop_ratio / max(target_repair_ratio, 1e-6)
+        init_drop = min(max(init_drop, 1e-4), 0.95)
+        init_drop_bias = math.log(init_drop / max(1.0 - init_drop, 1e-6))
+        nn.init.constant_(self.drop_head[-1].bias, init_drop_bias)
+        init_add_ratio = min(max(float(getattr(self.args, "repair_init_add_ratio", 0.03)), 1e-4), 0.95)
+        init_add_bias = math.log(init_add_ratio / max(1.0 - init_add_ratio, 1e-6))
+        nn.init.constant_(self.add_head[-1].bias, init_add_bias)
+        init_gate_values = (
+            float(getattr(self.args, "repair_operation_gate_init_drop", 0.50)),
+            float(getattr(self.args, "repair_operation_gate_init_add", 0.50)),
+            float(getattr(self.args, "repair_operation_gate_init_move", 0.50)),
+        )
+        init_gate_bias = [
+            math.log(min(max(v, 1e-4), 1.0 - 1e-4) / max(1.0 - min(max(v, 1e-4), 1.0 - 1e-4), 1e-6))
+            for v in init_gate_values
+        ]
+        nn.init.constant_(self.operation_gate_head[-1].bias[0], init_gate_bias[0])
+        nn.init.constant_(self.operation_gate_head[-1].bias[1], init_gate_bias[1])
+        nn.init.constant_(self.operation_gate_head[-1].bias[2], init_gate_bias[2])
+        if (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+            and str(getattr(
+                self.args, "heuristic_guidance_online_selection_mode", "prior_residual"
+            )).strip().lower() == "actor_critic"
+        ):
+            # head order is Prune/Add/Adjust.  This is a trainable safe
+            # initialization, not a forward-time Heuristic prior.
+            initial_share = self.operation_gate_head[-1].bias.new_tensor((0.4, 0.4, 0.2))
+            gate_scale = max(float(getattr(
+                self.args, "repair_operation_gate_logit_scale", 6.0
+            )), 1e-6)
+            self.operation_gate_head[-1].bias.data.copy_(
+                float(gate_scale) * initial_share.log()
+            )
+        init_subtree_move = min(
+            max(float(getattr(self.args, "repair_subtree_move_source_init_prob", 0.02)), 1e-4),
+            1.0 - 1e-4,
+        )
+        nn.init.constant_(
+            self.subtree_move_source_head[-1].bias,
+            math.log(init_subtree_move / max(1.0 - init_subtree_move, 1e-6)),
+        )
+        nn.init.constant_(self.drop_amount_head.bias, 0.0)
+        nn.init.constant_(self.add_amount_head.bias, 0.0)
+        nn.init.constant_(self.move_amount_head.bias, 0.0)
+        self.debug_tensors = {}
+
+    def _should_collect_runtime_debug(self):
+        """Return whether scalar diagnostics may synchronize the GPU this step."""
+        return bool(
+            getattr(self.args, "_collect_structure_debug", False)
+            or (
+                getattr(self.args, "verbose_step_logs", False)
+                and getattr(self.args, "_log_this_step", True)
+            )
+            or (
+                getattr(self.args, "sparsepcgc_hard_debug_on_log", False)
+                and getattr(self.args, "_log_this_step", True)
+            )
+            or getattr(self.args, "print_actuator_hard_soft_compare", False)
+        )
+
+    def _run_large_head(self, head, features):
+        """Run a point-wise head without a full-cloud hidden FP32 map.
+
+        These heads contain only 1x1 convolutions and point-wise activations, so
+        splitting the point dimension preserves their forward computation.
+        Checkpointing bounds saved activations during backward; chunking also
+        bounds the live forward activation which checkpointing alone cannot
+        reduce.  A preallocated output avoids a second full-sized ``cat`` copy.
+        """
+        checkpoint_enabled = bool(
+            self.training
+            and getattr(self.args, "full_cloud_activation_checkpoint", True)
+            and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
+        )
+        chunk_size = max(int(getattr(self.args, "full_cloud_head_chunk_size", 131072)), 0)
+
+        def _run(point_features):
+            if checkpoint_enabled:
+                # Non-reentrant checkpointing supports both the normal
+                # backward and the read-only per-loss ``autograd.grad`` audit.
+                # It also works when the frozen upstream features do not
+                # require gradients, so no artificial dummy input is needed.
+                return checkpoint(
+                    lambda value: head(value),
+                    point_features,
+                    use_reentrant=False,
+                )
+            return head(point_features)
+
+        point_count = int(features.shape[-1])
+        if chunk_size <= 0 or point_count <= chunk_size:
+            return _run(features)
+
+        output = None
+        for start in range(0, point_count, chunk_size):
+            end = min(start + chunk_size, point_count)
+            chunk_output = _run(features[..., start:end])
+            if output is None:
+                output = chunk_output.new_empty((*chunk_output.shape[:-1], point_count))
+            # Keep this assignment under autograd: CopySlices joins every chunk's
+            # graph without retaining a list of outputs or making a full cat copy.
+            output[..., start:end] = chunk_output
+        return output
+
+    def _child_slot_target_mask(self, voxel_coords, octree_context):
+        # 1. octree_cubtree.pyで作った厳密maskがあればそれを使う
+        if isinstance(octree_context, dict):
+            mask = octree_context.get("point_valid_empty_child_mask", None)
+            if mask is not None:
+                if not torch.is_tensor(mask):
+                    mask = torch.as_tensor(mask)
+                mask = mask.to(device=voxel_coords.device, dtype=torch.bool)
+                if mask.ndim == 2:
+                    mask = mask.unsqueeze(0)
+                if mask.ndim == 3 and mask.shape[1] == self.neighbor_offsets.shape[0] and mask.shape[2] == voxel_coords.shape[2]:
+                    mask = mask.permute(0, 2, 1).contiguous()
+                if mask.shape[0] == 1 and voxel_coords.shape[0] > 1:
+                    mask = mask.expand(voxel_coords.shape[0], -1, -1)
+                if mask.ndim == 3 and mask.shape[0] == voxel_coords.shape[0] and mask.shape[1] == voxel_coords.shape[2]:
+                    return mask
+
+        # 2. なければ簡易版として、voxel座標/2による同一parent制約を使う
+        B, _, N = voxel_coords.shape
+        offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
+        K = int(offsets.shape[0])
+
+        current = voxel_coords.transpose(1, 2).contiguous()
+        current_parent = torch.div(current, 2, rounding_mode="floor")
+        # Avoid materialising [B,N,26,3] target coordinates (~0.48 GB for an
+        # 8i frame).  Parent equality is separable by axis and integer-exact.
+        same_parent_mask = torch.ones(
+            (B, current.shape[1], K), device=voxel_coords.device, dtype=torch.bool
+        )
+        for axis in range(3):
+            target_axis = current[:, :, axis : axis + 1] + offsets[:, axis].view(1, 1, K)
+            same_parent_mask &= (
+                torch.div(target_axis, 2, rounding_mode="floor")
+                == current_parent[:, :, axis : axis + 1]
+            )
+
+        return same_parent_mask
+
+    def _fit_leaf_pattern_map(self, value, like_tensor):
+        """
+        Section4:
+        leaf_pattern_diag内の [B,N] / [B,1,N] Tensorを
+        Actuator内の [B,1,N] に揃える。
+        """
+        B, _, N = like_tensor.shape
+        device = like_tensor.device
+        dtype = like_tensor.dtype
+
+        if not torch.is_tensor(value):
+            return like_tensor.new_zeros((B, 1, N))
+
+        out = value.to(device=device, dtype=dtype)
+
+        if out.ndim == 1:
+            out = out.view(1, 1, -1)
+        elif out.ndim == 2:
+            out = out.unsqueeze(1)
+        elif out.ndim == 3:
+            if out.shape[1] != 1:
+                out = out[:, :1, :]
+        else:
+            return like_tensor.new_zeros((B, 1, N))
+
+        if out.shape[0] == 1 and B > 1:
+            out = out.expand(B, -1, -1).contiguous()
+
+        if out.shape[0] != B:
+            return like_tensor.new_zeros((B, 1, N))
+
+        current_n = int(out.shape[-1])
+        if current_n == N:
+            pass
+        elif current_n > N:
+            out = out[:, :, :N].contiguous()
+        elif current_n > 0:
+            pad = out[:, :, -1:].expand(B, 1, N - current_n)
+            out = torch.cat([out, pad], dim=2).contiguous()
+        else:
+            out = like_tensor.new_zeros((B, 1, N))
+
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _leaf_pattern_actuator_priors(self, structure, like_tensor):
+        """
+        Section4:
+        OctreeStructureAnalysisが作ったleaf pattern候補gainを
+        ActuatorのPrune/Add/Move source biasへ変換する。
+
+        ここではforward値を変えるためのpriorとして使うだけで、
+        leaf_pattern_diag自体へ勾配を戻す目的ではない。
+        """
+        B, _, N = like_tensor.shape
+        zero = like_tensor.new_zeros((B, 1, N))
+
+        out = {
+            "enabled": False,
+            "delete_prior": zero,
+            "add_prior": zero,
+            "move_prior": zero,
+            "best_prior": zero,
+            "delete_prior_mean": 0.0,
+            "add_prior_mean": 0.0,
+            "move_prior_mean": 0.0,
+            "best_prior_mean": 0.0,
+            "best_prior_max": 0.0,
+        }
+
+        if not bool(getattr(self.args, "leaf_pattern_actuator_prior", True)):
+            return out
+
+        if not isinstance(structure, dict):
+            return out
+
+        leaf_diag = structure.get("leaf_pattern_diag", None)
+        if not isinstance(leaf_diag, dict):
+            return out
+
+        if not bool(leaf_diag.get("available", False)):
+            return out
+
+        scale = max(float(getattr(self.args, "leaf_pattern_actuator_prior_scale", 2.0)), 1e-6)
+
+        if bool(leaf_diag.get("actual_oracle_enabled", False)):
+            delete_prior = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_drop_score", None),
+                like_tensor,
+            ).clamp_min(0.0).detach()
+            add_prior = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_add_score", None),
+                like_tensor,
+            ).clamp_min(0.0).detach()
+            move_prior = zero
+            best_prior = torch.maximum(delete_prior, add_prior)
+            debug_scalars = {}
+            if self._should_collect_runtime_debug():
+                debug_scalars = {
+                    "delete_prior_mean": float(delete_prior.detach().float().mean().cpu()),
+                    "add_prior_mean": float(add_prior.detach().float().mean().cpu()),
+                    "move_prior_mean": 0.0,
+                    "best_prior_mean": float(best_prior.detach().float().mean().cpu()),
+                    "best_prior_max": float(best_prior.detach().float().max().cpu()),
+                }
+            out.update(
+                {
+                    "enabled": True,
+                    "delete_prior": delete_prior,
+                    "add_prior": add_prior,
+                    "move_prior": move_prior,
+                    "best_prior": best_prior,
+                    **debug_scalars,
+                }
+            )
+            return out
+
+        delete_gain = self._fit_leaf_pattern_map(
+            leaf_diag.get("delete_nll_gain", None),
+            like_tensor,
+        ).clamp_min(0.0)
+        add_gain = self._fit_leaf_pattern_map(
+            leaf_diag.get("add_nll_gain", None),
+            like_tensor,
+        ).clamp_min(0.0)
+        move_gain = self._fit_leaf_pattern_map(
+            leaf_diag.get("move_nll_gain", None),
+            like_tensor,
+        ).clamp_min(0.0)
+
+        delete_prior = torch.tanh(delete_gain * scale).clamp(0.0, 1.0).detach()
+        add_prior = torch.tanh(add_gain * scale).clamp(0.0, 1.0).detach()
+        move_prior = torch.tanh(move_gain * scale).clamp(0.0, 1.0).detach()
+        best_prior = torch.maximum(torch.maximum(delete_prior, add_prior), move_prior)
+        debug_scalars = {}
+        if self._should_collect_runtime_debug():
+            debug_scalars = {
+                "delete_prior_mean": float(delete_prior.detach().float().mean().cpu()),
+                "add_prior_mean": float(add_prior.detach().float().mean().cpu()),
+                "move_prior_mean": float(move_prior.detach().float().mean().cpu()),
+                "best_prior_mean": float(best_prior.detach().float().mean().cpu()),
+                "best_prior_max": float(best_prior.detach().float().max().cpu()),
+            }
+
+        out.update(
+            {
+                "enabled": True,
+                "delete_prior": delete_prior,
+                "add_prior": add_prior,
+                "move_prior": move_prior,
+                "best_prior": best_prior,
+                **debug_scalars,
+            }
+        )
+        return out
+
+    def _fit_leaf_pattern_long_map(self, value, batch_size, point_count, device):
+        """
+        Section5:
+        leaf_pattern_diag内のchild slot Tensorを [B, N] のlong Tensorに揃える。
+        """
+        if not torch.is_tensor(value):
+            return torch.full(
+                (batch_size, point_count),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
+
+        out = value.to(device=device, dtype=torch.long)
+
+        if out.ndim == 1:
+            out = out.view(1, -1)
+        elif out.ndim == 2:
+            pass
+        elif out.ndim == 3:
+            if out.shape[1] == 1:
+                out = out.squeeze(1)
+            elif out.shape[2] == 1:
+                out = out.squeeze(2)
+            else:
+                out = out[:, 0, :]
+        else:
+            return torch.full(
+                (batch_size, point_count),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
+
+        if out.shape[0] == 1 and batch_size > 1:
+            out = out.expand(batch_size, -1).contiguous()
+
+        if out.shape[0] != batch_size:
+            return torch.full(
+                (batch_size, point_count),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
+
+        current_n = int(out.shape[1])
+        if current_n == point_count:
+            return out.contiguous()
+
+        if current_n > point_count:
+            return out[:, :point_count].contiguous()
+
+        if current_n > 0:
+            pad = out[:, -1:].expand(batch_size, point_count - current_n)
+            return torch.cat([out, pad], dim=1).contiguous()
+
+        return torch.full(
+            (batch_size, point_count),
+            -1,
+            device=device,
+            dtype=torch.long,
+        )
+
+    def _leaf_pattern_target_direction_priors(
+        self,
+        structure,
+        target_child_slots,
+        like_tensor,
+        leaf_actuator_prior=None,
+    ):
+        """
+        Section5:
+        Add/Move候補target voxelのchild slotと、
+        OctreeStructureAnalysisが推奨したbest child slotを照合し、
+        一致するtarget方向へlogit biasを作る。
+
+        target_child_slots は [B, N, K] である。
+        戻り値の add_target_bias / move_target_bias も [B, N, K] である。
+        """
+        B, N, K = target_child_slots.shape
+        device = target_child_slots.device
+        dtype = like_tensor.dtype
+
+        zero_bnk = like_tensor.new_zeros((B, N, K))
+
+        out = {
+            "enabled": False,
+            "add_target_bias": zero_bnk,
+            "move_target_bias": zero_bnk,
+            "add_target_match_ratio": 0.0,
+            "move_target_match_ratio": 0.0,
+            "add_target_bias_mean": 0.0,
+            "move_target_bias_mean": 0.0,
+        }
+
+        if not bool(getattr(self.args, "leaf_pattern_target_direction_prior", True)):
+            return out
+
+        if not isinstance(structure, dict):
+            return out
+
+        leaf_diag = structure.get("leaf_pattern_diag", None)
+        if not isinstance(leaf_diag, dict):
+            return out
+
+        if not bool(leaf_diag.get("available", False)):
+            return out
+
+        if leaf_actuator_prior is None or not isinstance(leaf_actuator_prior, dict):
+            return out
+
+        best_add_slot = self._fit_leaf_pattern_long_map(
+            leaf_diag.get("best_add_child_slot", None),
+            batch_size=B,
+            point_count=N,
+            device=device,
+        )
+        best_move_slot = self._fit_leaf_pattern_long_map(
+            leaf_diag.get("best_move_target_child_slot", None),
+            batch_size=B,
+            point_count=N,
+            device=device,
+        )
+
+        add_valid = best_add_slot.ge(0) & best_add_slot.le(7)
+        move_valid = best_move_slot.ge(0) & best_move_slot.le(7)
+
+        add_match = (
+            target_child_slots == best_add_slot.unsqueeze(2)
+        ) & add_valid.unsqueeze(2)
+
+        move_match = (
+            target_child_slots == best_move_slot.unsqueeze(2)
+        ) & move_valid.unsqueeze(2)
+
+        add_source_prior = leaf_actuator_prior.get(
+            "add_prior",
+            like_tensor.new_zeros((B, 1, N)),
+        ).to(device=device, dtype=dtype)
+
+        move_source_prior = leaf_actuator_prior.get(
+            "move_prior",
+            like_tensor.new_zeros((B, 1, N)),
+        ).to(device=device, dtype=dtype)
+
+        if add_source_prior.ndim == 3:
+            add_source_prior = add_source_prior.squeeze(1)
+        if move_source_prior.ndim == 3:
+            move_source_prior = move_source_prior.squeeze(1)
+
+        add_target_bias = add_match.to(dtype=dtype) * add_source_prior.unsqueeze(2)
+        move_target_bias = move_match.to(dtype=dtype) * move_source_prior.unsqueeze(2)
+        debug_scalars = {}
+        if self._should_collect_runtime_debug():
+            debug_scalars = {
+                "add_target_match_ratio": float(add_match.to(torch.float32).mean().detach().cpu()),
+                "move_target_match_ratio": float(move_match.to(torch.float32).mean().detach().cpu()),
+                "add_target_bias_mean": float(add_target_bias.detach().float().mean().cpu()),
+                "move_target_bias_mean": float(move_target_bias.detach().float().mean().cpu()),
+            }
+
+        out.update(
+            {
+                "enabled": True,
+                "add_target_bias": add_target_bias.detach(),
+                "move_target_bias": move_target_bias.detach(),
+                **debug_scalars,
+            }
+        )
+        return out
+
+    def _leaf_pattern_operation_masks(self, structure, like_tensor):
+        """
+        leaf pattern診断でNLL改善が見込めるsource候補だけを残す。
+
+        現在のleaf pattern scoreはSparsePCGCの完全なoracleではないが、
+        無関係な大量Voxel編集を許すとexact occupancy NLLが序盤から悪化する。
+        そのためhard maskは「正の改善候補だけに絞る」軽い安全弁として使う。
+        """
+        B, _, N = like_tensor.shape
+        device = like_tensor.device
+
+        false_mask = torch.zeros((B, 1, N), device=device, dtype=torch.bool)
+        out = {
+            "enabled": False,
+            "delete_mask": false_mask,
+            "add_mask": false_mask,
+            "move_mask": false_mask,
+            "actual_oracle_enabled": False,
+            "actual_oracle_drop_used": False,
+            "actual_oracle_add_used": False,
+            "actual_oracle_move_used": False,
+            "actual_oracle_drop_best_percent": 0.0,
+            "actual_oracle_drop_tested_count": 0,
+            "actual_oracle_bad_candidate_count": 0,
+            "actual_oracle_improving_candidate_count": 0,
+            "actual_oracle_combo_extra_count": 0,
+            "actual_oracle_generated_candidate_count": 0,
+            "actual_oracle_accepted_candidate_count": 0,
+            "actual_oracle_accepted_prune_count": 0,
+            "actual_oracle_accepted_add_count": 0,
+            "actual_oracle_accepted_adjust_count": 0,
+            "actual_oracle_accepted_subtree_move_count": 0,
+            "actual_oracle_accepted_parent_collapse_count": 0,
+            "actual_oracle_accepted_pattern_canonicalize_count": 0,
+            "actual_oracle_noop_label_count": 0,
+            "actual_oracle_noop_label_weight": 0.0,
+            "actual_oracle_high_rate_mppov_count": 0,
+            "actual_oracle_low_prob_occupied_count": 0,
+            "actual_oracle_single_child_chain_count": 0,
+            "actual_oracle_context_pattern_candidate_count": 0,
+            "actual_oracle_eval_count": 0,
+            "actual_oracle_eval_max": 0,
+            "actual_oracle_time": 0.0,
+            "actual_oracle_delta_actual_percent": 0.0,
+            "actual_oracle_proxy_percent": 0.0,
+            "actual_oracle_geometry_percent": 0.0,
+            "actual_oracle_original_actual_bits": 0.0,
+            "actual_oracle_edited_actual_bits": 0.0,
+            "actual_oracle_fast_diagnostic_used": False,
+            "actual_oracle_fast_diagnostic_full_drop_count": 0,
+            "actual_oracle_fast_diagnostic_local_drop_count": 0,
+            "actual_oracle_fast_diagnostic_full_drop_ratio": 0.0,
+            "actual_oracle_fast_diagnostic_local_drop_ratio": 0.0,
+            "actual_oracle_drop_reason": "",
+            "actual_oracle_operation": "",
+            "actual_oracle_scheduled_operation": "",
+            "actual_oracle_drop_bad_mask": false_mask,
+            "actual_oracle_add_bad_mask": false_mask,
+            "actual_oracle_move_bad_mask": false_mask,
+            "actual_oracle_drop_bad_score": false_mask.to(dtype=like_tensor.dtype),
+            "actual_oracle_add_bad_score": false_mask.to(dtype=like_tensor.dtype),
+            "actual_oracle_move_bad_score": false_mask.to(dtype=like_tensor.dtype),
+            "actual_oracle_best_add_direction_index": torch.full_like(false_mask, -1, dtype=torch.long),
+            "actual_oracle_bad_add_direction_index": torch.full_like(false_mask, -1, dtype=torch.long),
+            "actual_oracle_move_direction_index": torch.full_like(false_mask, -1, dtype=torch.long),
+            "actual_oracle_move_bad_direction_index": torch.full_like(false_mask, -1, dtype=torch.long),
+        }
+
+        if not isinstance(structure, dict):
+            return out
+        leaf_diag = structure.get("leaf_pattern_diag", None)
+        if not isinstance(leaf_diag, dict):
+            return out
+
+        # actual SparsePCGCで改善確認済みの候補があるstepでは、
+        # empirical leaf-pattern maskではなくoracle maskを優先する。
+        # force_no_edit時はdrop maskが全falseになり、全操作を明示的に止める。
+        if bool(leaf_diag.get("actual_oracle_enabled", False)):
+            oracle_drop_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_drop_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_add_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_add_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_move_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_drop_bad_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_drop_bad_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_add_bad_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_add_bad_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_move_bad_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_bad_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_drop_bad_score = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_drop_bad_score", None),
+                like_tensor,
+            )
+            oracle_add_bad_score = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_add_bad_score", None),
+                like_tensor,
+            )
+            oracle_move_bad_score = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_bad_score", None),
+                like_tensor,
+            )
+            oracle_add_direction_index = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_best_add_direction_index", None),
+                like_tensor,
+            ).to(dtype=torch.long)
+            oracle_bad_add_direction_index = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_bad_add_direction_index", None),
+                like_tensor,
+            ).to(dtype=torch.long)
+            oracle_move_direction_index = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_direction_index", None),
+                like_tensor,
+            ).to(dtype=torch.long)
+            oracle_bad_move_direction_index = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_bad_direction_index", None),
+                like_tensor,
+            ).to(dtype=torch.long)
+            out.update(
+                {
+                    "enabled": True,
+                    "delete_mask": oracle_drop_mask,
+                    "add_mask": oracle_add_mask,
+                    "move_mask": oracle_move_mask,
+                    "actual_oracle_enabled": True,
+                    "actual_oracle_drop_used": bool(leaf_diag.get("actual_oracle_drop_used", False)),
+                    "actual_oracle_add_used": bool(leaf_diag.get("actual_oracle_add_used", False)),
+                    "actual_oracle_move_used": bool(leaf_diag.get("actual_oracle_move_used", False)),
+                    "actual_oracle_drop_best_percent": float(
+                        leaf_diag.get("actual_oracle_drop_best_percent", 0.0) or 0.0
+                    ),
+                    "actual_oracle_drop_tested_count": int(
+                        leaf_diag.get("actual_oracle_drop_tested_count", 0) or 0
+                    ),
+                    "actual_oracle_bad_candidate_count": int(
+                        leaf_diag.get("actual_oracle_bad_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_improving_candidate_count": int(
+                        leaf_diag.get("actual_oracle_improving_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_combo_extra_count": int(
+                        leaf_diag.get("actual_oracle_combo_extra_count", 0) or 0
+                    ),
+                    "actual_oracle_generated_candidate_count": int(
+                        leaf_diag.get("actual_oracle_generated_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_candidate_count": int(
+                        leaf_diag.get("actual_oracle_accepted_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_prune_count": int(
+                        leaf_diag.get("actual_oracle_accepted_prune_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_add_count": int(
+                        leaf_diag.get("actual_oracle_accepted_add_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_adjust_count": int(
+                        leaf_diag.get("actual_oracle_accepted_adjust_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_subtree_move_count": int(
+                        leaf_diag.get("actual_oracle_accepted_subtree_move_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_parent_collapse_count": int(
+                        leaf_diag.get("actual_oracle_accepted_parent_collapse_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_pattern_canonicalize_count": int(
+                        leaf_diag.get("actual_oracle_accepted_pattern_canonicalize_count", 0) or 0
+                    ),
+                    "actual_oracle_noop_label_count": int(
+                        leaf_diag.get("actual_oracle_noop_label_count", 0) or 0
+                    ),
+                    "actual_oracle_noop_label_weight": float(
+                        leaf_diag.get("actual_oracle_noop_label_weight", 0.0) or 0.0
+                    ),
+                    "actual_oracle_high_rate_mppov_count": int(
+                        leaf_diag.get("actual_oracle_high_rate_mppov_count", 0) or 0
+                    ),
+                    "actual_oracle_low_prob_occupied_count": int(
+                        leaf_diag.get("actual_oracle_low_prob_occupied_count", 0) or 0
+                    ),
+                    "actual_oracle_single_child_chain_count": int(
+                        leaf_diag.get("actual_oracle_single_child_chain_count", 0) or 0
+                    ),
+                    "actual_oracle_context_pattern_candidate_count": int(
+                        leaf_diag.get("actual_oracle_context_pattern_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_eval_count": int(
+                        leaf_diag.get("actual_oracle_eval_count", 0) or 0
+                    ),
+                    "actual_oracle_eval_max": int(
+                        leaf_diag.get("actual_oracle_eval_max", 0) or 0
+                    ),
+                    "actual_oracle_time": float(
+                        leaf_diag.get("actual_oracle_time", 0.0) or 0.0
+                    ),
+                    "actual_oracle_delta_actual_percent": float(
+                        leaf_diag.get("actual_oracle_delta_actual_percent", 0.0) or 0.0
+                    ),
+                    "actual_oracle_proxy_percent": float(
+                        leaf_diag.get("actual_oracle_proxy_percent", 0.0) or 0.0
+                    ),
+                    "actual_oracle_geometry_percent": float(
+                        leaf_diag.get("actual_oracle_geometry_percent", 0.0) or 0.0
+                    ),
+                    "actual_oracle_original_actual_bits": float(
+                        leaf_diag.get("actual_oracle_original_actual_bits", 0.0) or 0.0
+                    ),
+                    "actual_oracle_edited_actual_bits": float(
+                        leaf_diag.get("actual_oracle_edited_actual_bits", 0.0) or 0.0
+                    ),
+                    "actual_oracle_fast_diagnostic_used": bool(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_used", False)
+                    ),
+                    "actual_oracle_fast_diagnostic_full_drop_count": int(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_full_drop_count", 0) or 0
+                    ),
+                    "actual_oracle_fast_diagnostic_local_drop_count": int(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_local_drop_count", 0) or 0
+                    ),
+                    "actual_oracle_fast_diagnostic_full_drop_ratio": float(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_full_drop_ratio", 0.0) or 0.0
+                    ),
+                    "actual_oracle_fast_diagnostic_local_drop_ratio": float(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0) or 0.0
+                    ),
+                    "actual_oracle_fast_diagnostic_full_add_count": int(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_full_add_count", 0) or 0
+                    ),
+                    "actual_oracle_fast_diagnostic_local_add_count": int(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_local_add_count", 0) or 0
+                    ),
+                    "actual_oracle_fast_diagnostic_full_add_ratio": float(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_full_add_ratio", 0.0) or 0.0
+                    ),
+                    "actual_oracle_fast_diagnostic_local_add_ratio": float(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_local_add_ratio", 0.0) or 0.0
+                    ),
+                    "actual_oracle_drop_reason": str(
+                        leaf_diag.get("actual_oracle_drop_reason", "")
+                    ),
+                    "actual_oracle_operation": str(
+                        leaf_diag.get("actual_oracle_operation", "")
+                    ),
+                    "actual_oracle_scheduled_operation": str(
+                        leaf_diag.get("actual_oracle_scheduled_operation", "")
+                    ),
+                    "actual_oracle_drop_bad_mask": oracle_drop_bad_mask & (~oracle_drop_mask),
+                    "actual_oracle_add_bad_mask": oracle_add_bad_mask & (~oracle_add_mask),
+                    "actual_oracle_move_bad_mask": oracle_move_bad_mask & (~oracle_move_mask),
+                    "actual_oracle_drop_bad_score": oracle_drop_bad_score,
+                    "actual_oracle_add_bad_score": oracle_add_bad_score,
+                    "actual_oracle_move_bad_score": oracle_move_bad_score,
+                    "actual_oracle_best_add_direction_index": oracle_add_direction_index,
+                    "actual_oracle_bad_add_direction_index": oracle_bad_add_direction_index,
+                    "actual_oracle_move_direction_index": oracle_move_direction_index,
+                    "actual_oracle_move_bad_direction_index": oracle_bad_move_direction_index,
+                }
+            )
+            return out
+
+        if not bool(getattr(self.args, "leaf_pattern_operation_mask", False)):
+            return out
+        if not bool(leaf_diag.get("available", False)):
+            return out
+
+        threshold = max(float(getattr(self.args, "leaf_pattern_operation_mask_gain_threshold", 0.02)), 0.0)
+        delete_gain = self._fit_leaf_pattern_map(leaf_diag.get("delete_nll_gain", None), like_tensor)
+        add_gain = self._fit_leaf_pattern_map(leaf_diag.get("add_nll_gain", None), like_tensor)
+        move_gain = self._fit_leaf_pattern_map(leaf_diag.get("move_nll_gain", None), like_tensor)
+
+        delete_valid = self._fit_leaf_pattern_map(
+            leaf_diag.get("delete_valid_mask", None),
+            like_tensor,
+        ).to(dtype=torch.bool)
+        add_valid = self._fit_leaf_pattern_map(
+            leaf_diag.get("add_valid_mask", None),
+            like_tensor,
+        ).to(dtype=torch.bool)
+        move_valid = self._fit_leaf_pattern_map(
+            leaf_diag.get("move_valid_mask", None),
+            like_tensor,
+        ).to(dtype=torch.bool)
+
+        # DeleteはSparsePCGC actual改善とleaf empirical gainの相関が弱い。
+        # 実改善stepでは delete_nll_gain<=0 の候補も多いため、正gainだけで
+        # hard maskすると改善候補を消してしまう。親nodeを空にしないvalid条件だけ残す。
+        delete_mask = delete_valid
+        add_mask = add_valid & (add_gain > threshold)
+        move_mask = move_valid & (move_gain > threshold)
+
+        if not bool((delete_mask | add_mask | move_mask).any().detach().item()):
+            return out
+
+        out.update(
+            {
+                "enabled": True,
+                "delete_mask": delete_mask,
+                "add_mask": add_mask,
+                "move_mask": move_mask,
+            }
+        )
+        return out
+    
+    def _context_voxel_step_and_offset(self, pts_xyz, coord_scale, octree_context):
+        # 初期Octree/Subtreeメタデータがある場合は、そのglobal_qs/global_offsetを優先する。
+        # これにより、Network入力前に作ったVoxel座標系をActuator内でも維持する。
+        if isinstance(octree_context, dict):
+            qs_raw = octree_context.get("global_qs", self._effective_qs())
+
+            if torch.is_tensor(qs_raw):
+                step = qs_raw.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
+                if step.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                    step = step.expand(pts_xyz.shape[0], -1, -1)
+                if step.shape[0] != pts_xyz.shape[0]:
+                    raise ValueError("octree_context['global_qs'] batch size does not match pts_xyz.")
+                step = step.clamp_min(1e-9)
+            else:
+                qs_value = max(float(qs_raw), 1e-9)
+                step = pts_xyz.new_full((pts_xyz.shape[0], 1, 1), qs_value)
+
+            if "global_offset" in octree_context:
+                offset = octree_context["global_offset"]
+                if not torch.is_tensor(offset):
+                    offset = torch.as_tensor(offset)
+                offset = offset.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+
+                if offset.ndim == 1 and offset.numel() == 3:
+                    offset = offset.view(1, 3, 1)
+                elif offset.ndim == 2 and offset.shape[-1] == 3:
+                    offset = offset.view(-1, 3, 1)
+                elif offset.ndim == 2 and offset.shape[0] == 3:
+                    offset = offset.unsqueeze(0)
+                elif offset.ndim == 3 and offset.shape[1] == 3:
+                    offset = offset[:, :, :1]
+                else:
+                    raise ValueError("octree_context['global_offset'] must have shape [3], [B,3], [3,1], or [B,3,1].")
+
+                if offset.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                    offset = offset.expand(pts_xyz.shape[0], -1, -1)
+                if offset.shape[0] != pts_xyz.shape[0]:
+                    raise ValueError("octree_context['global_offset'] batch size does not match pts_xyz.")
+            else:
+                offset = pts_xyz.new_zeros((pts_xyz.shape[0], 3, 1))
+
+            return step.contiguous(), offset.contiguous(), True
+
+        # fallback時だけ従来のvoxel_stepを使う。
+        step = self._voxel_step(pts_xyz, coord_scale)
+        offset = pts_xyz.new_zeros((pts_xyz.shape[0], 3, 1))
+        return step, offset, False
+
+
+    def _voxel_centers_from_global_coords(self, voxel_coords, voxel_step, voxel_offset, dtype):
+        # global voxel座標を、同じglobal_offset/global_qsに基づいて点座標へ戻す。
+        return voxel_offset.to(dtype=dtype) + voxel_coords.to(dtype=dtype) * voxel_step.to(dtype=dtype)
+
+    def _effective_qs(self):
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree, geometry_step
+        if is_geometry_octree(self.args):
+            return geometry_step(self.args)
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key == "sparsepcgc":
+            return max(float(sparsepcgc_effective_qs_value(self.args)), 1e-9)
+        if compress_key in {"gpcc", "gpcctmc3"}:
+            return max(float(getattr(self.args, "gpcc_effective_qs", getattr(self.args, "qs", 1.0))), 1e-9)
+        return max(float(getattr(self.args, "qs", 2.0)), 1e-9)
+
+    def _add_enabled(self):
+        return bool(getattr(self.args, "add", True))
+
+    def _prune_enabled(self):
+        return bool(getattr(self.args, "prune", True))
+
+    def _disp_enabled(self):
+        return bool(getattr(self.args, "disp", True))
+
+    def _threshold_cap_mode(self):
+        mode = str(getattr(self.args, "repair_selection_mode", "target")).strip().lower().replace("-", "_")
+        return mode in {"threshold_cap", "cap", "optional", "threshold"}
+
+    def _prune_after_prior_mode(self):
+        mode = str(getattr(self.args, "sparsepcgc_prune_after_prior_mode", "oracle")).strip().lower()
+        if bool(getattr(self.args, "direct_network_prune", False)):
+            return "direct_network"
+        if mode not in {"oracle", "network", "direct_network"}:
+            return "oracle"
+        return mode
+
+    def _direct_network_prune_mode(self):
+        return bool(
+            self.training
+            and (
+                bool(getattr(self.args, "direct_network_prune", False))
+                or self._prune_after_prior_mode() == "direct_network"
+            )
+        )
+
+    def _algorithmic_proposal_selector_enabled(self):
+        return bool(
+            self.training
+            and bool(getattr(self.args, "sparsepcgc_algorithmic_proposal_selector", True))
+            and not bool(getattr(self.args, "sparsepcgc_legacy_direct_actuator_train", False))
+            and not self._direct_network_prune_mode()
+        )
+
+    def _network_prune_floor_ratio(self, max_drop_ratio):
+        if not self.training:
+            return 0.0
+
+        mode = self._prune_after_prior_mode()
+        if mode not in {"network", "direct_network"}:
+            return 0.0
+
+        if mode == "direct_network":
+            floor_ratio = float(
+                getattr(
+                    self.args,
+                    "direct_prune_ratio_floor",
+                    getattr(self.args, "sparsepcgc_network_prune_ratio_floor", 0.05),
+                )
+            )
+        else:
+            floor_ratio = float(getattr(self.args, "sparsepcgc_network_prune_ratio_floor", 0.0))
+
+        floor_ratio = min(max(floor_ratio, 0.0), float(max_drop_ratio))
+        if floor_ratio <= 0.0:
+            return 0.0
+
+        current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+
+        # direct_networkではPhaseに依存させない。
+        # warmup終了後ではなく、訓練開始直後からNetwork Pruneの実行機会を残す。
+        if mode == "direct_network":
+            floor_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 1000)), 0)
+            decay_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 1000)), 0)
+            post_warmup_step = current_step
+        else:
+            warmup_steps = max(int(getattr(self.args, "sparsepcgc_codec_prune_prior_warmup_steps", 0)), 0)
+            floor_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 0)), 0)
+            decay_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 0)), 0)
+            post_warmup_step = max(current_step - warmup_steps, 0)
+
+        if post_warmup_step < floor_steps:
+            return floor_ratio
+
+        if decay_steps <= 0:
+            return 0.0
+
+        decay_progress = max(post_warmup_step - floor_steps, 0)
+        decay_phase = max(1.0 - float(decay_progress) / float(decay_steps), 0.0)
+        return floor_ratio * decay_phase
+
+    def _network_phase0_prune_mode(self, codec_prune_prior_phase):
+        if self._direct_network_prune_mode():
+            return True
+        return bool(
+            self.training
+            and self._prune_after_prior_mode() == "network"
+            and float(codec_prune_prior_phase) <= 0.0
+        )
+
+    def _post_warmup_amount_strategy(self):
+        strategy = str(
+            getattr(self.args, "sparsepcgc_post_warmup_amount_strategy", "outcome_explore")
+        ).strip().lower()
+        if strategy not in {"fixed_blend", "outcome_explore", "network"}:
+            return "outcome_explore"
+        return strategy
+
+    def _amount_explore_ratio_values(self):
+        raw_values = getattr(self.args, "sparsepcgc_amount_explore_ratio_values", None)
+        values = []
+        if isinstance(raw_values, (list, tuple)):
+            for value in raw_values:
+                try:
+                    ratio = float(value)
+                except Exception:
+                    continue
+                if math.isfinite(ratio):
+                    values.append(ratio)
+        if not values:
+            values = [0.005, 0.01, 0.02, 0.03, 0.04, 0.05]
+        values = sorted(set(min(max(float(value), 0.0), 0.95) for value in values))
+        return values
+
+    @staticmethod
+    def _algorithmic_amount_bin_values_from_args(args):
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        if is_geometry_octree(args):
+            values = getattr(args, "geometry_octree_amount_bin_values", None)
+            if values is None:
+                values = [float(v) for v in str(getattr(
+                    args, "heuristic_guidance_online_amount_bins",
+                    "0.0015,0.002,0.0025,0.00275,0.003"
+                )).split(",")]
+            return sorted(set(values))
+        raw_values = getattr(args, "sparsepcgc_algorithmic_amount_bin_values", None)
+        values = []
+        if isinstance(raw_values, (list, tuple)):
+            for value in raw_values:
+                try:
+                    ratio = float(value)
+                except Exception:
+                    continue
+                if math.isfinite(ratio) and ratio > 0.0:
+                    values.append(min(max(float(ratio), 0.0), 0.30))
+        if not values:
+            raw_text = str(getattr(args, "sparsepcgc_algorithmic_amount_bins", "") or "")
+            for item in raw_text.replace(";", ",").split(","):
+                try:
+                    ratio = float(item.strip())
+                except Exception:
+                    continue
+                if math.isfinite(ratio) and ratio > 0.0:
+                    values.append(min(max(float(ratio), 0.0), 0.30))
+        if not values:
+            proposal_values = getattr(args, "sparsepcgc_proposal_amount_bin_values", None)
+            if isinstance(proposal_values, (list, tuple)):
+                for value in proposal_values:
+                    try:
+                        ratio = float(value)
+                    except Exception:
+                        continue
+                    if math.isfinite(ratio) and ratio > 0.0:
+                        values.append(min(max(float(ratio), 0.0), 0.05))
+        if not values:
+            values = [0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05]
+        return sorted(set(values))
+
+    def _algorithmic_amount_bin_values(self, max_drop_ratio, device, dtype):
+        values = self._algorithmic_amount_bin_values_from_args(self.args)
+        values = values[: int(getattr(self, "algorithmic_amount_bin_count", len(values)))]
+        if not values:
+            values = [0.03]
+        values = [min(max(float(value), 0.0), float(max_drop_ratio)) for value in values]
+        return torch.tensor(values, device=device, dtype=dtype)
+
+    @staticmethod
+    def _nearest_amount_bin_class(bin_values, ratio_value):
+        if not torch.is_tensor(bin_values) or int(bin_values.numel()) <= 0:
+            return 0
+        try:
+            ratio_value = float(ratio_value)
+        except Exception:
+            return 0
+        if not math.isfinite(ratio_value) or ratio_value <= 0.0:
+            return 0
+        idx = torch.argmin(torch.abs(bin_values.detach().float().cpu() - float(ratio_value))).item()
+        return int(idx) + 1
+
+    def _deterministic_step_hash(self, *parts):
+        text = "|".join(str(part) for part in parts)
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        return int(digest[:16], 16)
+
+    def _max_offset(self, pts_xyz, coord_scale):
+        raw_max = float(getattr(self.args, "max_repair_offset", getattr(self.args, "max_disp_offset", 0.002)))
+        qstep_max = float(getattr(self.args, "max_repair_qstep", 0.25)) * self._effective_qs()
+        raw_max = max(raw_max, qstep_max)
+        if coord_scale is None:
+            return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), raw_max)
+        if torch.is_tensor(coord_scale):
+            scale = coord_scale.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
+            if scale.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                scale = scale.expand(pts_xyz.shape[0], -1, -1)
+            return raw_max / scale.clamp_min(1e-9)
+        return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), raw_max / max(float(coord_scale), 1e-9))
+
+    def _voxel_step(self, pts_xyz, coord_scale):
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key == "sparsepcgc":
+            return sparsepcgc_effective_qs_tensor(
+                pts_xyz,
+                args=self.args,
+                coord_scale=coord_scale,
+            ).clamp_min(1e-9)
+        
+        qstep = self._effective_qs()
+        if coord_scale is None:
+            return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), qstep)
+        if torch.is_tensor(coord_scale):
+            scale = coord_scale.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
+            if scale.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                scale = scale.expand(pts_xyz.shape[0], -1, -1)
+            return qstep / scale.clamp_min(1e-9)
+        return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), qstep / max(float(coord_scale), 1e-9))
+
+    @staticmethod
+    def _voxel_coords(pts_xyz, voxel_step):
+        return torch.round(pts_xyz / voxel_step.clamp_min(1e-9)).to(torch.long)
+
+    def _sparsepcgc_quantized_coords(self, pts_xyz, coord_scale, fallback_voxel_step=None, global_offset=None):
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+
+        if compress_key != "sparsepcgc":
+            step = fallback_voxel_step if fallback_voxel_step is not None else self._voxel_step(pts_xyz, coord_scale)
+            if global_offset is None:
+                return self._voxel_coords(pts_xyz, step)
+            return self._voxel_coords(pts_xyz - global_offset, step)
+
+        return canonical_sparsepcgc_voxel_coords(
+            pts_xyz,
+            args=self.args,
+            coord_scale=coord_scale,
+            global_offset=global_offset,
+        ).to(torch.long)
+    @classmethod
+    def _coords_membership_mask(cls, query_coords, reference_coords):
+        B, _, N = query_coords.shape
+        out = torch.zeros((B, N), device=query_coords.device, dtype=torch.bool)
+        for b in range(B):
+            query = query_coords[b].transpose(0, 1).contiguous()
+            reference = reference_coords[b].transpose(0, 1).contiguous()
+            out[b] = cls._coords_membership(query, reference)
+        return out
+
+    def _first_unique_selected_mask(self, target_coords, selected_mask):
+        if selected_mask.ndim == 3:
+            selected_mask = selected_mask.squeeze(1)
+        selected_mask = selected_mask.to(device=target_coords.device, dtype=torch.bool)
+        keep = torch.zeros_like(selected_mask, dtype=torch.bool)
+        for b in range(target_coords.shape[0]):
+            selected_idx = selected_mask[b].nonzero(as_tuple=False).flatten()
+            if selected_idx.numel() == 0:
+                continue
+            coords_b = target_coords[b : b + 1].index_select(2, selected_idx)
+            keep_b = self._first_unique_coord_mask(coords_b).squeeze(0)
+            keep[b, selected_idx[keep_b]] = True
+        return keep
+
+    @staticmethod
+    def _coord_keys(coords, mins, spans):
+        shifted = coords - mins.view(1, 3)
+        return (
+            shifted[:, 0] * spans[1].clamp_min(1) * spans[2].clamp_min(1)
+            + shifted[:, 1] * spans[2].clamp_min(1)
+            + shifted[:, 2]
+        )
+
+    @classmethod
+    def _coords_membership(cls, query_coords, reference_coords):
+        if query_coords.numel() == 0:
+            return torch.zeros((query_coords.shape[0],), device=query_coords.device, dtype=torch.bool)
+        if reference_coords.numel() == 0:
+            return torch.zeros((query_coords.shape[0],), device=query_coords.device, dtype=torch.bool)
+        combined = torch.cat([query_coords, reference_coords], dim=0)
+        mins = combined.amin(dim=0)
+        spans = (combined.amax(dim=0) - mins + 1).to(torch.long)
+        query_keys = cls._coord_keys(query_coords.to(torch.long), mins, spans)
+        reference_keys = torch.unique(cls._coord_keys(reference_coords.to(torch.long), mins, spans), sorted=True)
+        pos = torch.searchsorted(reference_keys, query_keys)
+        in_bounds = pos < reference_keys.numel()
+        safe_pos = pos.clamp(max=max(int(reference_keys.numel()) - 1, 0))
+        return in_bounds & (reference_keys[safe_pos] == query_keys)
+
+    def _build_voxel_cache(self, voxel_coords):
+        cache = []
+        B, _, _ = voxel_coords.shape
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if coords.numel() == 0:
+                empty = coords.new_empty((0,), dtype=torch.long)
+                cache.append(
+                    {
+                        "coords": coords,
+                        "unique_coords": coords.new_empty((0, 3), dtype=torch.long),
+                        "inverse": empty,
+                        "counts": empty.to(dtype=torch.float32),
+                        "occupied_keys": empty,
+                        "key_mins": coords.new_zeros((3,), dtype=torch.long),
+                        "key_spans": coords.new_ones((3,), dtype=torch.long),
+                        "voxel_count": 0,
+                    }
+                )
+                continue
+            unique_coords, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+            voxel_count = int(unique_coords.shape[0])
+            counts = torch.bincount(inverse, minlength=voxel_count).to(
+                device=voxel_coords.device,
+                dtype=torch.float32,
+            )
+            key_min = unique_coords.amin(dim=0) - 1
+            key_span = (unique_coords.amax(dim=0) - unique_coords.amin(dim=0) + 3).to(torch.long).clamp_min(1)
+            occupied_keys = torch.sort(self._coord_keys(unique_coords, key_min, key_span)).values
+            cache.append(
+                {
+                    "coords": coords,
+                    "unique_coords": unique_coords,
+                    "inverse": inverse,
+                    "counts": counts,
+                    "occupied_keys": occupied_keys,
+                    "key_mins": key_min,
+                    "key_spans": key_span,
+                    "voxel_count": voxel_count,
+                }
+            )
+        return cache
+
+    @staticmethod
+    def _child_slot_from_coords_lastdim(coords):
+        coords = coords.to(dtype=torch.long)
+        return (
+            coords[..., 0].remainder(2)
+            + 2 * coords[..., 1].remainder(2)
+            + 4 * coords[..., 2].remainder(2)
+        ).to(dtype=torch.long)
+
+    def _point_parent_codes_and_child_slots(self, voxel_coords):
+        B, _, N = voxel_coords.shape
+        parent_codes = torch.zeros((B, N), device=voxel_coords.device, dtype=torch.long)
+        child_slots = torch.zeros((B, N), device=voxel_coords.device, dtype=torch.long)
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous().to(dtype=torch.long)
+            if coords.numel() == 0:
+                continue
+            parents = torch.div(coords, 2, rounding_mode="floor")
+            slots = self._child_slot_from_coords_lastdim(coords)
+            child_slots[b] = slots
+            unique_parents, inverse = torch.unique(parents, dim=0, sorted=True, return_inverse=True)
+            occupancy = torch.zeros(
+                (unique_parents.shape[0], 8),
+                device=voxel_coords.device,
+                dtype=torch.bool,
+            )
+            occupancy[inverse, slots.clamp(0, 7)] = True
+            pattern_weights = (
+                2 ** torch.arange(8, device=voxel_coords.device, dtype=torch.long)
+            ).view(1, 8)
+            codes = (occupancy.to(dtype=torch.long) * pattern_weights).sum(dim=1)
+            parent_codes[b] = codes.index_select(0, inverse)
+        return parent_codes, child_slots
+
+    def _occupancy_code_popularity(self, octree_context, full_octree_context, like_tensor):
+        parts = []
+
+        def _add_codes(ctx, key, weight=1.0):
+            if not isinstance(ctx, dict) or key not in ctx:
+                return
+            value = ctx.get(key, None)
+            if value is None:
+                return
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            value = value.to(device=like_tensor.device, dtype=torch.long).reshape(-1)
+            value = value[(value >= 0) & (value < 256)]
+            if value.numel() <= 0:
+                return
+            if float(weight) != 1.0:
+                repeat = max(int(round(float(weight))), 1)
+                value = value.repeat(repeat)
+            parts.append(value)
+
+        for ctx in (full_octree_context, octree_context):
+            _add_codes(ctx, "occupancy_codes", weight=3.0)
+            _add_codes(ctx, "ancestor_occupancy_codes", weight=2.0)
+            _add_codes(ctx, "sibling_occupancy_codes", weight=2.0)
+            _add_codes(ctx, "parent_occupancy_code", weight=2.0)
+
+        counts = like_tensor.new_ones((256,), dtype=torch.float32) * float(
+            getattr(self.args, "repair_pattern_prior_smoothing", 1.0)
+        )
+        if parts:
+            codes = torch.cat(parts, dim=0)
+            counts = counts + torch.bincount(codes, minlength=256).to(device=like_tensor.device, dtype=counts.dtype)
+        score = torch.log1p(counts)
+        score = score / score.max().clamp_min(1e-6)
+        return score.to(dtype=like_tensor.dtype)
+
+    @classmethod
+    def _coords_membership_cached(cls, query_coords, reference_keys, key_mins, key_spans):
+        if query_coords.numel() == 0 or reference_keys.numel() == 0:
+            return torch.zeros((query_coords.shape[0],), device=query_coords.device, dtype=torch.bool)
+        query_keys = cls._coord_keys(query_coords.to(torch.long), key_mins, key_spans)
+        pos = torch.searchsorted(reference_keys, query_keys)
+        in_bounds = pos < reference_keys.numel()
+        safe_pos = pos.clamp(max=max(int(reference_keys.numel()) - 1, 0))
+        return in_bounds & (reference_keys[safe_pos] == query_keys)
+
+    @staticmethod
+    def _isin_voxel_ids(inverse, selected_voxel_idx):
+        if selected_voxel_idx.numel() == 0:
+            return torch.zeros_like(inverse, dtype=torch.bool)
+        if selected_voxel_idx.numel() == 1:
+            return inverse == selected_voxel_idx.reshape(()).to(device=inverse.device, dtype=inverse.dtype)
+        return torch.isin(inverse, selected_voxel_idx.to(device=inverse.device, dtype=inverse.dtype))
+
+    @staticmethod
+    def _top_unique_voxels_from_point_scores(scores, inverse, count):
+        if int(count) <= 0 or scores.numel() == 0:
+            empty = inverse.new_empty((0,), dtype=torch.long)
+            return empty, scores.new_empty((0,))
+
+        order = torch.argsort(scores.detach(), descending=True)
+        sorted_voxels = inverse.index_select(0, order).to(dtype=torch.long)
+        sorted_scores = scores.index_select(0, order)
+        positions = torch.arange(sorted_voxels.numel(), device=sorted_voxels.device, dtype=torch.long)
+
+        # First occurrence in score-sorted order is the per-voxel max score.
+        # This avoids the old Python loop fallback on PyTorch versions without scatter_reduce_.
+        stride = int(sorted_voxels.numel()) + 1
+        voxel_then_pos = sorted_voxels * stride + positions
+        by_voxel = torch.argsort(voxel_then_pos)
+        voxels_by_id = sorted_voxels.index_select(0, by_voxel)
+        pos_by_id = positions.index_select(0, by_voxel)
+        first = torch.ones_like(pos_by_id, dtype=torch.bool)
+        if pos_by_id.numel() > 1:
+            first[1:] = voxels_by_id[1:] != voxels_by_id[:-1]
+        first_pos = pos_by_id[first]
+        if first_pos.numel() == 0:
+            empty = inverse.new_empty((0,), dtype=torch.long)
+            return empty, scores.new_empty((0,))
+
+        k = min(int(count), int(first_pos.numel()))
+        selected_pos = torch.topk(first_pos, k=k, largest=False, sorted=False).values
+        return sorted_voxels.index_select(0, selected_pos), sorted_scores.index_select(0, selected_pos)
+
+    def _empty_neighbor_target_mask(self, voxel_coords, voxel_cache=None):
+        B, _, N = voxel_coords.shape
+        offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
+        voxel_cache = self._build_voxel_cache(voxel_coords) if voxel_cache is None else voxel_cache
+        masks = []
+        for b in range(B):
+            item = voxel_cache[b]
+            current = item["coords"]
+            # _coord_keys is affine in x/y/z.  Build the [N,26] integer keys
+            # directly instead of allocating [N,26,3] target coordinates.
+            mins = item["key_mins"]
+            spans = item["key_spans"].clamp_min(1)
+            shifted = current - mins.view(1, 3)
+            query_keys = (
+                (shifted[:, 0:1] + offsets[:, 0].view(1, -1)) * spans[1] * spans[2]
+                + (shifted[:, 1:2] + offsets[:, 1].view(1, -1)) * spans[2]
+                + shifted[:, 2:3]
+                + offsets[:, 2].view(1, -1)
+            )
+            occupied_keys = item["occupied_keys"]
+            pos = torch.searchsorted(occupied_keys, query_keys.reshape(-1))
+            in_bounds = pos < occupied_keys.numel()
+            safe_pos = pos.clamp(max=max(int(occupied_keys.numel()) - 1, 0))
+            occupied = (
+                in_bounds & (occupied_keys[safe_pos] == query_keys.reshape(-1))
+            ).view(N, -1)
+            masks.append(~occupied)
+        return torch.stack(masks, dim=0)
+
+    @staticmethod
+    def _voxel_point_counts(voxel_coords, voxel_cache=None):
+        B, _, N = voxel_coords.shape
+        counts = torch.zeros((B, 1, N), device=voxel_coords.device, dtype=torch.float32)
+        if voxel_cache is not None:
+            for b, item in enumerate(voxel_cache):
+                if item["voxel_count"] <= 0:
+                    continue
+                counts[b, 0] = item["counts"].index_select(0, item["inverse"])
+            return counts
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if coords.numel() == 0:
+                continue
+            _, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+            voxel_counts = torch.bincount(inverse, minlength=int(inverse.max().item()) + 1).to(
+                device=voxel_coords.device,
+                dtype=torch.float32,
+            )
+            counts[b, 0] = voxel_counts.index_select(0, inverse)
+        return counts
+
+    @classmethod
+    def _unique_voxel_count(cls, voxel_coords, point_mask=None):
+        B = voxel_coords.shape[0]
+        total = 0
+        if point_mask is not None:
+            if point_mask.ndim == 3:
+                point_mask = point_mask.squeeze(1)
+            point_mask = point_mask.to(device=voxel_coords.device, dtype=torch.bool)
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if point_mask is not None:
+                coords = coords[point_mask[b]]
+            if coords.numel() == 0:
+                continue
+            total += int(torch.unique(coords, dim=0).shape[0])
+        return total
+
+    @staticmethod
+    def _unique_voxel_count_from_cache(voxel_cache, point_mask=None):
+        total = 0
+        if point_mask is not None:
+            if point_mask.ndim == 3:
+                point_mask = point_mask.squeeze(1)
+            point_mask = point_mask.to(dtype=torch.bool)
+        for b, item in enumerate(voxel_cache):
+            voxel_count = int(item["voxel_count"])
+            if voxel_count <= 0:
+                continue
+            if point_mask is None:
+                total += voxel_count
+                continue
+            mask_b = point_mask[b].to(device=item["inverse"].device, dtype=torch.bool)
+            selected_inverse = item["inverse"][mask_b]
+            total += int(torch.unique(selected_inverse, sorted=False).numel())
+        return total
+
+    def _append_unique_voxel_coords(self, base_coords, add_coords):
+        """
+        base occupied coordsにadd coordsを追加し、重複voxelを1つにまとめる。
+        入出力は[N, 3]のlong tensorである。
+        """
+        if base_coords is None:
+            base_coords = add_coords.new_empty((0, 3), dtype=torch.long)
+        base_coords = base_coords.to(dtype=torch.long).reshape(-1, 3)
+
+        if add_coords is None:
+            return torch.unique(base_coords, dim=0, sorted=True) if base_coords.numel() > 0 else base_coords
+
+        add_coords = add_coords.to(device=base_coords.device, dtype=torch.long).reshape(-1, 3)
+        if add_coords.numel() == 0:
+            return torch.unique(base_coords, dim=0, sorted=True) if base_coords.numel() > 0 else base_coords
+        if base_coords.numel() == 0:
+            return torch.unique(add_coords, dim=0, sorted=True)
+
+        return torch.unique(torch.cat([base_coords, add_coords], dim=0), dim=0, sorted=True)
+
+    def _remove_voxel_coords(self, base_coords, remove_coords):
+        """
+        base occupied coordsからremove coordsを削除する。
+        入出力は[N, 3]のlong tensorである。
+        """
+        base_coords = base_coords.to(dtype=torch.long).reshape(-1, 3)
+        if base_coords.numel() == 0:
+            return base_coords
+        if remove_coords is None:
+            return base_coords
+
+        remove_coords = remove_coords.to(device=base_coords.device, dtype=torch.long).reshape(-1, 3)
+        if remove_coords.numel() == 0:
+            return base_coords
+
+        remove_unique = torch.unique(remove_coords, dim=0, sorted=True)
+        remove_mask = self._coords_membership(base_coords, remove_unique)
+        return base_coords[~remove_mask].contiguous()
+
+    def _first_unique_rows_mask(self, coords_n3):
+        """
+        [N, 3]座標について、同一座標の最初の出現だけTrueにする。
+        duplicate targetを1つだけ残すために使う。
+        """
+        coords_n3 = coords_n3.to(dtype=torch.long).reshape(-1, 3)
+        if coords_n3.numel() == 0:
+            return torch.zeros((0,), device=coords_n3.device, dtype=torch.bool)
+
+        _, inverse = torch.unique(coords_n3, dim=0, sorted=True, return_inverse=True)
+        idx = torch.arange(inverse.numel(), device=inverse.device, dtype=inverse.dtype)
+        sort_key = inverse * inverse.numel() + idx
+        order = torch.argsort(sort_key)
+        sorted_inverse = inverse.index_select(0, order)
+
+        first_sorted = torch.ones_like(sorted_inverse, dtype=torch.bool)
+        if sorted_inverse.numel() > 1:
+            first_sorted[1:] = sorted_inverse[1:] != sorted_inverse[:-1]
+
+        mask = torch.zeros_like(inverse, dtype=torch.bool)
+        mask[order[first_sorted]] = True
+        return mask
+
+    def _build_voxel_edit_state_single(
+        self,
+        voxel_coords_b,
+        hard_drop_mask_b,
+        add_target_coords_b,
+        add_target_mask_b,
+        move_source_mask_b,
+        move_target_coords_b,
+        move_valid_mask_b,
+    ):
+        """
+        1batch分のPrune/Add/Moveをoccupied voxel集合上に反映する。
+        Moveは source occupied voxel削除 + target empty voxel追加として扱う。
+        """
+        coords_n3 = voxel_coords_b.transpose(0, 1).contiguous().to(dtype=torch.long)
+        initial_unique = torch.unique(coords_n3, dim=0, sorted=True)
+
+        current = initial_unique
+        debug = {
+            "initial_count": int(initial_unique.shape[0]),
+            "drop_count": 0,
+            "add_count": 0,
+            "move_count": 0,
+            "same_voxel_move_rejected": 0,
+            "existing_target_rejected": 0,
+            "duplicate_target_rejected": 0,
+            "final_count": int(initial_unique.shape[0]),
+        }
+
+        # ------------------------------------------------------------
+        # Prune：点ではなく、選ばれた点が属するoccupied voxelを削除する。
+        # ------------------------------------------------------------
+        if hard_drop_mask_b is not None:
+            drop_mask = hard_drop_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
+            if drop_mask.numel() == coords_n3.shape[0]:
+                drop_coords = torch.unique(coords_n3[drop_mask], dim=0, sorted=True)
+                current = self._remove_voxel_coords(current, drop_coords)
+                debug["drop_count"] = int(drop_coords.shape[0])
+
+        # ------------------------------------------------------------
+        # Add：empty child-slot / empty neighbor voxelをoccupiedに追加する。
+        # ------------------------------------------------------------
+        if add_target_coords_b is not None and add_target_mask_b is not None:
+            add_coords_n3 = add_target_coords_b.transpose(0, 1).contiguous().to(device=coords_n3.device, dtype=torch.long)
+            add_mask = add_target_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
+            if add_mask.numel() == add_coords_n3.shape[0]:
+                selected_add = add_coords_n3[add_mask]
+                unique_add_mask = self._first_unique_rows_mask(selected_add)
+                debug["duplicate_target_rejected"] += int((~unique_add_mask).sum().item())
+                selected_add = selected_add[unique_add_mask]
+
+                # 念のため、既存occupiedへAddする候補は除外する。
+                already_occupied = self._coords_membership(selected_add, current)
+                debug["existing_target_rejected"] += int(already_occupied.sum().item())
+                selected_add = selected_add[~already_occupied]
+
+                if selected_add.numel() > 0:
+                    current = self._append_unique_voxel_coords(current, selected_add)
+                    debug["add_count"] = int(selected_add.shape[0])
+
+        # ------------------------------------------------------------
+        # Move：source voxelを削除し、target voxelを追加する。
+        # ------------------------------------------------------------
+        if move_source_mask_b is not None and move_target_coords_b is not None:
+            move_mask = move_source_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
+            if move_valid_mask_b is not None:
+                move_mask = move_mask & move_valid_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
+
+            move_targets_n3 = move_target_coords_b.transpose(0, 1).contiguous().to(device=coords_n3.device, dtype=torch.long)
+
+            if move_mask.numel() == coords_n3.shape[0] and move_targets_n3.shape[0] == coords_n3.shape[0]:
+                source_coords = coords_n3[move_mask]
+                target_coords = move_targets_n3[move_mask]
+
+                same_voxel = (source_coords == target_coords).all(dim=1)
+                debug["same_voxel_move_rejected"] = int(same_voxel.sum().item())
+                source_coords = source_coords[~same_voxel]
+                target_coords = target_coords[~same_voxel]
+
+                if target_coords.numel() > 0:
+                    # Move targetは初期occupiedおよびPrune/Add反映後のcurrentに存在しないものだけ許可する。
+                    target_existing = self._coords_membership(target_coords, current)
+                    debug["existing_target_rejected"] += int(target_existing.sum().item())
+                    source_coords = source_coords[~target_existing]
+                    target_coords = target_coords[~target_existing]
+
+                if target_coords.numel() > 0:
+                    unique_target_mask = self._first_unique_rows_mask(target_coords)
+                    debug["duplicate_target_rejected"] += int((~unique_target_mask).sum().item())
+                    source_coords = source_coords[unique_target_mask]
+                    target_coords = target_coords[unique_target_mask]
+
+                if target_coords.numel() > 0:
+                    source_unique = torch.unique(source_coords, dim=0, sorted=True)
+                    target_unique = torch.unique(target_coords, dim=0, sorted=True)
+                    current = self._remove_voxel_coords(current, source_unique)
+                    current = self._append_unique_voxel_coords(current, target_unique)
+                    debug["move_count"] = int(target_unique.shape[0])
+
+        current = torch.unique(current, dim=0, sorted=True) if current.numel() > 0 else current
+        debug["final_count"] = int(current.shape[0])
+        weights = torch.ones((1, int(current.shape[0])), device=current.device, dtype=torch.float32)
+        return current.transpose(0, 1).contiguous(), weights, debug
+
+    def _pad_voxel_edit_state(self, coords_list, weights_list, device, dtype):
+        """
+        batchごとに長さが違うfinal voxel coordsを[B, 3, M]へpaddingする。
+        final_voxel_valid_maskも同時に返す。
+        """
+        batch_size = len(coords_list)
+        max_count = max([int(coords.shape[-1]) for coords in coords_list] or [0])
+
+        if max_count <= 0:
+            coords = torch.empty((batch_size, 3, 0), device=device, dtype=torch.long)
+            weights = torch.empty((batch_size, 1, 0), device=device, dtype=dtype)
+            valid_mask = torch.empty((batch_size, 0), device=device, dtype=torch.bool)
+            return coords, weights, valid_mask
+
+        padded_coords = torch.zeros((batch_size, 3, max_count), device=device, dtype=torch.long)
+        padded_weights = torch.zeros((batch_size, 1, max_count), device=device, dtype=dtype)
+        valid_mask = torch.zeros((batch_size, max_count), device=device, dtype=torch.bool)
+
+        for b, coords_b in enumerate(coords_list):
+            count = int(coords_b.shape[-1])
+            if count <= 0:
+                continue
+            padded_coords[b, :, :count] = coords_b.to(device=device, dtype=torch.long)
+            padded_weights[b, :, :count] = weights_list[b].to(device=device, dtype=dtype)
+            valid_mask[b, :count] = True
+
+        return padded_coords, padded_weights, valid_mask
+
+    @staticmethod
+    def _apply_external_executable_plan(voxel_coords, executable_plan):
+        """K=1の確定planを再探索せず適用する唯一のActuator入口。"""
+        if executable_plan is None or int(executable_plan.operation_order.shape[1]) != 1:
+            raise ValueError("external executable planはK=1でなければならない")
+        selected_zero = torch.zeros(
+            (voxel_coords.shape[0],), device=voxel_coords.device, dtype=torch.long
+        )
+        return apply_selected_executable_plan(
+            voxel_coords, executable_plan, selected_zero
+        )
+
+    @classmethod
+    def _selected_voxels_absent_count(cls, before_coords, selected_mask, after_coords, after_mask):
+        if selected_mask.ndim == 3:
+            selected_mask = selected_mask.squeeze(1)
+        if after_mask.ndim == 3:
+            after_mask = after_mask.squeeze(1)
+        selected_mask = selected_mask.to(device=before_coords.device, dtype=torch.bool)
+        after_mask = after_mask.to(device=after_coords.device, dtype=torch.bool)
+        total = 0
+        for b in range(before_coords.shape[0]):
+            selected_coords = before_coords[b].transpose(0, 1).contiguous()[selected_mask[b]]
+            if selected_coords.numel() == 0:
+                continue
+            selected_coords = torch.unique(selected_coords, dim=0)
+            kept_after = after_coords[b].transpose(0, 1).contiguous()[after_mask[b]]
+            present = cls._coords_membership(selected_coords, kept_after)
+            total += int((~present).sum().item())
+        return total
+
+    def _neighbor_target_membership_mask(self, voxel_coords, reference_mask, voxel_cache=None):
+        B, _, N = voxel_coords.shape
+        offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
+        voxel_cache = self._build_voxel_cache(voxel_coords) if voxel_cache is None else voxel_cache
+        if reference_mask.ndim == 3:
+            reference_mask = reference_mask.squeeze(1)
+        reference_mask = reference_mask.to(device=voxel_coords.device, dtype=torch.bool)
+        masks = []
+        for b in range(B):
+            item = voxel_cache[b]
+            current = item["coords"]
+            reference = current[reference_mask[b]]
+            targets = current[:, None, :] + offsets.view(1, -1, 3)
+            if reference.numel() == 0:
+                masks.append(torch.zeros((N, offsets.shape[0]), device=voxel_coords.device, dtype=torch.bool))
+                continue
+            reference_keys = torch.sort(self._coord_keys(reference, item["key_mins"], item["key_spans"])).values
+            masks.append(
+                self._coords_membership_cached(
+                    targets.reshape(-1, 3),
+                    reference_keys,
+                    item["key_mins"],
+                    item["key_spans"],
+                ).view(N, -1)
+            )
+        return torch.stack(masks, dim=0)
+
+    @staticmethod
+    def _voxel_mean_logits(logits, voxel_coords, voxel_cache=None):
+        B, K, N = logits.shape
+        out = torch.empty_like(logits)
+        if voxel_cache is not None:
+            for b, item in enumerate(voxel_cache):
+                voxel_count = int(item["voxel_count"])
+                if voxel_count <= 0:
+                    out[b] = logits[b]
+                    continue
+                # canonical full-cloud入力は1点=1 occupied voxelである。
+                # この場合、Voxel平均は各点自身なのでscatter_add・除算・
+                # inverse復元を行っても値は変わらない。巨大な方向headでは
+                # この恒等処理が支配的になるため、厳密に同じTensorを返す。
+                if voxel_count == N:
+                    out[b] = logits[b]
+                    continue
+                inverse = item["inverse"]
+                index = inverse.view(1, N).expand(K, N)
+                sums = logits.new_zeros((K, voxel_count))
+                sums.scatter_add_(1, index, logits[b])
+                counts = item["counts"].to(device=logits.device, dtype=logits.dtype).clamp_min(1.0)
+                means = sums / counts.view(1, voxel_count)
+                out[b] = means.index_select(1, inverse)
+            return out
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if coords.numel() == 0:
+                out[b] = logits[b]
+                continue
+            _, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+            voxel_count = int(inverse.max().item()) + 1
+            index = inverse.view(1, N).expand(K, N)
+            sums = logits.new_zeros((K, voxel_count))
+            sums.scatter_add_(1, index, logits[b])
+            counts = torch.bincount(inverse, minlength=voxel_count).to(
+                device=logits.device,
+                dtype=logits.dtype,
+            ).clamp_min(1.0)
+            means = sums / counts.view(1, voxel_count)
+            out[b] = means.index_select(1, inverse)
+        return out
+
+    @staticmethod
+    def _first_unique_coord_mask(voxel_coords, eligible_mask=None):
+        B, _, N = voxel_coords.shape
+        unique_mask = torch.zeros((B, N), device=voxel_coords.device, dtype=torch.bool)
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if coords.numel() == 0:
+                continue
+
+            _, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+
+            idx = torch.arange(inverse.numel(), device=inverse.device, dtype=inverse.dtype)
+            if torch.is_tensor(eligible_mask):
+                eligible_b = eligible_mask[b].reshape(-1).to(
+                    device=inverse.device, dtype=torch.bool
+                )
+                if eligible_b.numel() != inverse.numel():
+                    raise ValueError("eligible_mask must match flattened voxel coordinates")
+                # 同じtargetでは有効pairを先に並べる。Prune済みsourceの無効pairが
+                # targetを予約し、有効な別sourceまで消す旧挙動を防ぐ。
+                invalid_rank = (~eligible_b).to(dtype=inverse.dtype)
+                sort_key = (
+                    inverse * (2 * inverse.numel())
+                    + invalid_rank * inverse.numel()
+                    + idx
+                )
+            else:
+                eligible_b = None
+                sort_key = inverse * inverse.numel() + idx
+            order = torch.argsort(sort_key)
+
+            sorted_inverse = inverse.index_select(0, order)
+            first = torch.ones_like(sorted_inverse, dtype=torch.bool)
+            if sorted_inverse.numel() > 1:
+                first[1:] = sorted_inverse[1:] != sorted_inverse[:-1]
+            selected = order[first]
+            if eligible_b is not None:
+                selected = selected[eligible_b.index_select(0, selected)]
+            unique_mask[b, selected] = True
+
+        return unique_mask
+
+    def _hard_voxel_drop_mask(
+        self,
+        voxel_coords,
+        drop_scores,
+        target_drop_ratio,
+        max_drop_ratio,
+        selection_mask,
+        hard_threshold=0.0,
+        voxel_cache=None,
+        force_min_count=False,
+        max_hard_count=0,
+        min_hard_count=0,
+        allow_single_candidate=False,
+        skip_hard_selection=False,
+    ):
+        B, _, N = drop_scores.shape
+        hard_drop = torch.zeros_like(drop_scores, dtype=torch.bool)
+        hard_drop_trace = {
+            "where_mode": "block_only",
+            "effective_where_mode": "block_only",
+            "macro_micro_hybrid_fallback": False,
+            "macro_disabled_reason": "",
+            "macro_ratio": 0.0,
+            "micro_ratio": 0.0,
+            "macro_selected_block_count": 0.0,
+            "macro_drop_count": 0.0,
+            "micro_drop_count": 0.0,
+            "selected_block_count": 0.0,
+            "micro_selected_block_count": 0.0,
+            "max_drop_count_per_block": 0.0,
+            "mean_drop_count_per_selected_block": 0.0,
+            "drop_concentration_top1_block_ratio": 0.0,
+            "drop_concentration_top5_block_ratio": 0.0,
+            "hard_where_uses_network_score": False,
+            "heuristic_where_score_mean": 0.0,
+            "heuristic_where_score_std": 0.0,
+            "micro_quota_hit_block_count": 0.0,
+            "micro_min_selected_blocks": 0.0,
+            "micro_candidate_block_count": 0.0,
+            "micro_min_blocks_satisfied": False,
+            "micro_min_blocks_fallback_reason": "",
+            "voxel_count": 0.0,
+            "pre_round_target_count": 0.0,
+            "post_round_target_count": 0.0,
+            "min_count_floor_applied": False,
+            "hard_mask_count": 0.0,
+            "candidate_count": 0.0,
+            "final_hard_drop_count": 0.0,
+        }
+        threshold_cap_mode = self._threshold_cap_mode()
+        network_floor_mode = bool(self.training and self._prune_after_prior_mode() == "network")
+        min_hard_count = max(int(min_hard_count), 0)
+        if bool(skip_hard_selection) or N <= 0 or float(max_drop_ratio) <= 0.0 or (not threshold_cap_mode and float(target_drop_ratio) <= 0.0):
+            try:
+                setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
+            except Exception:
+                pass
+            return hard_drop
+        if selection_mask is None:
+            valid_all = torch.ones((B, N), device=drop_scores.device, dtype=torch.bool)
+        else:
+            valid_all = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            valid_all = valid_all.to(device=drop_scores.device, dtype=torch.bool)
+        voxel_cache = self._build_voxel_cache(voxel_coords) if voxel_cache is None else voxel_cache
+        for b in range(B):
+            valid = valid_all[b]
+            if not bool(valid.any().item()):
+                continue
+            item = voxel_cache[b]
+            inverse_all = item["inverse"]
+            voxel_count_all = int(item["voxel_count"])
+            if voxel_count_all <= 1:
+                continue
+            score_values = drop_scores[b, 0].detach()
+            finite_valid = valid & torch.isfinite(score_values)
+            if not bool(finite_valid.any().item()):
+                continue
+            score_floor = torch.finfo(score_values.dtype).min
+            invalid_threshold = score_floor * 0.5
+            voxel_scores = score_values.new_full((voxel_count_all,), score_floor)
+            scatter_reduce = getattr(voxel_scores, "scatter_reduce_", None)
+            masked_scores = score_values.masked_fill(~finite_valid, score_floor)
+            if callable(scatter_reduce):
+                voxel_scores.scatter_reduce_(0, inverse_all, masked_scores, reduce="amax", include_self=True)
+                valid_voxels = voxel_scores > invalid_threshold
+                voxel_count = int(valid_voxels.sum().item())
+            else:
+                valid_inverse = inverse_all[finite_valid]
+                valid_scores = score_values[finite_valid]
+                voxel_count = int(torch.unique(valid_inverse, sorted=False).numel())
+            if voxel_count <= 1 and not bool(allow_single_candidate):
+                continue
+            hard_drop_trace["voxel_count"] += float(voxel_count)
+            pre_round_target_count = float(target_drop_ratio) * float(voxel_count)
+            floor_applied = False
+            reserve = 0 if bool(allow_single_candidate) else 1
+            available_count = max(voxel_count - reserve, 0)
+            if threshold_cap_mode:
+                cap_count = int(math.ceil(float(max_drop_ratio) * float(voxel_count)))
+                drop_count = min(max(cap_count, 0), available_count)
+                post_round_target_count = int(cap_count)
+            else:
+                cap_count = int(round(float(max_drop_ratio) * float(voxel_count)))
+                target_count = int(round(float(target_drop_ratio) * float(voxel_count)))
+                if (force_min_count or bool(allow_single_candidate)) and target_drop_ratio > 0.0:
+                    target_count = max(target_count, 1)
+                if (force_min_count or bool(allow_single_candidate)) and max_drop_ratio > 0.0:
+                    cap_count = max(cap_count, 1)
+                if network_floor_mode:
+                    if target_drop_ratio > 0.0 and target_count <= 0 and voxel_count > 0:
+                        target_count = 1
+                        floor_applied = True
+                    if max_drop_ratio > 0.0 and cap_count <= 0 and voxel_count > 0:
+                        cap_count = 1
+                        floor_applied = True
+                drop_count = min(target_count, cap_count, available_count)
+                if network_floor_mode and target_drop_ratio > 0.0 and drop_count <= 0 and available_count > 0:
+                    drop_count = 1
+                    floor_applied = True
+                post_round_target_count = int(target_count)
+            if network_floor_mode and min_hard_count > 0 and available_count > 0 and (target_drop_ratio > 0.0 or max_drop_ratio > 0.0):
+                floored_drop_count = min(max(int(drop_count), min_hard_count), available_count)
+                if floored_drop_count != int(drop_count):
+                    floor_applied = True
+                drop_count = floored_drop_count
+            if floor_applied:
+                hard_drop_trace["min_count_floor_applied"] = True
+            hard_drop_trace["pre_round_target_count"] += float(pre_round_target_count)
+            hard_drop_trace["post_round_target_count"] += float(post_round_target_count)
+            if int(max_hard_count) > 0:
+                drop_count = min(drop_count, int(max_hard_count))
+            if drop_count <= 0:
+                continue
+            if callable(scatter_reduce):
+                candidate_scores = voxel_scores.masked_fill(~valid_voxels, score_floor)
+                selected_voxel_idx = torch.topk(
+                    candidate_scores,
+                    k=min(int(drop_count), int(voxel_count)),
+                    largest=True,
+                    sorted=False,
+                ).indices
+                if threshold_cap_mode and not network_floor_mode:
+                    selected_scores = voxel_scores.index_select(0, selected_voxel_idx)
+                    selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
+                    if selected_voxel_idx.numel() <= 0:
+                        continue
+            else:
+                selected_voxel_idx, selected_scores = self._top_unique_voxels_from_point_scores(
+                    valid_scores,
+                    valid_inverse,
+                    drop_count,
+                )
+                if threshold_cap_mode and not network_floor_mode:
+                    selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
+                    if selected_voxel_idx.numel() <= 0:
+                        continue
+            selected_points = self._isin_voxel_ids(inverse_all, selected_voxel_idx)
+            hard_drop[b, 0] = selected_points
+            hard_drop_trace["hard_mask_count"] += float(selected_points.sum().item())
+            hard_drop_trace["candidate_count"] += float(voxel_count)
+        hard_drop_trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
+        try:
+            setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
+        except Exception:
+            pass
+        return hard_drop
+
+    @staticmethod
+    def _codec_prune_block_prior(voxel_coords, block_size):
+        """Rank points by sparse coarse-block occupancy without fixing the action."""
+        batch_size, _, point_count = voxel_coords.shape
+        prior = torch.zeros(
+            (batch_size, 1, point_count),
+            device=voxel_coords.device,
+            dtype=torch.float32,
+        )
+        block_counts = []
+        for batch_idx in range(batch_size):
+            coords = voxel_coords[batch_idx].transpose(0, 1).contiguous().to(dtype=torch.long)
+            if coords.numel() <= 0:
+                block_counts.append(0)
+                continue
+            blocks = torch.div(coords, int(block_size), rounding_mode="floor")
+            unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
+            counts = torch.bincount(inverse, minlength=int(unique_blocks.shape[0])).float()
+            order = torch.argsort(counts, descending=False)
+            rank = torch.empty_like(counts)
+            if int(order.numel()) > 1:
+                rank_values = torch.linspace(1.0, 0.0, int(order.numel()), device=counts.device)
+                rank[order] = rank_values
+            else:
+                rank.fill_(1.0)
+            prior[batch_idx, 0] = rank.index_select(0, inverse)
+            block_counts.append(int(unique_blocks.shape[0]))
+        return prior, block_counts
+
+    def _hard_codec_block_drop_mask(
+        self,
+        voxel_coords,
+        point_scores,
+        *,
+        block_size,
+        target_drop_ratio,
+        selection_mask=None,
+        max_hard_count=0,
+        min_hard_count=0,
+    ):
+        """Select complete coarse blocks without exceeding the point budget."""
+        batch_size, _, point_count = voxel_coords.shape
+        hard_drop = torch.zeros(
+            (batch_size, 1, point_count),
+            device=voxel_coords.device,
+            dtype=torch.bool,
+        )
+        hard_drop_trace = {
+            "where_mode": "block_only",
+            "effective_where_mode": "block_only",
+            "macro_micro_hybrid_fallback": False,
+            "macro_disabled_reason": "",
+            "macro_ratio": 0.0,
+            "micro_ratio": 0.0,
+            "macro_selected_block_count": 0.0,
+            "macro_drop_count": 0.0,
+            "micro_drop_count": 0.0,
+            "selected_block_count": 0.0,
+            "micro_selected_block_count": 0.0,
+            "max_drop_count_per_block": 0.0,
+            "mean_drop_count_per_selected_block": 0.0,
+            "drop_concentration_top1_block_ratio": 0.0,
+            "drop_concentration_top5_block_ratio": 0.0,
+            "hard_where_uses_network_score": False,
+            "heuristic_where_score_mean": 0.0,
+            "heuristic_where_score_std": 0.0,
+            "micro_quota_hit_block_count": 0.0,
+            "micro_min_selected_blocks": 0.0,
+            "micro_candidate_block_count": 0.0,
+            "micro_min_blocks_satisfied": False,
+            "micro_min_blocks_fallback_reason": "",
+            "voxel_count": 0.0,
+            "pre_round_target_count": 0.0,
+            "post_round_target_count": 0.0,
+            "min_count_floor_applied": False,
+            "hard_mask_count": 0.0,
+            "candidate_count": 0.0,
+            "final_hard_drop_count": 0.0,
+            "codec_block_valid_point_count": 0.0,
+            "codec_block_budget_points": 0.0,
+            "codec_block_count": 0.0,
+            "codec_block_selected_block_count": 0.0,
+            "codec_block_selected_point_count": 0.0,
+            "codec_block_budget_zero": False,
+            "codec_block_target_drop_ratio": float(target_drop_ratio),
+            "codec_block_under_selected": False,
+        }
+        ratio = min(max(float(target_drop_ratio), 0.0), 1.0)
+        if ratio <= 0.0 or point_count <= 0:
+            try:
+                setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
+            except Exception:
+                pass
+            return hard_drop
+        if selection_mask is None:
+            selection = torch.ones(
+                (batch_size, point_count),
+                device=voxel_coords.device,
+                dtype=torch.bool,
+            )
+        else:
+            selection = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            selection = selection.to(device=voxel_coords.device, dtype=torch.bool)
+
+        for batch_idx in range(batch_size):
+            valid_idx = selection[batch_idx].nonzero(as_tuple=False).reshape(-1)
+            valid_count = int(valid_idx.numel())
+            if valid_count <= 0:
+                continue
+            hard_drop_trace["codec_block_valid_point_count"] += float(valid_count)
+            budget = int(math.floor(float(valid_count) * ratio))
+            if int(max_hard_count) > 0:
+                budget = min(budget, int(max_hard_count))
+            coords = voxel_coords[batch_idx].index_select(1, valid_idx).transpose(0, 1).contiguous().long()
+            blocks = torch.div(coords, int(block_size), rounding_mode="floor")
+            unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
+            block_count = int(unique_blocks.shape[0])
+            hard_drop_trace["voxel_count"] += float(valid_count)
+            hard_drop_trace["pre_round_target_count"] += float(ratio * float(valid_count))
+            hard_drop_trace["post_round_target_count"] += float(max(budget, 0))
+            hard_drop_trace["codec_block_budget_points"] += float(max(budget, 0))
+            hard_drop_trace["codec_block_count"] += float(block_count)
+            hard_drop_trace["candidate_count"] += float(block_count)
+            if budget <= 0:
+                hard_drop_trace["codec_block_budget_zero"] = True
+            counts = torch.bincount(inverse, minlength=block_count).long()
+            scores = point_scores[batch_idx, 0].index_select(0, valid_idx).detach().float()
+            score_sum = torch.zeros((block_count,), device=scores.device, dtype=scores.dtype)
+            score_sum.scatter_add_(0, inverse, scores)
+            block_scores = score_sum / counts.to(dtype=scores.dtype).clamp_min(1.0)
+            if block_scores.numel() > 0:
+                hard_drop_trace["heuristic_where_score_mean"] += float(block_scores.mean().item())
+                hard_drop_trace["heuristic_where_score_std"] += float(block_scores.std(unbiased=False).item())
+            order = torch.argsort(block_scores, descending=True)
+            cumulative = torch.cumsum(counts.index_select(0, order), dim=0)
+            take = int((cumulative <= int(max(budget, 0))).sum().item())
+            if take <= 0 and int(min_hard_count) > 0 and block_count > 0:
+                take = min(max(int(min_hard_count), 1), block_count)
+                hard_drop_trace["min_count_floor_applied"] = True
+            if take <= 0:
+                continue
+            selected_blocks = torch.zeros((block_count,), device=coords.device, dtype=torch.bool)
+            selected_blocks[order[:take]] = True
+            selected_local = selected_blocks.index_select(0, inverse)
+            selected_points = valid_idx[selected_local]
+            hard_drop[batch_idx, 0, selected_points] = True
+            selected_block_count = int(take)
+            selected_point_count = int(selected_points.numel())
+            if budget > 0 and selected_point_count < min(valid_count, budget):
+                hard_drop_trace["codec_block_under_selected"] = True
+            hard_drop_trace["hard_mask_count"] += float(selected_points.numel())
+            hard_drop_trace["codec_block_selected_block_count"] += float(selected_block_count)
+            hard_drop_trace["codec_block_selected_point_count"] += float(selected_point_count)
+        hard_drop_trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
+        selected_block_drop_counts = []
+        for batch_idx in range(batch_size):
+            selected_idx = hard_drop[batch_idx, 0].nonzero(as_tuple=False).reshape(-1)
+            if selected_idx.numel() <= 0:
+                continue
+            selected_coords = voxel_coords[batch_idx].index_select(1, selected_idx).transpose(0, 1).contiguous().long()
+            selected_blocks = torch.div(selected_coords, int(block_size), rounding_mode="floor")
+            _, selected_inverse = torch.unique(selected_blocks, dim=0, sorted=True, return_inverse=True)
+            block_drop_counts = torch.bincount(selected_inverse).detach().cpu().tolist()
+            selected_block_drop_counts.extend(int(v) for v in block_drop_counts)
+        selected_block_count = len(selected_block_drop_counts)
+        hard_drop_trace["selected_block_count"] = float(selected_block_count)
+        if selected_block_count > 0:
+            selected_block_drop_counts.sort(reverse=True)
+            total_drop = max(float(sum(selected_block_drop_counts)), 1.0)
+            hard_drop_trace["max_drop_count_per_block"] = float(selected_block_drop_counts[0])
+            hard_drop_trace["mean_drop_count_per_selected_block"] = (
+                float(sum(selected_block_drop_counts)) / float(selected_block_count)
+            )
+            hard_drop_trace["drop_concentration_top1_block_ratio"] = float(selected_block_drop_counts[0]) / total_drop
+            hard_drop_trace["drop_concentration_top5_block_ratio"] = (
+                float(sum(selected_block_drop_counts[:5])) / total_drop
+            )
+        try:
+            setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
+        except Exception:
+            pass
+        return hard_drop
+
+    def _full_cloud_amount_action_temperature(self):
+        base_temp = min(
+            max(float(getattr(self.args, "sparsepcgc_full_cloud_amount_exploration_temperature", 1.0)), 0.05),
+            10.0,
+        )
+        min_temp = min(
+            max(float(getattr(self.args, "sparsepcgc_full_cloud_amount_min_temperature", 0.3)), 0.01),
+            base_temp,
+        )
+        decay_steps = max(
+            int(getattr(self.args, "sparsepcgc_full_cloud_amount_temperature_decay_steps", 3000)),
+            0,
+        )
+        if decay_steps <= 0:
+            return float(min_temp)
+        step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        phase = max(0.0, 1.0 - float(step) / float(max(decay_steps, 1)))
+        return float(min_temp + (base_temp - min_temp) * phase)
+
+    def _sample_full_cloud_amount_action(self, logits):
+        logits = logits.float()
+        batch_size, class_count = int(logits.shape[0]), int(logits.shape[1])
+        temperature = max(float(self._full_cloud_amount_action_temperature()), 1e-6)
+        learning_mode = str(
+            getattr(self.args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")
+        ).strip().lower()
+        sample_mode = str(
+            getattr(self.args, "sparsepcgc_full_cloud_amount_action_sample_mode", "categorical")
+        ).strip().lower()
+        if learning_mode != "network_selected_bandit":
+            sample_mode = "argmax"
+        scaled_logits = logits / float(temperature)
+        if sample_mode == "argmax" or (not self.training):
+            selected_class = torch.argmax(scaled_logits.detach(), dim=1)
+        elif sample_mode == "gumbel":
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(scaled_logits).clamp_min(1e-8)).clamp_min(1e-8))
+            selected_class = torch.argmax((scaled_logits + gumbel_noise).detach(), dim=1)
+        else:
+            selected_class = torch.distributions.Categorical(logits=scaled_logits.detach()).sample()
+        selected_class = selected_class.clamp(0, max(class_count - 1, 0))
+        log_probs = torch.log_softmax(scaled_logits, dim=1)
+        probs = torch.softmax(scaled_logits, dim=1)
+        selected_prob = probs.gather(1, selected_class.view(-1, 1)).squeeze(1)
+        selected_log_prob = log_probs.gather(1, selected_class.view(-1, 1)).squeeze(1)
+        entropy = -(probs * log_probs).sum(dim=1)
+        return {
+            "selected_class": selected_class,
+            "scaled_logits": scaled_logits,
+            "selected_prob": selected_prob,
+            "selected_log_prob": selected_log_prob,
+            "entropy": entropy,
+            "temperature": float(temperature),
+            "sample_mode": str(sample_mode),
+        }
+
+    @staticmethod
+    def build_codec_block_drop_ranking(
+        voxel_coords,
+        point_scores,
+        *,
+        block_size,
+        selection_mask=None,
+    ):
+        batch_size, _, point_count = voxel_coords.shape
+        if selection_mask is None:
+            selection = torch.ones(
+                (batch_size, point_count),
+                device=voxel_coords.device,
+                dtype=torch.bool,
+            )
+        else:
+            selection = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            selection = selection.to(device=voxel_coords.device, dtype=torch.bool)
+
+        batches = []
+        trace_base = {
+            "where_mode": "block_only",
+            "effective_where_mode": "block_only",
+            "macro_micro_hybrid_fallback": False,
+            "macro_disabled_reason": "",
+            "macro_ratio": 0.0,
+            "micro_ratio": 0.0,
+            "macro_selected_block_count": 0.0,
+            "macro_drop_count": 0.0,
+            "micro_drop_count": 0.0,
+            "selected_block_count": 0.0,
+            "micro_selected_block_count": 0.0,
+            "max_drop_count_per_block": 0.0,
+            "mean_drop_count_per_selected_block": 0.0,
+            "drop_concentration_top1_block_ratio": 0.0,
+            "drop_concentration_top5_block_ratio": 0.0,
+            "hard_where_uses_network_score": False,
+            "heuristic_where_score_mean": 0.0,
+            "heuristic_where_score_std": 0.0,
+            "micro_quota_hit_block_count": 0.0,
+            "micro_min_selected_blocks": 0.0,
+            "micro_candidate_block_count": 0.0,
+            "micro_min_blocks_satisfied": False,
+            "micro_min_blocks_fallback_reason": "",
+            "codec_block_valid_point_count": 0.0,
+            "codec_block_count": 0.0,
+            "codec_block_target_drop_ratio": 0.0,
+            "codec_block_selected_block_count": 0.0,
+            "codec_block_selected_point_count": 0.0,
+            "codec_block_budget_points": 0.0,
+            "codec_block_budget_zero": False,
+            "codec_block_under_selected": False,
+        }
+        for batch_idx in range(batch_size):
+            valid_idx = selection[batch_idx].nonzero(as_tuple=False).reshape(-1)
+            valid_count = int(valid_idx.numel())
+            batch_state = {
+                "valid_idx": valid_idx,
+                "valid_count": int(valid_count),
+                "point_count": int(point_count),
+                "counts": None,
+                "order": None,
+                "inverse": None,
+                "block_scores": None,
+                "block_count": 0,
+            }
+            if valid_count > 0:
+                coords = voxel_coords[batch_idx].index_select(1, valid_idx).transpose(0, 1).contiguous().long()
+                blocks = torch.div(coords, int(block_size), rounding_mode="floor")
+                unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
+                block_count = int(unique_blocks.shape[0])
+                counts = torch.bincount(inverse, minlength=block_count).long()
+                scores = point_scores[batch_idx, 0].index_select(0, valid_idx).detach().float()
+                score_sum = torch.zeros((block_count,), device=scores.device, dtype=scores.dtype)
+                score_sum.scatter_add_(0, inverse, scores)
+                block_scores = score_sum / counts.to(dtype=scores.dtype).clamp_min(1.0)
+                order = torch.argsort(block_scores, descending=True)
+                batch_state.update(
+                    {
+                        "counts": counts,
+                        "order": order,
+                        "inverse": inverse,
+                        "block_scores": block_scores,
+                        "block_count": int(block_count),
+                    }
+                )
+                trace_base["codec_block_valid_point_count"] += float(valid_count)
+                trace_base["codec_block_count"] += float(block_count)
+                if block_scores.numel() > 0:
+                    trace_base["heuristic_where_score_mean"] += float(block_scores.mean().item())
+                    trace_base["heuristic_where_score_std"] += float(block_scores.std(unbiased=False).item())
+            batches.append(batch_state)
+        return {
+            "block_size": int(block_size),
+            "point_count": int(point_count),
+            "batch_size": int(batch_size),
+            "voxel_coords": voxel_coords,
+            "batches": batches,
+            "trace_base": trace_base,
+        }
+
+    @staticmethod
+    def mask_from_codec_block_ranking(
+        ranking_state,
+        *,
+        target_drop_ratio,
+        max_hard_count=0,
+        min_hard_count=0,
+    ):
+        if not isinstance(ranking_state, dict):
+            raise ValueError("ranking_state must be a dict returned by build_codec_block_drop_ranking().")
+        batch_size = int(ranking_state.get("batch_size", 0))
+        point_count = int(ranking_state.get("point_count", 0))
+        device = None
+        for batch_state in ranking_state.get("batches", []):
+            valid_idx = batch_state.get("valid_idx", None)
+            if torch.is_tensor(valid_idx):
+                device = valid_idx.device
+                break
+        if device is None:
+            device = torch.device("cpu")
+        hard_drop = torch.zeros((batch_size, 1, point_count), device=device, dtype=torch.bool)
+        ratio = min(max(float(target_drop_ratio), 0.0), 1.0)
+        trace = dict(ranking_state.get("trace_base", {}) or {})
+        trace.update(
+            {
+                "voxel_count": 0.0,
+                "pre_round_target_count": 0.0,
+                "post_round_target_count": 0.0,
+                "min_count_floor_applied": False,
+                "hard_mask_count": 0.0,
+                "candidate_count": 0.0,
+                "final_hard_drop_count": 0.0,
+                "codec_block_budget_points": 0.0,
+                "codec_block_selected_block_count": 0.0,
+                "codec_block_selected_point_count": 0.0,
+                "codec_block_budget_zero": False,
+                "codec_block_target_drop_ratio": float(ratio),
+                "codec_block_under_selected": False,
+            }
+        )
+        if ratio <= 0.0 or point_count <= 0:
+            return hard_drop, trace
+
+        for batch_idx, batch_state in enumerate(ranking_state.get("batches", [])):
+            valid_idx = batch_state.get("valid_idx", None)
+            counts = batch_state.get("counts", None)
+            order = batch_state.get("order", None)
+            inverse = batch_state.get("inverse", None)
+            valid_count = int(batch_state.get("valid_count", 0))
+            block_count = int(batch_state.get("block_count", 0))
+            if (
+                not torch.is_tensor(valid_idx)
+                or not torch.is_tensor(counts)
+                or not torch.is_tensor(order)
+                or not torch.is_tensor(inverse)
+                or valid_count <= 0
+                or block_count <= 0
+            ):
+                continue
+            budget = int(math.floor(float(valid_count) * ratio))
+            if int(max_hard_count) > 0:
+                budget = min(budget, int(max_hard_count))
+            trace["voxel_count"] += float(valid_count)
+            trace["pre_round_target_count"] += float(ratio * float(valid_count))
+            trace["post_round_target_count"] += float(max(budget, 0))
+            trace["codec_block_budget_points"] += float(max(budget, 0))
+            trace["candidate_count"] += float(block_count)
+            if budget <= 0:
+                trace["codec_block_budget_zero"] = True
+            cumulative = torch.cumsum(counts.index_select(0, order), dim=0)
+            take = int((cumulative <= int(max(budget, 0))).sum().item())
+            if take <= 0 and int(min_hard_count) > 0 and block_count > 0:
+                take = min(max(int(min_hard_count), 1), block_count)
+                trace["min_count_floor_applied"] = True
+            if take <= 0:
+                continue
+            selected_blocks = torch.zeros((block_count,), device=valid_idx.device, dtype=torch.bool)
+            selected_blocks[order[:take]] = True
+            selected_local = selected_blocks.index_select(0, inverse)
+            selected_points = valid_idx[selected_local]
+            hard_drop[batch_idx, 0, selected_points] = True
+            selected_point_count = int(selected_points.numel())
+            if budget > 0 and selected_point_count < min(valid_count, budget):
+                trace["codec_block_under_selected"] = True
+            trace["hard_mask_count"] += float(selected_point_count)
+            trace["codec_block_selected_block_count"] += float(take)
+            trace["codec_block_selected_point_count"] += float(selected_point_count)
+        trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
+        selected_block_drop_counts = []
+        block_size = max(int(ranking_state.get("block_size", 1)), 1)
+        voxel_coords = ranking_state.get("voxel_coords", None)
+        if torch.is_tensor(voxel_coords):
+            for batch_idx in range(batch_size):
+                selected_idx = hard_drop[batch_idx, 0].nonzero(as_tuple=False).reshape(-1)
+                if selected_idx.numel() <= 0:
+                    continue
+                selected_coords = voxel_coords[batch_idx].index_select(1, selected_idx).transpose(0, 1).contiguous().long()
+                selected_blocks = torch.div(selected_coords, int(block_size), rounding_mode="floor")
+                _, selected_inverse = torch.unique(selected_blocks, dim=0, sorted=True, return_inverse=True)
+                block_drop_counts = torch.bincount(selected_inverse).detach().cpu().tolist()
+                selected_block_drop_counts.extend(int(v) for v in block_drop_counts)
+        selected_block_count = len(selected_block_drop_counts)
+        trace["selected_block_count"] = float(selected_block_count)
+        if selected_block_count > 0:
+            selected_block_drop_counts.sort(reverse=True)
+            total_drop = max(float(sum(selected_block_drop_counts)), 1.0)
+            trace["max_drop_count_per_block"] = float(selected_block_drop_counts[0])
+            trace["mean_drop_count_per_selected_block"] = (
+                float(sum(selected_block_drop_counts)) / float(selected_block_count)
+            )
+            trace["drop_concentration_top1_block_ratio"] = float(selected_block_drop_counts[0]) / total_drop
+            trace["drop_concentration_top5_block_ratio"] = (
+                float(sum(selected_block_drop_counts[:5])) / total_drop
+            )
+        return hard_drop, trace
+
+    def build_macro_micro_where_mask(
+        self,
+        voxel_coords,
+        total_drop_ratio,
+        codec_prune_prior_score,
+        *,
+        delete_prior=None,
+        selection_mask=None,
+        block_size=64,
+        args=None,
+        max_hard_count=0,
+        min_hard_count=0,
+    ):
+        """Full-cloud Where helper: limited macro block prune + scattered micro voxel prune."""
+        args = args if args is not None else self.args
+        batch_size, _, point_count = voxel_coords.shape
+        device = voxel_coords.device
+        hard_drop = torch.zeros((batch_size, 1, point_count), device=device, dtype=torch.bool)
+
+        where_mode = str(getattr(args, "sparsepcgc_where_mode", "block_only")).strip().lower()
+        hybrid_fallback = bool(where_mode == "macro_micro_hybrid")
+        effective_where_mode = "macro_micro_heuristic" if hybrid_fallback else where_mode
+        ratio = min(max(float(total_drop_ratio), 0.0), 1.0)
+        block_size = max(int(block_size), 1)
+        macro_share = min(max(float(getattr(args, "sparsepcgc_where_macro_share", 0.25)), 0.0), 1.0)
+        macro_max_ratio = min(max(float(getattr(args, "sparsepcgc_where_macro_max_ratio", 0.01)), 0.0), 1.0)
+        macro_max_blocks = max(int(getattr(args, "sparsepcgc_where_macro_max_blocks", 1)), 0)
+        macro_min_total_ratio = min(
+            max(float(getattr(args, "sparsepcgc_where_macro_min_total_ratio", 0.015)), 0.0),
+            1.0,
+        )
+        micro_exclude_macro = bool(getattr(args, "sparsepcgc_where_micro_exclude_macro_blocks", True))
+        micro_quota_fraction = min(
+            max(float(getattr(args, "sparsepcgc_where_micro_block_quota_fraction", 0.10)), 0.0),
+            1.0,
+        )
+        micro_round_robin = bool(getattr(args, "sparsepcgc_where_micro_round_robin", True))
+        micro_use_delete_prior = bool(getattr(args, "sparsepcgc_where_micro_use_delete_prior", True))
+        micro_min_selected_blocks = max(
+            int(getattr(args, "sparsepcgc_where_micro_min_selected_blocks", 8)),
+            1,
+        )
+
+        if selection_mask is None:
+            selection = torch.ones((batch_size, point_count), device=device, dtype=torch.bool)
+        else:
+            selection = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            selection = selection.to(device=device, dtype=torch.bool)
+
+        if torch.is_tensor(delete_prior) and micro_use_delete_prior:
+            micro_score_all = delete_prior.to(device=device, dtype=torch.float32)
+        else:
+            micro_score_all = codec_prune_prior_score.to(device=device, dtype=torch.float32)
+        if micro_score_all.ndim == 2:
+            micro_score_all = micro_score_all.unsqueeze(1)
+        micro_score_finite_all = torch.isfinite(micro_score_all)
+        micro_score_all = torch.nan_to_num(micro_score_all, nan=-1e9, posinf=1e9, neginf=-1e9)
+        codec_score_all = torch.nan_to_num(
+            codec_prune_prior_score.to(device=device, dtype=torch.float32),
+            nan=-1e9,
+            posinf=1e9,
+            neginf=-1e9,
+        )
+        if codec_score_all.ndim == 2:
+            codec_score_all = codec_score_all.unsqueeze(1)
+
+        macro_ratio = 0.0
+        macro_disabled_reason = "none"
+        if ratio < macro_min_total_ratio:
+            macro_disabled_reason = "ratio_below_min"
+        elif macro_max_blocks <= 0 or macro_share <= 0.0 or macro_max_ratio <= 0.0:
+            macro_disabled_reason = "macro_disabled_by_config"
+        else:
+            macro_ratio = min(float(ratio) * macro_share, macro_max_ratio, float(ratio))
+        micro_ratio = max(float(ratio) - float(macro_ratio), 0.0)
+
+        trace = {
+            "where_mode": effective_where_mode,
+            "where_mode_id": 1.0,
+            "macro_micro_hybrid_fallback": hybrid_fallback,
+            "macro_disabled_reason": macro_disabled_reason,
+            "macro_ratio": float(macro_ratio),
+            "micro_ratio": float(micro_ratio),
+            "macro_selected_block_count": 0.0,
+            "macro_drop_count": 0.0,
+            "micro_drop_count": 0.0,
+            "total_drop_count": 0.0,
+            "selected_block_count": 0.0,
+            "micro_selected_block_count": 0.0,
+            "max_drop_count_per_block": 0.0,
+            "mean_drop_count_per_selected_block": 0.0,
+            "drop_concentration_top1_block_ratio": 0.0,
+            "drop_concentration_top5_block_ratio": 0.0,
+            "hard_where_uses_network_score": False,
+            "heuristic_where_score_mean": 0.0,
+            "heuristic_where_score_std": 0.0,
+            "micro_quota_hit_block_count": 0.0,
+            "micro_min_selected_blocks": float(micro_min_selected_blocks),
+            "micro_candidate_block_count": 0.0,
+            "micro_min_blocks_satisfied": False,
+            "micro_min_blocks_fallback_reason": "",
+            "voxel_count": 0.0,
+            "pre_round_target_count": 0.0,
+            "post_round_target_count": 0.0,
+            "min_count_floor_applied": False,
+            "hard_mask_count": 0.0,
+            "candidate_count": 0.0,
+            "final_hard_drop_count": 0.0,
+            "codec_block_valid_point_count": 0.0,
+            "codec_block_budget_points": 0.0,
+            "codec_block_count": 0.0,
+            "codec_block_selected_block_count": 0.0,
+            "codec_block_selected_point_count": 0.0,
+            "codec_block_budget_zero": False,
+            "codec_block_target_drop_ratio": float(ratio),
+            "codec_block_under_selected": False,
+        }
+        selected_block_drop_counts = []
+        heuristic_score_values = []
+        if ratio <= 0.0 or point_count <= 0:
+            try:
+                setattr(self, "_last_hard_drop_count_trace", trace)
+            except Exception:
+                pass
+            return hard_drop, trace
+
+        for batch_idx in range(batch_size):
+            valid_idx = selection[batch_idx].nonzero(as_tuple=False).reshape(-1)
+            valid_count = int(valid_idx.numel())
+            if valid_count <= 0:
+                continue
+            total_budget = int(math.floor(float(valid_count) * ratio))
+            if int(max_hard_count) > 0:
+                total_budget = min(total_budget, int(max_hard_count))
+            if total_budget <= 0 and int(min_hard_count) > 0:
+                total_budget = min(valid_count, int(min_hard_count))
+                trace["min_count_floor_applied"] = True
+            total_budget = max(total_budget, 0)
+            trace["voxel_count"] += float(valid_count)
+            trace["pre_round_target_count"] += float(ratio * float(valid_count))
+            trace["post_round_target_count"] += float(total_budget)
+            trace["codec_block_valid_point_count"] += float(valid_count)
+            trace["codec_block_budget_points"] += float(total_budget)
+            if total_budget <= 0:
+                trace["codec_block_budget_zero"] = True
+                continue
+
+            coords = voxel_coords[batch_idx].index_select(1, valid_idx).transpose(0, 1).contiguous().long()
+            blocks = torch.div(coords, int(block_size), rounding_mode="floor")
+            unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
+            block_count = int(unique_blocks.shape[0])
+            if block_count <= 0:
+                continue
+            counts = torch.bincount(inverse, minlength=block_count).long()
+            codec_scores = codec_score_all[batch_idx, 0].index_select(0, valid_idx).detach().float()
+            codec_score_sum = torch.zeros((block_count,), device=device, dtype=codec_scores.dtype)
+            codec_score_sum.scatter_add_(0, inverse, codec_scores)
+            block_scores = codec_score_sum / counts.to(dtype=codec_scores.dtype).clamp_min(1.0)
+            order = torch.argsort(block_scores, descending=True)
+            trace["codec_block_count"] += float(block_count)
+            trace["candidate_count"] += float(block_count)
+
+            macro_drop_local = torch.zeros((valid_count,), device=device, dtype=torch.bool)
+            selected_macro_blocks = torch.zeros((block_count,), device=device, dtype=torch.bool)
+            macro_budget = min(int(math.floor(float(valid_count) * float(macro_ratio))), total_budget)
+            if int(max_hard_count) > 0:
+                macro_budget = min(macro_budget, int(max_hard_count), total_budget)
+            macro_take_points = 0
+            if macro_ratio > 0.0 and macro_budget > 0 and macro_max_blocks > 0:
+                selected_count = 0
+                for block_idx_tensor in order:
+                    if selected_count >= macro_max_blocks:
+                        break
+                    block_idx = int(block_idx_tensor.item())
+                    block_points = int(counts[block_idx].item())
+                    if block_points <= 0:
+                        continue
+                    if macro_take_points + block_points > macro_budget:
+                        if selected_count <= 0:
+                            macro_disabled_reason = "first_block_exceeds_budget"
+                        continue
+                    selected_macro_blocks[block_idx] = True
+                    macro_take_points += block_points
+                    selected_count += 1
+                if selected_count > 0:
+                    macro_drop_local = selected_macro_blocks.index_select(0, inverse)
+                    macro_points = valid_idx[macro_drop_local]
+                    hard_drop[batch_idx, 0, macro_points] = True
+                    trace["macro_selected_block_count"] += float(selected_count)
+                    trace["macro_drop_count"] += float(int(macro_points.numel()))
+                    trace["codec_block_selected_block_count"] += float(selected_count)
+                    trace["codec_block_selected_point_count"] += float(int(macro_points.numel()))
+
+            micro_budget = max(total_budget - int(macro_drop_local.sum().item()), 0)
+            if micro_budget <= 0:
+                continue
+            micro_scores = micro_score_all[batch_idx, 0].index_select(0, valid_idx).detach().float()
+            finite_score = micro_score_finite_all[batch_idx, 0].index_select(0, valid_idx).detach().bool()
+            micro_candidate_local = finite_score.clone()
+            if micro_exclude_macro and bool(selected_macro_blocks.any().item()):
+                micro_candidate_local = micro_candidate_local & (~selected_macro_blocks.index_select(0, inverse))
+            heuristic_score_values.append(micro_scores[micro_candidate_local].detach())
+
+            block_items = []
+            block_quota_hit = 0
+            for block_idx in range(block_count):
+                local_positions = (inverse == int(block_idx)).nonzero(as_tuple=False).reshape(-1)
+                if local_positions.numel() <= 0:
+                    continue
+                local_positions = local_positions[micro_candidate_local.index_select(0, local_positions)]
+                if local_positions.numel() <= 0:
+                    continue
+                block_voxel_count = int(counts[block_idx].item())
+                quota = max(1, int(math.ceil(float(block_voxel_count) * float(micro_quota_fraction))))
+                quota = min(quota, int(local_positions.numel()))
+                local_scores = micro_scores.index_select(0, local_positions)
+                local_order = torch.argsort(local_scores, descending=True)
+                limited = local_positions.index_select(0, local_order[:quota])
+                if int(local_positions.numel()) > quota:
+                    block_quota_hit += 1
+                top_score = (
+                    float(local_scores.index_select(0, local_order[:1]).detach().cpu().reshape(-1)[0].item())
+                    if local_scores.numel() > 0
+                    else -1e9
+                )
+                block_items.append((top_score, int(block_idx), limited))
+
+            if not block_items:
+                continue
+            block_items.sort(key=lambda item: item[0], reverse=True)
+            trace["micro_candidate_block_count"] += float(len(block_items))
+            desired_min_blocks = min(
+                max(int(micro_min_selected_blocks), 1),
+                int(micro_budget),
+                len(block_items),
+            )
+            micro_min_blocks_fallback_reason = ""
+            if len(block_items) < int(micro_min_selected_blocks):
+                micro_min_blocks_fallback_reason = "candidate_block_shortage"
+            elif int(micro_budget) < int(micro_min_selected_blocks):
+                micro_min_blocks_fallback_reason = "budget_shortage"
+            selected_local_positions = []
+            if micro_round_robin:
+                primary_items = block_items[:desired_min_blocks]
+                secondary_items = block_items[desired_min_blocks:]
+                depth = 0
+                while len(selected_local_positions) < micro_budget:
+                    added = False
+                    scan_items = primary_items if depth == 0 and primary_items else (primary_items + secondary_items)
+                    for _, _, limited in scan_items:
+                        if depth < int(limited.numel()):
+                            selected_local_positions.append(limited[depth])
+                            added = True
+                            if len(selected_local_positions) >= micro_budget:
+                                break
+                    if not added:
+                        break
+                    depth += 1
+            else:
+                flat_positions = torch.cat([item[2] for item in block_items], dim=0)
+                flat_scores = micro_scores.index_select(0, flat_positions)
+                flat_order = torch.argsort(flat_scores, descending=True)
+                take = min(int(micro_budget), int(flat_positions.numel()))
+                selected_local_positions = [
+                    pos for pos in flat_positions.index_select(0, flat_order[:take])
+                ]
+
+            if not selected_local_positions:
+                continue
+            selected_local = torch.stack(selected_local_positions).to(device=device, dtype=torch.long)
+            selected_global = valid_idx.index_select(0, selected_local)
+            hard_drop[batch_idx, 0, selected_global] = True
+            selected_micro_blocks = torch.unique(inverse.index_select(0, selected_local))
+            micro_drop_count = int(selected_global.numel())
+            trace["micro_drop_count"] += float(micro_drop_count)
+            trace["micro_selected_block_count"] += float(int(selected_micro_blocks.numel()))
+            trace["micro_quota_hit_block_count"] += float(block_quota_hit)
+            min_blocks_satisfied = bool(int(selected_micro_blocks.numel()) >= int(desired_min_blocks))
+            trace["micro_min_blocks_satisfied"] = bool(
+                bool(trace.get("micro_min_blocks_satisfied", False)) or min_blocks_satisfied
+            )
+            if not min_blocks_satisfied and not trace.get("micro_min_blocks_fallback_reason", ""):
+                trace["micro_min_blocks_fallback_reason"] = (
+                    micro_min_blocks_fallback_reason or "round_robin_exhausted"
+                )
+            elif min_blocks_satisfied and not trace.get("micro_min_blocks_fallback_reason", ""):
+                trace["micro_min_blocks_fallback_reason"] = micro_min_blocks_fallback_reason
+
+        final_mask = hard_drop.detach()
+        trace["final_hard_drop_count"] = float(final_mask.sum().item())
+        trace["total_drop_count"] = float(final_mask.sum().item())
+        trace["hard_mask_count"] = float(final_mask.sum().item())
+        for batch_idx in range(batch_size):
+            selected_idx = final_mask[batch_idx, 0].nonzero(as_tuple=False).reshape(-1)
+            if selected_idx.numel() <= 0:
+                continue
+            selected_coords = voxel_coords[batch_idx].index_select(1, selected_idx).transpose(0, 1).contiguous().long()
+            selected_blocks = torch.div(selected_coords, int(block_size), rounding_mode="floor")
+            _, selected_inverse = torch.unique(selected_blocks, dim=0, sorted=True, return_inverse=True)
+            block_drop_counts = torch.bincount(selected_inverse).detach().cpu().tolist()
+            selected_block_drop_counts.extend(int(v) for v in block_drop_counts)
+        selected_block_count = len(selected_block_drop_counts)
+        trace["selected_block_count"] = float(selected_block_count)
+        if selected_block_count > 0:
+            selected_block_drop_counts.sort(reverse=True)
+            total_drop = max(float(sum(selected_block_drop_counts)), 1.0)
+            trace["max_drop_count_per_block"] = float(selected_block_drop_counts[0])
+            trace["mean_drop_count_per_selected_block"] = float(sum(selected_block_drop_counts)) / float(selected_block_count)
+            trace["drop_concentration_top1_block_ratio"] = float(selected_block_drop_counts[0]) / total_drop
+            trace["drop_concentration_top5_block_ratio"] = float(sum(selected_block_drop_counts[:5])) / total_drop
+        score_value_chunks = [
+            v.reshape(-1).float().cpu()
+            for v in heuristic_score_values
+            if torch.is_tensor(v) and v.numel() > 0
+        ]
+        if score_value_chunks:
+            score_values = torch.cat(score_value_chunks, dim=0)
+            if score_values.numel() > 0:
+                trace["heuristic_where_score_mean"] = float(score_values.mean().item())
+                trace["heuristic_where_score_std"] = float(score_values.std(unbiased=False).item())
+        trace["macro_disabled_reason"] = macro_disabled_reason
+        trace["effective_where_mode"] = effective_where_mode
+        trace["codec_block_under_selected"] = bool(
+            trace["final_hard_drop_count"] < min(float(trace["post_round_target_count"]), float(trace["voxel_count"]))
+        )
+        try:
+            setattr(self, "_last_hard_drop_count_trace", trace)
+        except Exception:
+            pass
+        return hard_drop, trace
+
+    @staticmethod
+    def _priority_topk_gate(priority, target_ratio, tau):
+        B, _, N = priority.shape
+        if N <= 0:
+            return priority
+        keep = max(1, min(int(round(float(target_ratio) * float(N))), N))
+        flat = priority.detach().reshape(B, N)
+        threshold = torch.topk(flat, k=keep, dim=1, largest=True).values[:, -1].view(B, 1, 1)
+        return torch.sigmoid((priority - threshold) / max(float(tau), 1e-6))
+
+    @staticmethod
+    def network_only_topk_log_prob(base_logits, executed, temperature):
+        """Relative likelihood of the executed Gumbel-top-k subset.
+
+        This is the mean selected categorical log-probability (a compact
+        Plackett-Luce surrogate).  Unlike independent Bernoulli likelihoods,
+        it is invariant to a common logit shift and therefore trains ranking.
+        """
+        if base_logits.ndim == 2:
+            base_logits = base_logits.unsqueeze(1)
+        if executed.ndim == 2:
+            executed = executed.unsqueeze(1)
+        if base_logits.ndim != 3 or executed.ndim != 3:
+            raise ValueError("top-k log probability expects [B,N] or [B,C,N]")
+        base_logits = torch.nan_to_num(
+            base_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0
+        )
+        executed = executed.detach().to(device=base_logits.device, dtype=torch.bool)
+        if executed.shape != base_logits.shape:
+            executed = executed.reshape(base_logits.shape)
+        if not bool(executed.any().item()):
+            return base_logits.new_zeros(())
+        temperature = torch.as_tensor(
+            temperature, device=base_logits.device, dtype=base_logits.dtype
+        ).clamp_min(0.05)
+        scaled_logits = base_logits / temperature
+        selected_index = torch.nonzero(executed, as_tuple=False)
+        selected_logits = scaled_logits[
+            selected_index[:, 0], selected_index[:, 1], selected_index[:, 2]
+        ]
+        log_normalizer = torch.logsumexp(scaled_logits, dim=2)
+        selected_normalizer = log_normalizer[
+            selected_index[:, 0], selected_index[:, 1]
+        ]
+        # Avoid materialising/saving a full [B,operation,N] log-softmax only
+        # to index a few thousand executed points.
+        return (selected_logits - selected_normalizer).mean()
+
+    @staticmethod
+    def _masked_mean(values, point_mask):
+        if point_mask is None:
+            return values.mean()
+        if point_mask.ndim == 2:
+            point_mask = point_mask.unsqueeze(1)
+        if point_mask.ndim != 3 or point_mask.shape[0] != values.shape[0] or point_mask.shape[2] != values.shape[2]:
+            raise ValueError("point_mask must broadcast to [B, 1, N].")
+        mask = point_mask.to(device=values.device, dtype=values.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        return (values * mask).sum() / denom
+
+    def _numeric_floor(self, values, arg_name="repair_soft_normalizer_floor", default=1e-4):
+        # AMP fp16では1e-12が0へ丸まり、0 * inf のNaN勾配を作りやすい。
+        floor = max(float(getattr(self.args, arg_name, default)), 0.0)
+        if torch.is_tensor(values) and values.is_floating_point():
+            if values.dtype in (torch.float16, torch.bfloat16):
+                floor = max(floor, 1e-4)
+            else:
+                floor = max(floor, float(torch.finfo(values.dtype).tiny))
+        return floor
+
+    def _safe_budget_scale(self, raw_sum_detached, budget, arg_name="repair_soft_normalizer_floor", default=1e-4):
+        # raw_sumが0/極小のときに budget / raw_sum がinfにならないよう、scale自体を0へ落とす。
+        # 操作量headへの勾配は直接量損失で残すため、ここでは非有限勾配を作らないことを優先する。
+        floor = self._numeric_floor(raw_sum_detached, arg_name=arg_name, default=default)
+        raw_sum = torch.nan_to_num(
+            raw_sum_detached.detach(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        clean_budget = torch.nan_to_num(
+            budget,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        safe_sum = raw_sum.clamp_min(floor)
+        scale = torch.where(raw_sum > floor, clean_budget / safe_sum, torch.zeros_like(clean_budget))
+        return torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _exploration_phase(self):
+        if not bool(getattr(self, "training", False)):
+            return 1.0
+        fraction = min(max(float(getattr(self.args, "repair_exploration_fraction", 0.0)), 0.0), 1.0)
+        if fraction <= 0.0:
+            return 1.0
+        # 実訓練長と探索horizonは別の概念である。明示的に旧固定
+        # horizonを指定したablationだけそれを使い、通常は実訓練長に追従する。
+        total_steps = max(int(getattr(
+            self.args,
+            "_exploration_schedule_steps_estimate",
+            getattr(self.args, "_total_train_steps_estimate", 0),
+        )), 1)
+        step = min(max(int(getattr(self.args, "_global_train_step", 0)), 0), total_steps)
+        progress = min(float(step) / float(max(total_steps, 1)), 1.0)
+        return smooth_exploration_phase(
+            progress,
+            fraction,
+            getattr(self.args, "repair_exploration_smooth_tail_fraction", 0.25),
+            getattr(self.args, "repair_exploration_plateau_fraction", 0.40),
+        )
+
+    def _behavior_exploration_phase(self):
+        """Phase used by every stochastic component of the executed policy."""
+        annealed_phase = self._exploration_phase()
+        exact_online = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        schedule_mode = str(getattr(
+            self.args, "repair_policy_exploration_mode", "annealed"
+        )).strip().lower()
+        if exact_online and schedule_mode == "constant":
+            multiplier = policy_exploration_multiplier(
+                training=bool(getattr(self, "training", False)),
+                schedule_mode=schedule_mode,
+                constant_multiplier=getattr(
+                    self.args, "repair_policy_exploration_constant_multiplier", 0.50
+                ),
+                annealed_phase=annealed_phase,
+            )
+            return 1.0 - float(multiplier)
+        return annealed_phase
+
+    def _annealed_value(self, start_name, end_name, default_start=0.0, default_end=0.0):
+        start = float(getattr(self.args, start_name, default_start))
+        end = float(getattr(self.args, end_name, default_end))
+        # ana_den6_onlineの実行方策には専用Gumbelだけでなく、旧汎用経路の
+        # Amount/gate random mixも入力される。片方だけ一定化すると、後者の
+        # 減衰が依然としてtrain Actualを時刻で改善させるため、同じ一定phaseを使う。
+        phase = self._behavior_exploration_phase()
+        exact_online = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        schedule_mode = str(getattr(
+            self.args, "repair_policy_exploration_mode", "annealed"
+        )).strip().lower()
+        if exact_online and schedule_mode == "annealed":
+            # For the requested finite exploration window, every stochastic
+            # legacy component must become exactly zero at the boundary.  Some
+            # historical ``*_end`` defaults are deliberately non-zero and
+            # would otherwise keep random Amount/Gate/Fine behavior alive
+            # after the first 25% of training.
+            return start * max(1.0 - float(phase), 0.0)
+        return start + (end - start) * phase
+
+    @staticmethod
+    def _safe_logit(prob):
+        # 0/1付近の確率を安全にlogitへ戻し、比率biasや探索ノイズをlogit空間で足す。
+        prob = prob.clamp(1e-4, 1.0 - 1e-4)
+        return torch.log(prob / (1.0 - prob))
+
+    def _learned_operation_ratio(self, actuator_features, head, max_ratio, random_mix_start, random_mix_end):
+        # 全点特徴を集約して、このStepでAdd/Adjust/Pruneする割合を作る。
+        # repair_learn_operation_amounts=False の場合でも、
+        # amount_head への勾配確認用に gradient-only 経路を残す。
+        if max_ratio <= 0.0:
+            return actuator_features.new_zeros((actuator_features.shape[0], 1, 1))
+
+        # ============================================================
+        # Amount head 用の集約特徴
+        # ============================================================
+        # 既存実装では mean だけを使っていたため、
+        # 点群内の局所的な強い異常やばらつきがAmount headへ入りにくかった。
+        #
+        # headの入力チャネル数は変えず、mean + std + max を同じC次元に合成する。
+        # これにより既存の drop/add/move_amount_head の構造を壊さず、
+        # Stepごとの操作割合が入力状態に応じて変化しやすくなる。
+        # ============================================================
+        mean_feat = actuator_features.mean(dim=2, keepdim=True)
+        max_feat = actuator_features.amax(dim=2, keepdim=True)
+
+        if actuator_features.shape[2] > 1:
+            std_feat = actuator_features.std(dim=2, keepdim=True, unbiased=False)
+        else:
+            std_feat = torch.zeros_like(mean_feat)
+
+        pooled = (
+            mean_feat
+            + float(getattr(self.args, "repair_amount_pool_std_weight", 0.50)) * std_feat
+            + float(getattr(self.args, "repair_amount_pool_max_weight", 0.25)) * max_feat
+        )
+
+        # まず必ず amount head を通す。
+        # raw logit を軽く正規化し、sigmoid 飽和による amount_head 勾配消失を抑える。
+        raw_logit = torch.nan_to_num(
+            head(pooled),
+            nan=0.0,
+            posinf=float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0)),
+            neginf=-float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0)),
+        )
+        ratio_logit_scale = max(float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0)), 1e-6)
+        bounded_logit = ratio_logit_scale * torch.tanh(raw_logit / ratio_logit_scale)
+        learned_ratio = torch.sigmoid(bounded_logit) * float(max_ratio)
+
+        if bool(getattr(self.args, "repair_learn_operation_amounts", True)):
+            ratio = learned_ratio
+        else:
+            # forward値は固定比率に近いままにし、backwardだけ learned_ratio へ流す。
+            # これにより、固定操作量モードでも amount_head の勾配が完全には切れない。
+            fixed_ratio = pooled.new_full((pooled.shape[0], 1, 1), float(max_ratio))
+            eps = float(getattr(self.args, "repair_amount_fixed_mode_grad_eps", 1e-3))
+            ratio = fixed_ratio + eps * (learned_ratio - learned_ratio.detach())
+
+        # 学習初期だけランダム比率を混ぜ、Add/Adjust量の探索範囲を広げる。
+        random_mix = min(max(self._annealed_value(random_mix_start, random_mix_end), 0.0), 1.0)
+        if self.training and random_mix > 0.0:
+            random_ratio = torch.rand_like(ratio) * float(max_ratio)
+            ratio = (1.0 - random_mix) * ratio + random_mix * random_ratio
+
+        return ratio.clamp(0.0, float(max_ratio))
+
+    def _learned_operation_gates(self, actuator_features, prune_enabled, add_enabled, move_enabled):
+        B = actuator_features.shape[0]
+        enabled_mask = actuator_features.new_tensor(
+            [
+                1.0 if prune_enabled else 0.0,
+                1.0 if add_enabled else 0.0,
+                1.0 if move_enabled else 0.0,
+            ]
+        ).view(1, 3, 1)
+        if not bool(getattr(self.args, "repair_operation_gate_enabled", True)):
+            gate_prob = enabled_mask.expand(B, -1, -1).contiguous()
+            gate_hard = gate_prob
+            gate = gate_prob
+            gate_logit = torch.where(
+                gate_prob > 0.0,
+                gate_prob.new_full(gate_prob.shape, 8.0),
+                gate_prob.new_full(gate_prob.shape, -8.0),
+            )
+            return gate[:, 0:1], gate[:, 1:2], gate[:, 2:3], gate_prob, gate_hard, gate_logit
+
+        mean_feat = actuator_features.mean(dim=2, keepdim=True)
+        max_feat = actuator_features.amax(dim=2, keepdim=True)
+        if actuator_features.shape[2] > 1:
+            std_feat = actuator_features.std(dim=2, keepdim=True, unbiased=False)
+        else:
+            std_feat = torch.zeros_like(mean_feat)
+        pooled = (
+            mean_feat
+            + float(getattr(self.args, "repair_operation_gate_pool_std_weight", 0.50)) * std_feat
+            + float(getattr(self.args, "repair_operation_gate_pool_max_weight", 0.25)) * max_feat
+        )
+        logit_scale = max(float(getattr(self.args, "repair_operation_gate_logit_scale", 6.0)), 1e-6)
+        raw_logit = torch.nan_to_num(
+            self._run_large_head(self.operation_gate_head, pooled),
+            nan=0.0,
+            posinf=logit_scale,
+            neginf=-logit_scale,
+        )
+        gate_logit = logit_scale * torch.tanh(raw_logit / logit_scale)
+        temperature = max(float(getattr(self.args, "repair_operation_gate_temperature", 1.0)), 1e-6)
+        gate_prob = torch.sigmoid(gate_logit / temperature) * enabled_mask
+
+        random_mix = min(
+            max(
+                self._annealed_value(
+                    "repair_operation_gate_random_mix_start",
+                    "repair_operation_gate_random_mix_end",
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        if self.training and random_mix > 0.0:
+            random_gate = torch.rand_like(gate_prob) * enabled_mask
+            gate_prob = (1.0 - random_mix) * gate_prob + random_mix * random_gate
+
+        min_forward = min(
+            max(float(getattr(self.args, "repair_operation_gate_min_forward", 0.0)), 0.0),
+            0.49,
+        )
+        if self.training and min_forward > 0.0:
+            gate_prob = gate_prob * (1.0 - min_forward) + min_forward * enabled_mask
+
+        hard_threshold = min(max(float(getattr(self.args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
+        gate_hard = (gate_prob >= hard_threshold).to(dtype=gate_prob.dtype) * enabled_mask
+        if bool(getattr(self.args, "repair_operation_gate_hard_forward", False)):
+            gate = gate_hard.detach() + gate_prob - gate_prob.detach()
+        else:
+            gate = gate_prob
+        return gate[:, 0:1], gate[:, 1:2], gate[:, 2:3], gate_prob, gate_hard, gate_logit
+
+    def _heuristic_guidance_state(self, structure):
+        guidance = structure.get("heuristic_guidance") if isinstance(structure, dict) else None
+        if not isinstance(guidance, dict) or not bool(guidance.get("enabled", False)):
+            return None
+        if not bool(getattr(self.args, "heuristic_guidance_enabled", True)):
+            return None
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if str(guidance.get("formula_basis", "")) == "mynet_geometry_octree_safe_pool_v1":
+            from ..utils.pointcloud.geometry_octree import is_geometry_octree
+            if not is_geometry_octree(self.args):
+                raise RuntimeError("conventional geometry pools cannot enter the SparsePCGC actuator")
+        if mode in {"ana_den6_online", "ana_den6_residual"}:
+            if str(guidance.get("formula_basis", "")) not in {
+                "ana_den6_exact_ranked_editcandidate_pool_v2",
+                "ana_den6_exact_ranked_editcandidate_pool_online_v1",
+                "ana_den6_exact_one_pattern_anchor_online_v4",
+                "ana_den6_exact_one_pattern_anchor_online_v5",
+                "ana_den6_exact_compact_candidate_shortlist_online_v5",
+                "ana_den6_exact_unique_plan_online_v6",
+                "ana_den6_exact_one_pattern_anchor_online_v6",
+                "ana_den6_single_proposal_network_residual_online_v7",
+                "ana_den6_exact_single_plan_teacher_online_v8",
+                "mynet_fast_unordered_safe_pool_v1",
+                "mynet_geometry_octree_safe_pool_v1",
+                "network_only_where_amount_action_inference_v1",
+            }:
+                raise RuntimeError(
+                    "ana_den6 online/residualでproxy近似guidanceがActuatorへ入った。"
+                    "許可されたexact候補またはsingle-proposal prior以外は使用できない"
+                )
+            if (
+                str(guidance.get("formula_basis", ""))
+                != "network_only_where_amount_action_inference_v1"
+                and not isinstance(guidance.get("exact_candidate_guidance"), dict)
+            ):
+                raise RuntimeError("ana_den6 online/residualでexact_candidate_guidanceが欠落した")
+        return guidance
+
+    def _heuristic_anchor_phase(self):
+        current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        anchor_steps = max(int(getattr(self.args, "heuristic_guidance_anchor_steps", 0)), 0)
+        if anchor_steps <= 0:
+            return 0.0
+        return max(1.0 - float(current_step) / float(anchor_steps), 0.0)
+
+    def _fit_heuristic_where_prior(self, guidance, operation, like_tensor):
+        if not isinstance(guidance, dict):
+            return torch.zeros_like(like_tensor)
+        where = guidance.get("where_prior", {})
+        value = where.get(operation) if isinstance(where, dict) else None
+        if not torch.is_tensor(value):
+            return torch.zeros_like(like_tensor)
+        return self._fit_leaf_pattern_map(value, like_tensor).clamp(0.0, 1.0).detach()
+
+    def _fit_heuristic_candidate_mask(self, guidance, operation, like_tensor):
+        if not isinstance(guidance, dict):
+            return torch.ones_like(like_tensor, dtype=torch.bool)
+        masks = guidance.get("candidate_mask", {})
+        value = masks.get(operation) if isinstance(masks, dict) else None
+        if not torch.is_tensor(value):
+            return torch.ones_like(like_tensor, dtype=torch.bool)
+        fitted = self._fit_leaf_pattern_map(value, like_tensor)
+        return fitted.to(dtype=torch.bool).detach()
+
+    def _fit_heuristic_target_direction_prior(self, guidance, operation, like_tensor):
+        """den6 candidateのsparse source-target rankを既存方向logit形状へ展開する。"""
+        B, _, N = like_tensor.shape
+        K = int(self.neighbor_offsets.shape[0])
+        dense = like_tensor.new_zeros((B, K, N))
+        if not isinstance(guidance, dict):
+            return dense
+
+        bitset_all = guidance.get("fixed_direction_bits", {})
+        bitset = bitset_all.get(operation) if isinstance(bitset_all, dict) else None
+        if torch.is_tensor(bitset):
+            bits = bitset.detach().to(device=like_tensor.device, dtype=torch.long)
+            if bits.ndim == 1:
+                bits = bits.view(1, -1)
+            if bits.shape[0] == 1 and B > 1:
+                bits = bits.expand(B, -1)
+            if bits.shape == (B, N):
+                shifts = torch.arange(K, device=bits.device, dtype=torch.long).view(1, K, 1)
+                return ((bits.unsqueeze(1) >> shifts) & 1).to(dtype=like_tensor.dtype)
+
+        fixed_all = guidance.get("fixed_direction_index", {})
+        fixed = fixed_all.get(operation) if isinstance(fixed_all, dict) else None
+        if torch.is_tensor(fixed):
+            index = fixed.detach().to(device=like_tensor.device, dtype=torch.long)
+            if index.ndim == 1:
+                index = index.view(1, -1)
+            if index.shape[0] == 1 and B > 1:
+                index = index.expand(B, -1)
+            if index.shape == (B, N):
+                valid = index.ge(0) & index.lt(K)
+                dense.scatter_(
+                    1,
+                    index.clamp(0, K - 1).unsqueeze(1),
+                    valid.to(dtype=like_tensor.dtype).unsqueeze(1),
+                )
+                return dense
+
+        sparse_all = guidance.get("target_direction_sparse", {})
+        sparse = sparse_all.get(operation) if isinstance(sparse_all, dict) else None
+        if isinstance(sparse, dict):
+            batch_index = sparse.get("batch_index")
+            source_index = sparse.get("source_index")
+            direction_index = sparse.get("direction_index")
+            rank_score = sparse.get("rank_score")
+            if all(torch.is_tensor(value) for value in (
+                batch_index, source_index, direction_index, rank_score
+            )):
+                batch_index = batch_index.to(device=like_tensor.device, dtype=torch.long)
+                source_index = source_index.to(device=like_tensor.device, dtype=torch.long)
+                direction_index = direction_index.to(device=like_tensor.device, dtype=torch.long)
+                rank_score = rank_score.to(device=like_tensor.device, dtype=like_tensor.dtype)
+                valid = (
+                    batch_index.ge(0) & batch_index.lt(B)
+                    & source_index.ge(0) & source_index.lt(N)
+                    & direction_index.ge(0) & direction_index.lt(K)
+                )
+                if bool(valid.any().item()):
+                    flat_index = (
+                        batch_index[valid] * (K * N)
+                        + direction_index[valid] * N
+                        + source_index[valid]
+                    )
+                    flat = dense.reshape(-1)
+                    values = rank_score[valid].clamp(0.0, 1.0)
+                    scatter_amax_1d_compat_(flat, flat_index, values)
+                return dense
+
+        # v1互換。新規residual modeでは通常使用しない。
+        values = guidance.get("target_direction_prior", {})
+        value = values.get(operation) if isinstance(values, dict) else None
+        if not torch.is_tensor(value):
+            return dense
+        out = value.detach().to(device=like_tensor.device, dtype=like_tensor.dtype)
+        if out.ndim != 3:
+            return dense
+        if out.shape[1] == N and out.shape[2] == K:
+            out = out.permute(0, 2, 1).contiguous()
+        if out.shape[1] != K:
+            return dense
+        if out.shape[0] == 1 and B > 1:
+            out = out.expand(B, -1, -1).contiguous()
+        if out.shape[0] != B:
+            return dense
+        if out.shape[2] > N:
+            out = out[:, :, :N]
+        elif out.shape[2] < N:
+            out = torch.cat([out, out.new_zeros((B, K, N - out.shape[2]))], dim=2)
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+
+    def _den6_first_empty_direction_bias(self, valid_target_mask, like_tensor):
+        """den5 fallbackと同じ +x,-x,+y,-y,+z,-z の最初の有効方向。"""
+        B, _, N = like_tensor.shape
+        K = int(self.neighbor_offsets.shape[0])
+        if not torch.is_tensor(valid_target_mask) or valid_target_mask.shape != (B, N, K):
+            return like_tensor.new_zeros((B, K, N))
+        chosen = torch.zeros((B, N), device=like_tensor.device, dtype=torch.bool)
+        bias = like_tensor.new_zeros((B, K, N))
+        for direction_index in self._den6_fallback_direction_indices:
+            selected = valid_target_mask[:, :, direction_index].to(torch.bool) & (~chosen)
+            bias[:, direction_index, :] = selected.to(dtype=like_tensor.dtype)
+            chosen |= selected
+        return bias.detach()
+
+    def _apply_heuristic_action_guidance(
+        self, guidance, drop_gate, add_gate, move_gate, *, prune_enabled, add_enabled, move_enabled
+    ):
+        if not isinstance(guidance, dict):
+            return drop_gate, add_gate, move_gate
+        strength = min(max(float(getattr(self.args, "heuristic_guidance_action_strength", 0.50)), 0.0), 1.0)
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode in {"ana_den6_online", "ana_den6_residual"}:
+            final_strength = min(max(float(
+                getattr(self.args, "heuristic_guidance_final_prior_strength", 0.10)
+            ), 0.0), 1.0)
+            anchor_phase = self._heuristic_anchor_phase()
+            # Step 0はden6 Actionを100%使い、以降はNetwork主体へ連続移行する。
+            strength = final_strength + (1.0 - final_strength) * anchor_phase
+        if strength <= 0.0:
+            return drop_gate, add_gate, move_gate
+        priors = guidance.get("action_gate_prior", {})
+        outputs = []
+        for gate, operation, enabled in (
+            (drop_gate, "Prune", prune_enabled),
+            (add_gate, "Add", add_enabled),
+            (move_gate, "Adjust", move_enabled),
+        ):
+            if not enabled:
+                outputs.append(torch.zeros_like(gate))
+                continue
+            prior_value = min(max(float(priors.get(operation, 0.5)), 0.0), 1.0) if isinstance(priors, dict) else 0.5
+            prior = gate.new_full(gate.shape, prior_value)
+            guided_forward = ((1.0 - strength) * gate + strength * prior).clamp(0.0, 1.0)
+            # forwardはden6規則から開始するが、anchor強度1.0の初期Stepでも
+            # Action headの勾配を消さない。Networkは同じ判断規則を模倣し、
+            # anchor減衰後は自身のgateで同じ複合planを再現する。
+            outputs.append(guided_forward.detach() + gate - gate.detach())
+        return tuple(outputs)
+
+    def _apply_heuristic_amount_guidance(self, ratio, guidance, operation, max_ratio):
+        if not isinstance(guidance, dict) or float(max_ratio) <= 0.0:
+            return ratio
+        priors = guidance.get("amount_prior", {})
+        if not isinstance(priors, dict) or operation not in priors:
+            return ratio
+        prior_value = min(max(float(priors.get(operation, 0.0)), 0.0), float(max_ratio))
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode == "ana_den6_online" and prior_value > 0.0:
+            # den6のActionは3操作を含む複合planであり、Amount=0は有効なActionではない。
+            # floor固定ではなく、Network値をpriorに対する対数residualへ写像する。
+            # 初期値はprior、学習可能範囲は概ねprior/4～prior*4なので、Networkは
+            # 操作量を増減できる一方、sigmoid飽和による厳密な0操作へは崩壊しない。
+            fraction = (ratio / float(max_ratio)).clamp(0.0, 1.0)
+            current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+            # 時刻で1.05倍から4倍へ許容幅を広げる旧curriculumは、同じ
+            # Network出力でもEpisodeによりhard Amountを変えていた。探索域は
+            # 全期間固定し、実際の変化はNetwork出力だけから生じさせる。
+            expansion = max(float(getattr(
+                self.args, "heuristic_guidance_amount_expansion", 4.0
+            )), 1.0)
+            multiplier = torch.exp(math.log(expansion) * (2.0 * fraction - 1.0))
+            learned_value = (ratio.new_full(ratio.shape, prior_value) * multiplier).clamp(
+                max=float(max_ratio)
+            )
+            exact_anchor_steps = max(int(getattr(
+                self.args, "heuristic_guidance_exact_anchor_steps", 0
+            )), 0)
+            if current_step < exact_anchor_steps:
+                # 完成den6 planを明示的に再生する診断時だけ教師Amountへ合わせる。
+                # anchor=0の通常trainではStep 0からNetwork値をhard forwardへ使う。
+                prior = ratio.new_full(ratio.shape, prior_value)
+                return prior.detach() + learned_value - learned_value.detach()
+            return learned_value
+
+        residual_fraction = max(float(getattr(self.args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
+        min_residual = max(float(getattr(self.args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
+        residual_limit = min(max(prior_value * residual_fraction, min_residual), float(max_ratio))
+        anchor_lower = max(prior_value - residual_limit, 0.0)
+        anchor_upper = min(prior_value + residual_limit, float(max_ratio))
+        current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        anchor_steps = max(int(getattr(self.args, "heuristic_guidance_anchor_steps", 0)), 0)
+        anchor_phase = (
+            max(1.0 - float(current_step) / float(anchor_steps), 0.0)
+            if anchor_steps > 0 else 0.0
+        )
+        lower = anchor_lower * anchor_phase
+        upper = anchor_upper * anchor_phase + float(max_ratio) * (1.0 - anchor_phase)
+        network_forward = ratio.detach().clamp(lower, upper)
+        guided_forward = (
+            ratio.new_full(ratio.shape, prior_value) * anchor_phase
+            + network_forward * (1.0 - anchor_phase)
+        )
+        grad_scale = max(float(getattr(self.args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
+        return guided_forward + grad_scale * (ratio - ratio.detach())
+
+    def _heuristic_where_logit_bias(self, guidance, operation, like_tensor):
+        if (
+            isinstance(guidance, dict)
+            and str(guidance.get("formula_basis", ""))
+            == "network_only_where_amount_action_inference_v1"
+        ):
+            return torch.zeros_like(like_tensor)
+        prior = self._fit_heuristic_where_prior(guidance, operation, like_tensor)
+        weight = max(float(getattr(self.args, "heuristic_guidance_where_weight", 1.0)), 0.0)
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode in {"ana_den6_online", "ana_den6_residual"}:
+            if mode == "ana_den6_online":
+                # GT固定Octree特徴はteacher行動ではなくNetwork入力の一部である。
+                # Step 200でこの特徴だけを1/4へ落とすと、学習対象そのものが不連続に
+                # 変わるため、onlineでは全Stepで同じ尺度を保つ。
+                weight = max(float(
+                    getattr(self.args, "heuristic_guidance_where_weight", 1.0)
+                ), 0.0)
+            else:
+                final_weight = max(float(getattr(self.args, "heuristic_guidance_final_where_weight", 0.25)), 0.0)
+                anchor_phase = self._heuristic_anchor_phase()
+                weight = final_weight + (weight - final_weight) * anchor_phase
+            mask = self._fit_heuristic_candidate_mask(guidance, operation, like_tensor)
+            outside_penalty = max(float(
+                getattr(self.args, "heuristic_guidance_outside_pool_logit_penalty", 20.0)
+            ), 0.0)
+            # den6候補pool外へ探索空間が再拡大しないよう、hard候補を制限する。
+            return weight * (2.0 * prior - 1.0) - (~mask).to(like_tensor.dtype) * outside_penalty
+        return weight * (2.0 * prior - 1.0)
+    
+    @staticmethod
+    def _den6_allocate_counts(total_budget, shares):
+        """Allocate an integer budget while allowing an operation to be zero.
+
+        A positive budget produces a non-empty plan, while an explicit zero
+        budget is the learned no-op.  Add/Prune/Adjust are not forced to appear
+        once each, so the operation gate causally controls the executed mix.
+        """
+        operations = ("Add", "Prune", "Adjust")
+        total_budget = max(int(total_budget), 0)
+        if total_budget == 0:
+            return {name: 0 for name in operations}
+        raw = {name: total_budget * float(shares[name]) for name in operations}
+        counts = {name: max(0, int(math.floor(raw[name]))) for name in operations}
+        while sum(counts.values()) > total_budget:
+            reducible = [name for name in operations if counts[name] > 0]
+            if not reducible:
+                break
+            name = min(reducible, key=lambda key: (raw[key] - math.floor(raw[key]), counts[key]))
+            counts[name] -= 1
+        while sum(counts.values()) < total_budget:
+            name = max(operations, key=lambda key: (raw[key] - counts[key], raw[key]))
+            counts[name] += 1
+        return counts
+
+    @staticmethod
+    def _den6_candidate_coord_sets(candidate):
+        removes = {
+            tuple(int(value) for value in coord)
+            for coord in candidate.get("remove_coords", ())
+        }
+        adds = {
+            tuple(int(value) for value in coord)
+            for coord in candidate.get("add_coords", ())
+        }
+        return removes, adds
+
+    @staticmethod
+    def _den6_candidate_compatible(candidate, occupied, removes, adds):
+        """ana_den6._candidate_compatibleと同じ適用可能性・衝突条件を確認する。"""
+        candidate_removes, candidate_adds = StructureRepairActuator._den6_candidate_coord_sets(candidate)
+        if not candidate_removes.issubset(occupied):
+            return False
+        if candidate_adds & occupied:
+            return False
+        if removes & candidate_removes or adds & candidate_adds:
+            return False
+        if removes & candidate_adds or adds & candidate_removes:
+            return False
+        return True
+
+    @staticmethod
+    def _den6_candidate_conflict_free(candidate, removes, adds):
+        """GTに対する適合性確認済み候補へ、plan内衝突だけを適用する。"""
+        candidate_removes, candidate_adds = StructureRepairActuator._den6_candidate_coord_sets(candidate)
+        if removes & candidate_removes or adds & candidate_adds:
+            return False
+        if removes & candidate_adds or adds & candidate_removes:
+            return False
+        return True
+
+    def _normalize_candidate_network_score(
+        self, value, scored_mask=None, *, return_audit=False
+    ):
+        value = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if torch.is_tensor(scored_mask) and int(scored_mask.numel()) == int(value.numel()):
+            scored_mask = scored_mask.to(device=value.device, dtype=torch.bool)
+            if bool(scored_mask.any().item()):
+                neutral = value[scored_mask].mean().detach()
+                value = torch.where(scored_mask, value, neutral)
+        if value.numel() <= 1:
+            result = value - value.detach()
+            audit = {
+                "pool_std": 0.0,
+                "normalization_scale": 1.0,
+                "temperature": 1.0,
+                "tanh_input_abs_max": 0.0,
+                "saturation_rate": 0.0,
+            }
+            return (result, audit) if return_audit else result
+        # 固定scaleだけでraw scoreをtanhへ入れると、学習後半にheadの
+        # magnitudeだけが増えて候補の大半が+/-0.5へ飽和する。候補pool内の
+        # detached RMSを尺度として使えば、raw順位と勾配経路を保ったまま、
+        # magnitude driftを最終rankingから分離できる。scale floorは従来の
+        # 固定scaleなので、未学習時の微小な差を[-0.5, 0.5]へ増幅しない。
+        center = value.mean().detach()
+        fixed_scale = max(float(getattr(
+            self.args, "heuristic_guidance_network_score_scale", 1.0
+        )), 1e-6)
+        centered = value - center
+        pool_std = centered.detach().square().mean().sqrt()
+        scale = torch.maximum(
+            pool_std,
+            pool_std.new_tensor(float(fixed_scale)),
+        )
+        temperature = max(float(getattr(
+            self.args, "heuristic_guidance_network_score_temperature", 1.0
+        )), 1e-6)
+        tanh_input = centered / scale / float(temperature)
+        result = 0.5 * torch.tanh(tanh_input)
+        # |x|>=3ではtanh微分が1%未満になるため、実効的な飽和率として記録する。
+        audit = {
+            "pool_std": float(pool_std.cpu()),
+            "normalization_scale": float(scale.cpu()),
+            "temperature": float(temperature),
+            "tanh_input_abs_max": float(tanh_input.detach().abs().amax().cpu()),
+            "saturation_rate": float(
+                tanh_input.detach().abs().ge(3.0).float().mean().cpu()
+            ),
+        }
+        return (result, audit) if return_audit else result
+
+    def _exact_den6_candidate_scores(
+        self,
+        guidance,
+        drop_score,
+        move_score,
+        move_logits,
+        add_pair_logits,
+        *,
+        return_raw=False,
+    ):
+        """den6各EditCandidateへ対応するNetwork residual scoreを作る。"""
+        maps = guidance.get("candidate_tensor_map", {}) if isinstance(guidance, dict) else {}
+        output = {}
+        raw_output = {}
+        normalization_audit = {}
+        for operation in ("Add", "Prune", "Adjust"):
+            mapping = maps.get(operation, {}) if isinstance(maps, dict) else {}
+            rank_score = mapping.get("rank_score")
+            if not torch.is_tensor(rank_score):
+                output[operation] = drop_score.new_zeros((0,))
+                raw_output[operation] = drop_score.new_zeros((0,))
+                continue
+            rank_score = rank_score.to(device=drop_score.device, dtype=torch.float32)
+            candidate_count = int(rank_score.numel())
+            network_score = rank_score.new_zeros((candidate_count,))
+            scored_mask = torch.zeros(
+                (candidate_count,), device=rank_score.device, dtype=torch.bool
+            )
+            if operation == "Prune":
+                source = mapping.get("source_index")
+                if torch.is_tensor(source) and candidate_count > 0:
+                    source = source.to(device=drop_score.device, dtype=torch.long)
+                    valid = source.ge(0) & source.lt(drop_score.shape[-1])
+                    if bool(valid.any().item()):
+                        network_score[valid] = drop_score[0, 0].index_select(0, source[valid]).float()
+                        scored_mask[valid] = True
+            elif operation == "Adjust":
+                source = mapping.get("source_index")
+                direction = mapping.get("direction_index")
+                if torch.is_tensor(source) and torch.is_tensor(direction) and candidate_count > 0:
+                    source = source.to(device=move_score.device, dtype=torch.long)
+                    direction = direction.to(device=move_score.device, dtype=torch.long)
+                    valid = (
+                        source.ge(0) & source.lt(move_score.shape[-1])
+                        & direction.ge(0) & direction.lt(move_logits.shape[1])
+                    )
+                    if bool(valid.any().item()):
+                        # Preserve direction differences without exposing the
+                        # candidate ranker to an unbounded raw logit.  The first
+                        # ablation used the centered logit directly: Adjust raw
+                        # std reached 96.8 within 200 steps and worsened fixed
+                        # RD.  Detached pool scaling keeps its ordering while a
+                        # bounded transform prevents that magnitude feedback.
+                        direction_logit = move_logits.float()
+                        direction_logit = (
+                            direction_logit
+                            - direction_logit.mean(dim=1, keepdim=True)
+                        )
+                        direction_scale = torch.maximum(
+                            direction_logit.detach().square().mean(
+                                dim=1, keepdim=True
+                            ).sqrt(),
+                            direction_logit.new_tensor(1.0),
+                        )
+                        direction_residual = 0.5 * torch.tanh(
+                            direction_logit / direction_scale
+                        )
+                        network_score[valid] = (
+                            move_score[0, 0].index_select(0, source[valid]).float()
+                            + direction_residual[0, direction[valid], source[valid]]
+                        )
+                        scored_mask[valid] = True
+            else:
+                pair_candidate = mapping.get("pair_candidate_index")
+                pair_source = mapping.get("pair_source_index")
+                pair_direction = mapping.get("pair_direction_index")
+                if (
+                    torch.is_tensor(add_pair_logits)
+                    and torch.is_tensor(pair_candidate)
+                    and torch.is_tensor(pair_source)
+                    and torch.is_tensor(pair_direction)
+                    and candidate_count > 0
+                ):
+                    pair_candidate = pair_candidate.to(device=add_pair_logits.device, dtype=torch.long)
+                    pair_source = pair_source.to(device=add_pair_logits.device, dtype=torch.long)
+                    pair_direction = pair_direction.to(device=add_pair_logits.device, dtype=torch.long)
+                    valid = (
+                        pair_candidate.ge(0) & pair_candidate.lt(candidate_count)
+                        & pair_source.ge(0) & pair_source.lt(add_pair_logits.shape[1])
+                        & pair_direction.ge(0) & pair_direction.lt(add_pair_logits.shape[2])
+                    )
+                    if bool(valid.any().item()):
+                        # Prune/Adjustはlogitを候補scoreへ使うのに、Addだけsigmoid後の
+                        # 確率を使うと未学習域の差が約1/4へ潰れる。順位を変えずに
+                        # 3操作を同じraw-logit尺度へ揃え、後段の固定scaleで校正する。
+                        pair_value = add_pair_logits[
+                            0, pair_source[valid], pair_direction[valid]
+                        ].float()
+                        index = pair_candidate[valid]
+                        # raw logitは通常負なので、0初期化tensorへamaxすると全候補が
+                        # 0へ潰れる。候補内の複数source/directionだけを-infからamaxし、
+                        # 未対応候補は後段で対応候補meanへ置換する。
+                        add_candidate_score = network_score.new_full(
+                            network_score.shape, float("-inf")
+                        )
+                        scatter_amax_1d_compat_(
+                            add_candidate_score, index, pair_value
+                        )
+                        scored_mask[index] = True
+                        network_score = torch.where(
+                            scored_mask, add_candidate_score, network_score
+                        )
+            if bool(scored_mask.any().item()):
+                neutral = network_score[scored_mask].mean().detach()
+                network_score = torch.where(scored_mask, network_score, neutral)
+            raw_output[operation] = network_score
+            output[operation], normalization_audit[operation] = (
+                self._normalize_candidate_network_score(
+                    network_score,
+                    scored_mask=scored_mask,
+                    return_audit=True,
+                )
+            )
+        if return_raw:
+            return output, raw_output, normalization_audit
+        return output
+
+    def _candidate_rd_alignment_confidence(self, guidance, network_scores):
+        """Measure whether learned ranking agrees with the local RD teacher.
+
+        The confidence is computed independently for each operation and each
+        input pool.  It is detached: it controls only how much of an already
+        learned residual reaches the hard forward plan, while the listwise
+        local loss remains fully differentiable even when confidence is zero.
+        Requiring both value and rank correlation prevents a large but
+        misordered score from gaining control of the actuator.
+        """
+        mode = str(getattr(
+            self.args, "heuristic_guidance_network_confidence_mode", "rd_alignment"
+        )).strip().lower()
+        operations = ("Add", "Prune", "Adjust")
+        if mode == "none":
+            one = next(iter(network_scores.values())).new_tensor(1.0)
+            return (
+                {name: one for name in operations},
+                {name: {"pearson": 1.0, "spearman": 1.0, "confidence": 1.0}
+                 for name in operations},
+            )
+        if mode == "prior_only":
+            zero = next(iter(network_scores.values())).new_tensor(0.0)
+            return (
+                {name: zero for name in operations},
+                {name: {"pearson": 0.0, "spearman": 0.0, "confidence": 0.0}
+                 for name in operations},
+            )
+        if mode != "rd_alignment":
+            raise ValueError(
+                "heuristic_guidance_network_confidence_mode must be "
+                "none, rd_alignment, or prior_only"
+            )
+
+        tensor_map = guidance.get("candidate_tensor_map", {})
+        confidences = {}
+        audit = {}
+        for name in operations:
+            prediction = network_scores[name]
+            mapping = tensor_map.get(name, {}) if isinstance(tensor_map, dict) else {}
+            utility = mapping.get("local_utility_target") if isinstance(mapping, dict) else None
+            pearson = 0.0
+            spearman = 0.0
+            pairwise_accuracy = 0.5
+            valid_count = 0
+            if torch.is_tensor(utility) and int(utility.numel()) == int(prediction.numel()):
+                target = 0.5 * torch.tanh(utility.to(
+                    device=prediction.device, dtype=prediction.dtype
+                ))
+                valid = torch.isfinite(prediction) & torch.isfinite(target)
+                valid_count = int(valid.sum().detach().cpu())
+                if valid_count > 1:
+                    pred = prediction.detach().float()[valid]
+                    tgt = target.detach().float()[valid]
+                    pred_centered = pred - pred.mean()
+                    target_centered = tgt - tgt.mean()
+                    denominator = (
+                        pred_centered.square().sum().sqrt()
+                        * target_centered.square().sum().sqrt()
+                    ).clamp_min(1e-12)
+                    pearson = float(
+                        ((pred_centered * target_centered).sum() / denominator).cpu()
+                    )
+                    pred_rank = torch.argsort(torch.argsort(pred)).float()
+                    target_rank = torch.argsort(torch.argsort(tgt)).float()
+                    pred_rank = pred_rank - pred_rank.mean()
+                    target_rank = target_rank - target_rank.mean()
+                    rank_denominator = (
+                        pred_rank.square().sum().sqrt()
+                        * target_rank.square().sum().sqrt()
+                    ).clamp_min(1e-12)
+                    spearman = float(
+                        ((pred_rank * target_rank).sum() / rank_denominator).cpu()
+                    )
+                    pair_count = min(256, valid_count // 2)
+                    if pair_count > 0:
+                        target_order = torch.argsort(tgt)
+                        lower = target_order[:pair_count]
+                        upper = target_order[-pair_count:].flip(0)
+                        target_gap = tgt[upper] - tgt[lower]
+                        clear = torch.isfinite(target_gap) & target_gap.gt(0.0)
+                        if bool(clear.any()):
+                            predicted_gap = pred[upper[clear]] - pred[lower[clear]]
+                            pairwise_accuracy = float(
+                                predicted_gap.gt(0.0).float().mean().cpu()
+                            )
+            # A residual receives authority only to the degree supported by
+            # both its value calibration and ordering.  No fitted threshold,
+            # target compression value, or Episode-dependent state is used.
+            alignment_value = min(max(min(pearson, spearman), 0.0), 1.0)
+            # A zero floor made an initially imperfect head unable to alter even
+            # adjacent den6 ranks in the executed plan, although its local RD
+            # loss was learning.  Keep only a small, bounded residual corridor;
+            # confidence still supplies the remaining authority.  The explicit
+            # prior_only ablation above remains exactly zero.
+            confidence_floor = min(max(float(getattr(
+                self.args, "heuristic_guidance_network_confidence_floor", 0.05
+            )), 0.0), 0.25)
+            confidence_value = (
+                confidence_floor
+                + (1.0 - confidence_floor) * alignment_value
+            )
+            pairwise_evidence = min(max(
+                2.0 * (float(pairwise_accuracy) - 0.5), 0.0
+            ), 1.0)
+            # Whole-pool rank agreement and clear-tail pair accuracy are
+            # detached observations of learned RD ranking quality.  Neither
+            # contains an Episode counter nor a target compression value.
+            ranking_quality = 0.5 * (alignment_value + pairwise_evidence)
+            confidences[name] = prediction.new_tensor(confidence_value)
+            audit[name] = {
+                "pearson": float(pearson),
+                "spearman": float(spearman),
+                "pairwise_accuracy": float(pairwise_accuracy),
+                "alignment": float(alignment_value),
+                "ranking_quality": float(ranking_quality),
+                "uncertainty": float(1.0 - ranking_quality),
+                "confidence_floor": float(confidence_floor),
+                "confidence": float(confidence_value),
+                "valid_count": int(valid_count),
+            }
+        return confidences, audit
+
+    def _den6_group_actual_quality(self, group, source="actor"):
+        """Return a bounded quality backed only by matched Actual pairs.
+
+        Beta(1,1) smoothing avoids treating one lucky pair as certainty.  The
+        coverage term is evidence driven (never Episode driven), so a fresh
+        group has zero forward authority while a repeatedly correct group can
+        earn a bounded residual corridor independently of other groups.
+        """
+        stats = getattr(self, "_den6_actual_group_stats", {})
+        row = stats.get(str(group), {}) if isinstance(stats, dict) else {}
+        comparisons = max(int(row.get(
+            "proposal_comparisons" if source == "proposal" else "comparisons", 0
+        )), 0)
+        if comparisons <= 0:
+            return 0.0
+        correct = min(max(float(row.get(f"{source}_correct", 0.0)), 0.0),
+                      float(comparisons))
+        accuracy = (correct + 1.0) / (float(comparisons) + 2.0)
+        target = max(int(getattr(
+            self.args, "heuristic_guidance_online_group_authority_pairs", 8
+        )), 1)
+        coverage = min(float(comparisons) / float(target), 1.0)
+        return float(coverage * max(2.0 * (accuracy - 0.5), 0.0))
+
+    def _den6_group_actual_authority(self, group):
+        """Authority for one decision group, without a global AND deadlock."""
+        if (
+            bool(getattr(
+                self.args,
+                "heuristic_guidance_online_simultaneous_operation_exploration",
+                False,
+            ))
+            and str(group) in {"AddWhere", "PruneWhere", "AdjustWhere"}
+        ):
+            # In simultaneous mode the executed counterfactual changes all
+            # three Where sets together.  Its Actual evidence therefore
+            # belongs to the joint Where policy, not to three fictitious
+            # one-operation experiments.
+            group = "WhereAll"
+        actor_quality = self._den6_group_actual_quality(group, "actor")
+        critic_quality = self._den6_group_actual_quality(group, "critic")
+        # The Actor must itself be correct.  Critic calibration strengthens the
+        # grant, but an initially uncalibrated Critic cannot make the Actor's
+        # otherwise valid matched evidence identically useless forever.
+        raw_authority = actor_quality * (0.25 + 0.75 * critic_quality)
+        # Independent fixed validation is evaluation/model selection only.
+        # Never feed its result back into training authority; candidate-level
+        # LCB below supplies the deployment-time safety decision from the
+        # Actual-trained Critic itself.
+        return min(max(float(raw_authority), 0.0), 1.0)
+
+    def _learning_adaptive_exploration_factor(self, confidence_audit, operation=None):
+        """Contract exploration only after action-conditional Actual evidence."""
+        floor = min(max(float(getattr(
+            self.args,
+            "heuristic_guidance_exploration_min_fraction",
+            0.25,
+        )), 0.0), 1.0)
+        if operation is None:
+            rows = [
+                value for value in confidence_audit.values()
+                if isinstance(value, dict)
+            ] if isinstance(confidence_audit, dict) else []
+        else:
+            value = confidence_audit.get(operation, {}) \
+                if isinstance(confidence_audit, dict) else {}
+            rows = [value] if isinstance(value, dict) else []
+        group = (
+            "WhereAll"
+            if (
+                operation in {"Add", "Prune", "Adjust"}
+                and bool(getattr(
+                    self.args,
+                    "heuristic_guidance_online_simultaneous_operation_exploration",
+                    False,
+                ))
+            )
+            else f"{operation}Where"
+            if operation in {"Add", "Prune", "Adjust"}
+            else str(operation)
+            if operation in {
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
+            else None
+        )
+        if group is None:
+            qualities = [
+                self._den6_group_actual_authority(name)
+                for name in (
+                    ("WhereAll", "Amount", "Gate", "Fine")
+                    if bool(getattr(
+                        self.args,
+                        "heuristic_guidance_online_simultaneous_operation_exploration",
+                        False,
+                    ))
+                    else (
+                        "AddWhere", "PruneWhere", "AdjustWhere",
+                        "Amount", "Gate", "Fine",
+                    )
+                )
+            ]
+            quality = sum(qualities) / float(max(len(qualities), 1))
+        else:
+            quality = self._den6_group_actual_authority(group)
+        return float(floor + (1.0 - floor) * (1.0 - quality))
+
+    def _den6_actual_residual_authority(self, group=None):
+        """Return authority earned only from matched, executed Actual-RD data.
+
+        The three factors deliberately have an AND relationship.  A lucky
+        pair, a proxy-trained Critic, or evidence volume without correct
+        ordering cannot grant the Actor forward authority on its own.
+        """
+        if group is not None:
+            return self._den6_group_actual_authority(group)
+        simultaneous_where = bool(getattr(
+            self.args,
+            "heuristic_guidance_online_simultaneous_operation_exploration",
+            False,
+        ))
+        group_authorities = [
+            self._den6_group_actual_authority(name)
+            for name in (
+                ("WhereAll",)
+                if simultaneous_where
+                else ("AddWhere", "PruneWhere", "AdjustWhere")
+            )
+        ]
+        if any(value > 0.0 for value in group_authorities):
+            return float(sum(group_authorities) / len(group_authorities))
+        matched_accuracy = min(max(float(getattr(
+            self, "_den6_matched_actual_pair_accuracy", 0.0
+        )), 0.0), 1.0)
+        matched_quality = max(2.0 * (matched_accuracy - 0.5), 0.0)
+        critic_quality = min(max(float(getattr(
+            self, "_den6_actual_candidate_critic_quality", 0.0
+        )), 0.0), 1.0)
+        evidence = min(max(float(getattr(
+            self, "_den6_actual_action_evidence", 0.0
+        )), 0.0), 1.0)
+        raw_authority = float(min(matched_quality, critic_quality) * evidence)
+        return raw_authority
+
+    @staticmethod
+    def _den6_standardize_candidate_feature(value):
+        value = value.float().reshape(-1)
+        if int(value.numel()) <= 1:
+            return value * 0.0
+        centered = value - value.mean()
+        return centered / centered.square().mean().sqrt().clamp_min(
+            torch.finfo(centered.dtype).eps
+        )
+
+    def _den6_actor_critic_candidate_values(
+        self, mapping, base_network_score, operation_index
+    ):
+        """Evaluate an unordered safe candidate pool without rank fusion.
+
+        ``rank_score`` keeps a checkpoint-compatible feature slot, but the
+        default Actor receives zero in that slot.  The legacy rank feature can
+        be enabled only by an explicit ablation flag and is never added to the
+        final policy logit.  Rate/geometry are cheap codec-context proxy
+        features, not candidate Actual encode results.
+        """
+        count = int(base_network_score.numel())
+        if count <= 0:
+            empty = base_network_score.reshape(-1)
+            return empty, empty, empty, empty, empty.new_empty((0, 7))
+
+        def _feature(name):
+            value = mapping.get(name)
+            if not torch.is_tensor(value) or int(value.numel()) != count:
+                return base_network_score.new_zeros((count,))
+            return value.to(
+                device=base_network_score.device,
+                dtype=base_network_score.dtype,
+            ).reshape(-1)
+
+        rank_feature = (
+            self._den6_standardize_candidate_feature(_feature("rank_score"))
+            if bool(getattr(
+                self.args,
+                "heuristic_guidance_online_actor_use_rank_feature",
+                False,
+            ))
+            else base_network_score.new_zeros((count,))
+        )
+        rate_feature = self._den6_standardize_candidate_feature(
+            _feature("local_rate_benefit")
+        )
+        geometry_feature = self._den6_standardize_candidate_feature(
+            _feature("local_geometry_risk")
+        )
+        base_feature = self._den6_standardize_candidate_feature(
+            base_network_score
+        )
+        operation_one_hot = base_network_score.new_zeros((count, 3))
+        operation_one_hot[:, int(operation_index)] = 1.0
+        critic_features = torch.cat((
+            base_feature.reshape(-1, 1),
+            rank_feature.reshape(-1, 1),
+            rate_feature.reshape(-1, 1),
+            geometry_feature.reshape(-1, 1),
+            operation_one_hot,
+        ), dim=1)
+        # ProxyはCriticのdense warm-start教師には有用だが、Actorへそのまま渡すと
+        # optimistic_gainだけでden6順位を再構成できる。Actorは学習特徴を主入力にし、
+        # rate proxyは既定0、geometry riskだけ安全性情報として弱く残す。
+        actor_features = torch.cat((
+            base_feature.reshape(-1, 1),
+            rank_feature.reshape(-1, 1),
+            rate_feature.reshape(-1, 1) * float(getattr(
+                self.args, "heuristic_guidance_online_actor_rate_proxy_scale", 0.0
+            )),
+            geometry_feature.reshape(-1, 1) * float(getattr(
+                self.args, "heuristic_guidance_online_actor_geometry_proxy_scale", 0.25
+            )),
+            operation_one_hot,
+        ), dim=1)
+        actor_residual = self.den6_candidate_actor(actor_features).reshape(-1)
+        proposal_logit = self.den6_candidate_proposal(actor_features).reshape(-1)
+        # Proxy regression is Critic-only.  Detaching its input prevents the
+        # dense all-candidate proxy target from updating the Actor's shared
+        # point/voxel feature path indirectly before Actual plans are compared.
+        critic_output = self.den6_candidate_critic(critic_features.detach())
+        # Rate/geometry proxy values are observations, not action scores.  In
+        # particular, do not add their hand-written combination to Q here:
+        # doing so made a fresh Critic correlate ~1.0 with the local target and
+        # recreated a fixed ranking under a different name.
+        critic_mean = critic_output[:, 0]
+        critic_uncertainty = torch.nn.functional.softplus(
+            critic_output[:, 1]
+        ).clamp_min(1e-4)
+        # Actor and Proposal remain distinct.  The Critic supplies calibrated
+        # value/uncertainty targets, but is not silently fused into Actor logits.
+        actor_logit = actor_residual
+        return (
+            actor_logit,
+            critic_mean,
+            critic_uncertainty,
+            proposal_logit,
+            actor_features,
+        )
+
+    def _select_den6_factorized_exploration_group(self, confidence_audit):
+        """Choose an uncertain decision family without an Episode schedule.
+
+        Simultaneous Add/Prune/Adjust locations use one WhereAll group for
+        both behavior and evidence. Coverage floors keep plan-level decisions
+        reachable after UCB bonuses alone become too small to ensure revisits.
+        """
+        simultaneous_where = bool(getattr(
+            self.args,
+            "heuristic_guidance_online_simultaneous_operation_exploration",
+            False,
+        ))
+        groups = (
+            ("WhereAll", "Amount", "Gate", "Fine")
+            if simultaneous_where
+            else (
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            )
+        )
+        where_groups = ("WhereAll",) if simultaneous_where else groups[:3]
+
+        def behavior_group(group):
+            return str(group)
+        if not bool(getattr(self, "training", False)):
+            return "none"
+        if not bool(getattr(
+            self.args, "heuristic_guidance_online_factorized_exploration", True
+        )):
+            return "all"
+        # Finish an outstanding same-frame codec comparison before opening a
+        # different group.  With 400 frames, global round-robin otherwise
+        # revisits the same frame/group only after the 512-entry LRU has
+        # evicted its anchor.  This priority depends solely on missing Actual
+        # evidence, never on Episode number or the desired metric value.
+        frame_codec_key = "|".join((
+            str(getattr(self.args, "_current_input_file", "")),
+            str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_m", 8)),
+        ))
+        pending = getattr(self, "_den6_pending_matched_groups", None)
+        if pending is None:
+            pending = OrderedDict()
+            self._den6_pending_matched_groups = pending
+        record = pending.get(frame_codec_key)
+        if isinstance(record, dict):
+            current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+            age = current_step - int(record.get("created_step", current_step))
+            max_age = max(int(getattr(
+                self.args, "heuristic_guidance_online_matched_anchor_max_age_steps", 1600
+            )), 1)
+            group = str(record.get("group", ""))
+            if group in groups and 0 <= age <= max_age:
+                record["attempts"] = int(record.get("attempts", 0)) + 1
+                pending.move_to_end(frame_codec_key)
+                self._den6_factorized_group_counts[group] = int(
+                    self._den6_factorized_group_counts.get(group, 0)
+                ) + 1
+                return behavior_group(group)
+            pending.pop(frame_codec_key, None)
+        scale = max(float(getattr(
+            self.args, "heuristic_guidance_online_factorized_ucb_scale", 0.25
+        )), 0.0)
+        counts = getattr(self, "_den6_factorized_group_counts", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            self._den6_factorized_group_counts = counts
+        remembered = getattr(self, "_den6_factorized_group_uncertainty", None)
+        if not isinstance(remembered, dict):
+            remembered = {}
+            self._den6_factorized_group_uncertainty = remembered
+        total = sum(int(counts.get(name, 0)) for name in groups)
+        where_count = sum(int(counts.get(name, 0)) for name in where_groups)
+        where_share = (
+            float(where_count) / float(max(total, 1)) if total > 0 else 0.0
+        )
+        desired_where_share = min(max(float(getattr(
+            self.args, "heuristic_guidance_online_where_exploration_share", 0.60
+        )), 0.0), 1.0)
+        where_coverage_weight = max(float(getattr(
+            self.args, "heuristic_guidance_online_where_coverage_weight", 1.0
+        )), 0.0)
+        where_family_deficit = max(desired_where_share - where_share, 0.0)
+        evidence_target = max(int(getattr(
+            self.args, "heuristic_guidance_online_group_evidence_target", 64
+        )), 1)
+        need_weight = max(float(getattr(
+            self.args, "heuristic_guidance_online_group_need_weight", 0.75
+        )), 0.0)
+        actual_stats = getattr(self, "_den6_actual_group_stats", {})
+        where_actual_comparisons = {
+            name: max(int(
+                (actual_stats.get(name, {}) or {}).get("comparisons", 0)
+            ), 0)
+            for name in where_groups
+        } if isinstance(actual_stats, dict) else {
+            name: 0 for name in where_groups
+        }
+        max_where_actual_comparisons = max(
+            where_actual_comparisons.values(), default=0
+        )
+        where_evidence_balance_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_where_evidence_balance_weight",
+            1.0,
+        )), 0.0)
+        scores = {}
+        score_audit = {}
+        for name in groups:
+            if name == "WhereAll":
+                where_uncertainties = []
+                for operation in ("Add", "Prune", "Adjust"):
+                    row = confidence_audit.get(operation, {}) \
+                        if isinstance(confidence_audit, dict) else {}
+                    where_uncertainties.append(float(
+                        row.get(
+                            "uncertainty",
+                            remembered.get(f"{operation}Where", 1.0),
+                        )
+                    ))
+                uncertainty = sum(where_uncertainties) / float(
+                    max(len(where_uncertainties), 1)
+                )
+            elif name.endswith("Where") and name in remembered:
+                uncertainty = float(remembered[name])
+            elif name.endswith("Where"):
+                operation = name[:-5]
+                row = confidence_audit.get(operation, {}) \
+                    if isinstance(confidence_audit, dict) else {}
+                uncertainty = float(row.get("uncertainty", 1.0))
+            else:
+                uncertainty = float(remembered.get(name, 1.0))
+            coverage = math.sqrt(
+                math.log(float(total) + 2.0) / float(int(counts.get(name, 0)) + 1)
+            )
+            actual_row = actual_stats.get(name, {}) \
+                if isinstance(actual_stats, dict) else {}
+            comparisons = max(int(actual_row.get("comparisons", 0)), 0)
+            evidence_deficit = 1.0 - min(
+                float(comparisons) / float(evidence_target), 1.0
+            )
+            actual_authority = self._den6_group_actual_authority(name)
+            learning_need = 0.5 * (
+                evidence_deficit + (1.0 - actual_authority)
+            )
+            family_bonus = (
+                float(where_coverage_weight) * float(where_family_deficit)
+                if name in where_groups else 0.0
+            )
+            # A low-authority operation can otherwise monopolise Where
+            # exploration: rejected/sub-margin comparisons keep its evidence
+            # deficit high after it has already consumed hundreds of Steps.
+            # Balance usable matched-Actual evidence across the three Where
+            # groups without imposing an operation-rate or performance target.
+            evidence_balance_bonus = (
+                float(where_evidence_balance_weight)
+                * float(max_where_actual_comparisons - comparisons)
+                / float(evidence_target)
+                if name in where_groups else 0.0
+            )
+            # The old order ``uncertainty + scale * coverage`` let a
+            # high-entropy Amount head monopolise the group indefinitely:
+            # in the 220604 run no Where group was sampled after E5.  Coverage
+            # is the UCB exploration guarantee, whereas uncertainty is only a
+            # learned preference between similarly covered groups.  Keeping
+            # coverage unscaled makes every non-zero decision group revisit
+            # possible without an Episode schedule; ``scale`` now controls
+            # how strongly measured uncertainty biases that fair coverage.
+            scores[name] = (
+                coverage
+                + float(scale) * min(max(uncertainty, 0.0), 1.0)
+                + float(need_weight) * float(learning_need)
+                + float(family_bonus)
+                + float(evidence_balance_bonus)
+            )
+            score_audit[name] = {
+                "score": float(scores[name]),
+                "coverage": float(coverage),
+                "uncertainty": float(uncertainty),
+                "comparisons": int(comparisons),
+                "evidence_deficit": float(evidence_deficit),
+                "authority": float(actual_authority),
+                "family_bonus": float(family_bonus),
+                "evidence_balance_bonus": float(evidence_balance_bonus),
+            }
+        # Stable order is used only to break exact UCB ties; after selection the
+        # count changes, so initially unknown groups are covered in turn.
+        selected = max(groups, key=lambda name: (scores[name], -groups.index(name)))
+        # Bounded score bonuses do not guarantee revisits once counts grow:
+        # the UCB coverage term tends to zero.  In 104216 Amount got only
+        # 9/2200 Steps in E41--95.  Reserve coverage for every decision family;
+        # pending same-frame comparisons above still finish before a new one.
+        min_share = min(max(float(getattr(
+            self.args, "heuristic_guidance_online_factorized_min_share", 0.10
+        )), 0.0), 1.0 / float(len(groups)))
+        underserved = [
+            name for name in groups
+            if int(counts.get(name, 0)) < min_share * float(total)
+        ] if all(int(counts.get(name, 0)) > 0 for name in groups) else []
+        if underserved:
+            selected = min(underserved, key=lambda name: (
+                int(counts.get(name, 0)), -scores[name], groups.index(name)
+            ))
+            score_audit[selected]["selected_by_coverage_floor"] = True
+        # A large evidence deficit can keep one group at the top of the UCB
+        # score for hundreds of consecutive Steps.  In 172318 this produced
+        # long synchronized waves (AddWhere at E41--60, AdjustWhere at
+        # E61--80, PruneWhere at E81--96), so the measured compression curve
+        # changed when the *exploration group* changed rather than when the
+        # Network improved.  Bound only consecutive exploration ownership;
+        # this does not prescribe an operation count or alter any score inside
+        # the selected group.
+        max_consecutive = max(int(getattr(
+            self.args,
+            "heuristic_guidance_online_factorized_max_consecutive_steps",
+            8,
+        )), 1)
+        previous_group = str(getattr(
+            self, "_den6_last_factorized_exploration_group", ""
+        ))
+        previous_streak = max(int(getattr(
+            self, "_den6_factorized_exploration_group_streak", 0
+        )), 0)
+        if selected == previous_group and previous_streak >= max_consecutive:
+            selected = max(
+                (name for name in groups if name != previous_group),
+                key=lambda name: (scores[name], -groups.index(name)),
+            )
+            score_audit[selected]["selected_by_consecutive_cap"] = True
+        current_streak = previous_streak + 1 if selected == previous_group else 1
+        self._den6_last_factorized_exploration_group = str(selected)
+        self._den6_factorized_exploration_group_streak = int(current_streak)
+        counts[selected] = int(counts.get(selected, 0)) + 1
+        self._den6_last_factorized_group_scores = {
+            "selected": str(selected),
+            "behavior_group": str(behavior_group(selected)),
+            "where_share": float(where_share),
+            "where_target": float(desired_where_share),
+            "groups": score_audit,
+        }
+        return behavior_group(selected)
+
+    def _complete_den6_pending_matched_group(self, frame_codec_key, anchor_key):
+        """Release one consumed same-frame counterfactual anchor."""
+        removed = False
+        pending = getattr(self, "_den6_pending_matched_groups", None)
+        if isinstance(pending, OrderedDict) and str(frame_codec_key):
+            removed = pending.pop(str(frame_codec_key), None) is not None or removed
+        anchors = getattr(self, "_den6_matched_anchor_plan_memory", None)
+        if isinstance(anchors, OrderedDict) and str(anchor_key):
+            removed = anchors.pop(str(anchor_key), None) is not None or removed
+        return bool(removed)
+
+    def _build_exact_den6_residual_plan(
+        self,
+        guidance,
+        voxel_coords,
+        learned_add_ratio,
+        learned_drop_ratio,
+        learned_move_ratio,
+        drop_score,
+        move_score,
+        move_logits,
+        add_pair_logits,
+        amount_selector_logits=None,
+        operation_gate_logits=None,
+    ):
+        """den6順位を基盤に、1Stepで1つだけonline planをsampleする。"""
+        if not isinstance(guidance, dict):
+            return None
+        exact = guidance.get("exact_candidate_guidance")
+        if not isinstance(exact, dict) or voxel_coords.shape[0] != 1:
+            return None
+        pools = exact.get("operation_edit_units")
+        if not isinstance(pools, dict):
+            pools = exact.get("operation_candidate_shortlists")
+        if not isinstance(pools, dict):
+            # 既存manifestは同じden6順位をranked_candidate_pools名で保持している。
+            pools = exact.get("ranked_candidate_pools")
+        if not isinstance(pools, dict):
+            return None
+        operations = ("Add", "Prune", "Adjust")
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        geometry_joint = bool(is_geometry_octree(self.args) and getattr(
+            self.args, 'geometry_octree_joint_policy', True))
+        if any(not isinstance(pools.get(name), list) or not pools.get(name) for name in operations):
+            return None
+        pool_identity_payload = json.dumps({
+            name: tuple(
+                str(candidate.get("candidate_id", "")) for candidate in pools[name]
+            )
+            for name in operations
+        }, sort_keys=True, separators=(",", ":"))
+        candidate_pool_identity_hash = hashlib.sha256(
+            pool_identity_payload.encode("utf-8")
+        ).hexdigest()
+
+        point_count = int(voxel_coords.shape[-1])
+        if point_count <= 0:
+            raise RuntimeError("ana_den6 online planの入力Voxel数が0である")
+        online_mode = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        max_total_ratio = min(max(float(
+            getattr(self.args, "heuristic_guidance_online_max_total_ratio", 0.0099)
+        ), 0.0), 0.0099)
+        max_changed_ratio = min(max(float(
+            getattr(self.args, "heuristic_guidance_online_max_changed_ratio", 0.0099)
+        ), 0.0), 0.0099)
+        if geometry_joint:
+            max_total_ratio = max_changed_ratio = float(getattr(
+                self.args, 'geometry_octree_max_edit_ratio', .0099))
+        # A plan needs at least one executable edit, but individual operation
+        # families may be zero because their counts are owned by the Gate.
+        if online_mode and int(math.floor(point_count * max_total_ratio)) < 1:
+            raise RuntimeError(
+                "ana_den6 onlineで1操作を維持しつつ総操作率1%未満にできない: "
+                f"voxel_count={point_count}, max_total_ratio={max_total_ratio}"
+            )
+        if online_mode and int(math.floor(point_count * max_changed_ratio)) < 1:
+            raise RuntimeError(
+                "ana_den6 onlineで1操作を維持しつつ変更Voxel率1%未満にできない: "
+                f"voxel_count={point_count}, max_changed_ratio={max_changed_ratio}"
+            )
+
+        anchor_phase = self._heuristic_anchor_phase()
+        residual_alpha = 1.0 - anchor_phase
+
+        # Amount/Actionは毎Step den6 priorを基礎にし、Networkは有界な乗法residualだけを与える。
+        # Step 0ではresidual_alpha=0となるためworkerのden6初期planと完全一致する。
+        prior_total_ratio = max(float(exact.get("total_ratio", 0.0)), 1e-9)
+        prior_shares_raw = exact.get("operation_shares", {})
+        prior_shares = {
+            name: max(float(prior_shares_raw.get(name, 1.0 / 3.0)), 1e-9)
+            for name in operations
+        }
+        prior_share_sum = max(sum(prior_shares.values()), 1e-9)
+        prior_ratios = {
+            name: prior_total_ratio * prior_shares[name] / prior_share_sum
+            for name in operations
+        }
+        learned_raw = {
+            "Add": learned_add_ratio.float().mean().clamp_min(1e-9),
+            "Prune": learned_drop_ratio.float().mean().clamp_min(1e-9),
+            "Adjust": learned_move_ratio.float().mean().clamp_min(1e-9),
+        }
+        amount_beta = min(max(float(
+            getattr(self.args, "heuristic_guidance_online_amount_residual_scale", 0.35)
+        ), 0.0), 0.50)
+        ratio_tensors = {}
+        for name in operations:
+            prior_t = learned_raw[name].new_tensor(prior_ratios[name])
+            log_residual = torch.log(learned_raw[name] / prior_t.clamp_min(1e-9))
+            bounded = torch.tanh(log_residual) * float(amount_beta) * float(residual_alpha)
+            ratio_tensors[name] = prior_t * torch.exp(bounded)
+        current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        exact_anchor_steps = max(
+            int(getattr(self.args, "heuristic_guidance_exact_anchor_steps", 0)), 0
+        )
+        unique_plan_mode = str(exact.get("source", "")) in {
+            "ana_den6_exact_unique_plan_online_v6",
+            "ana_den6_exact_one_pattern_anchor_online_v6",
+        }
+        anchor_counts_for_exploration = dict(
+            exact.get("anchor_operation_counts")
+            or dict(exact.get("heuristic_anchor_plan") or {}).get("operation_counts")
+            or {}
+        )
+        # unique_planは「Actualへ渡す完成planが1個」という意味であり、
+        # edit-unit Poolが1候補という意味ではない。reserve付きCacheに余剰候補が
+        # ある場合は、そのPool内でNetwork方策がWhereを探索できる。
+        has_where_alternatives = any(
+            len(pools[name]) > max(int(anchor_counts_for_exploration.get(name, 0)), 0)
+            for name in operations
+        )
+        exploration_active = bool(
+            online_mode
+            and self.training
+            and current_step >= exact_anchor_steps
+            and has_where_alternatives
+        )
+        # cacheが一意plan由来でも、Amountは3つの独立分布として学習する。
+        # unique_plan_modeでこれまで探索まで止めていたこともAmount grad=0の
+        # 原因だった。候補plan数は増やさず、実行する複合planは常に1つのまま。
+        amount_exploration_active = bool(
+            online_mode
+            and self.training
+            and current_step >= exact_anchor_steps
+        )
+        # Exact-onlineのActual値は実行plan自体の値である。既定設定では
+        # 全Stepの最初の25%だけbehavior探索を滑らかに減衰させ、その後は
+        # 学習済みの決定論的方策を実行する。Fixed validationは常に探索なし。
+        module_is_training = bool(getattr(self, "training", False))
+        exploration_mode = str(getattr(
+            self.args, "repair_policy_exploration_mode", "annealed"
+        )).strip().lower()
+        annealed_phase = (
+            self._exploration_phase() if exploration_mode == "annealed" else 0.0
+        )
+        exploration_multiplier = policy_exploration_multiplier(
+            training=module_is_training,
+            schedule_mode=exploration_mode,
+            constant_multiplier=getattr(
+                self.args, "repair_policy_exploration_constant_multiplier", 0.50
+            ),
+            annealed_phase=annealed_phase,
+        )
+        scheduled_exploration_multiplier = float(exploration_multiplier)
+        post_window_exploration = False
+        post_window_learning_need = 0.0
+        # The first 25% remains the broad exploration envelope.  Afterwards,
+        # retain only a tiny evidence-driven probe for decision groups that are
+        # still unsupported by matched Actual comparisons.  Accuracy enters via
+        # group authority, and the remembered Critic uncertainty prevents a
+        # poorly calibrated group from being declared complete merely because
+        # it accumulated many comparisons.  This is not an Episode anneal: once
+        # every group is supported and calibrated, the residual floor is zero.
+        if exploration_multiplier <= 0.0 and exploration_active:
+            actual_stats = getattr(self, "_den6_actual_group_stats", {})
+            remembered_uncertainty = getattr(
+                self, "_den6_factorized_group_uncertainty", {}
+            )
+            evidence_target = max(int(getattr(
+                self.args, "heuristic_guidance_online_group_evidence_target", 64
+            )), 1)
+            post_window_group_states = []
+            for group_name in (
+                ("WhereAll", "Amount", "Gate", "Fine")
+                if bool(getattr(
+                    self.args,
+                    "heuristic_guidance_online_simultaneous_operation_exploration",
+                    False,
+                ))
+                else (
+                    "AddWhere", "PruneWhere", "AdjustWhere",
+                    "Amount", "Gate", "Fine",
+                )
+            ):
+                row = actual_stats.get(group_name, {}) \
+                    if isinstance(actual_stats, dict) else {}
+                comparisons = max(int(row.get("comparisons", 0)), 0)
+                uncertainty = min(max(float(
+                    remembered_uncertainty.get(group_name, 1.0)
+                    if isinstance(remembered_uncertainty, dict) else 1.0
+                ), 0.0), 1.0)
+                post_window_group_states.append({
+                    "comparisons": int(comparisons),
+                    "authority": float(
+                        self._den6_group_actual_authority(group_name)
+                    ),
+                    "uncertainty": float(uncertainty),
+                })
+            post_window_floor = min(max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_post_window_exploration_floor",
+                0.0,
+            )), 0.0), 0.10)
+            (
+                exploration_multiplier,
+                post_window_learning_need,
+            ) = evidence_driven_post_window_multiplier(
+                post_window_floor,
+                evidence_target,
+                post_window_group_states,
+            )
+            post_window_exploration = exploration_multiplier > 0.0
+        # Once the scheduled 25% exploration window closes, do not merely set
+        # Gumbel to zero: disable the stochastic branch itself so tail lifting
+        # and random Amount/Gate/Fine choices cannot survive through ties.
+        if exploration_multiplier <= 0.0:
+            exploration_active = False
+            amount_exploration_active = False
+
+        # Compute candidate scores once, before Amount/Gate, so the same
+        # per-input evidence controls every Network residual in the plan.
+        (
+            network_scores,
+            raw_network_scores,
+            network_score_normalization_audit,
+        ) = self._exact_den6_candidate_scores(
+            guidance,
+            drop_score,
+            move_score,
+            move_logits,
+            add_pair_logits,
+            return_raw=True,
+        )
+        network_confidence_by_operation, network_confidence_audit = (
+            self._candidate_rd_alignment_confidence(guidance, network_scores)
+        )
+        network_plan_confidence = torch.stack([
+            network_confidence_by_operation[name] for name in operations
+        ]).mean().detach()
+        selection_mode = str(getattr(
+            self.args,
+            "heuristic_guidance_online_selection_mode",
+            # Missing on old checkpoints/tests: retain the safe
+            # prior-residual forward contract.
+            "prior_residual",
+        )).strip().lower()
+        actor_critic_selection = selection_mode == "actor_critic"
+        # ``prior_residual`` keeps den6 as the safe forward prior, but it must
+        # not disable the action-conditional Actual-RD evidence machinery.
+        # The 20261008/041554 run reached E131 with factorized_group=all and
+        # zero matched comparisons because every anchor/evidence branch was
+        # guarded by ``actor_critic_selection``.  Keep behavior selection and
+        # credit collection as separate concerns: both trainable policies use
+        # factorized exploration and strict same-frame anchors, while only the
+        # pure actor_critic mode removes the heuristic term from its logits.
+        factorized_actual_credit = selection_mode in {
+            "actor_critic", "prior_residual"
+        }
+        # Both modes learn the same Actual Actor/Critic/Proposal.  Their only
+        # behavioral difference is whether the safe Heuristic prior is kept in
+        # the forward score (prior_residual) or removed (actor_critic).
+        actual_residual_learning = bool(
+            factorized_actual_credit
+            and hasattr(self, "den6_candidate_actor")
+            and hasattr(self, "den6_candidate_critic")
+            and hasattr(self, "den6_candidate_proposal")
+            and hasattr(self, "den6_plan_critic")
+        )
+        factorized_behavior = bool(
+            factorized_actual_credit and actual_residual_learning
+        )
+        factorized_exploration_group = (
+            self._select_den6_factorized_exploration_group(
+                network_confidence_audit
+            )
+            if factorized_actual_credit and exploration_active and not geometry_joint
+            else "all" if exploration_active else "none"
+        )
+        if geometry_joint:
+            # One composite Actual result must supervise the joint decision;
+            # do not freeze the other operations/Amount behind factor anchors.
+            factorized_behavior = False
+            factorized_exploration_group = 'all' if exploration_active else 'none'
+        # Exact candidate credit needs an actually reused counterfactual anchor,
+        # not merely two plans whose hashes happen to coincide after the Network
+        # has changed.  Keep the first executed plan for each
+        # frame/codec/Where-group and replay all of its decisions except the one
+        # factorized Where group being explored.  This runtime memory contains
+        # candidate indices only; it contains no Actual result and cannot leak a
+        # codec oracle into proposal/selection.
+        matched_frame_codec_key = "|".join((
+            str(getattr(self.args, "_current_input_file", "")),
+            str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_m", 8)),
+        ))
+        matched_anchor_key = "|".join((
+            matched_frame_codec_key,
+            str(factorized_exploration_group),
+        ))
+        matched_anchor_runtime = getattr(
+            self, "_den6_matched_anchor_plan_memory", None
+        )
+        if matched_anchor_runtime is None:
+            matched_anchor_runtime = OrderedDict()
+            self._den6_matched_anchor_plan_memory = matched_anchor_runtime
+        matched_anchor_record = (
+            matched_anchor_runtime.get(matched_anchor_key)
+            if factorized_actual_credit
+            and str(factorized_exploration_group) in {
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
+            else None
+        )
+        matched_anchor_reused = False
+        plan_exploration_factor = self._learning_adaptive_exploration_factor(
+            network_confidence_audit,
+            factorized_exploration_group
+            if str(factorized_exploration_group) in {
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
+            else None,
+        )
+        operation_exploration_factors = {
+            name: self._learning_adaptive_exploration_factor(
+                network_confidence_audit, name
+            )
+            for name in operations
+        }
+        if exploration_mode == "annealed" and exploration_multiplier > 0.0:
+            # Do not let a small amount of early matched evidence collapse the
+            # requested exploration window immediately.  The schedule is an
+            # upper-envelope guarantee during the first 25%; Actual quality can
+            # still contract each group as that envelope falls.
+            plan_exploration_factor = max(
+                float(plan_exploration_factor), float(exploration_multiplier)
+            )
+            operation_exploration_factors = {
+                name: max(float(value), float(exploration_multiplier))
+                for name, value in operation_exploration_factors.items()
+            }
+
+        def _confidence_forward_full_backward(residual, decision_group=None):
+            """Scale hard forward authority but keep the residual trainable."""
+            if geometry_joint:
+                # SparsePCGC-specific alignment is not a geometry-codec
+                # safety proof and must not freeze Gate/Fine at their priors.
+                return residual
+            forward_authority = (
+                float(network_plan_confidence)
+                + (1.0 - float(network_plan_confidence))
+                * self._den6_group_actual_authority(decision_group)
+                if decision_group is not None
+                else float(network_plan_confidence)
+            )
+            if decision_group == "Amount":
+                forward_authority = amount_forward_authority(
+                    float(network_plan_confidence),
+                    self._den6_group_actual_authority(decision_group),
+                    getattr(self.args,
+                            "heuristic_guidance_online_amount_authority_floor", 0.75),
+                )
+            forward_value = residual * float(forward_authority)
+            return forward_value.detach() + residual - residual.detach()
+
+        # Explicit diagnostic anchors replay the Exact amount. Otherwise the
+        # Network chooses from the existing discrete total-ratio set; Fine
+        # residuals and per-operation safety/count bounds remain in place.
+        raw_bins = str(getattr(
+            self.args,
+            "heuristic_guidance_online_amount_bins",
+            "0.0015,0.002,0.0025,0.00275,0.003",
+        ))
+        try:
+            amount_bins = sorted({
+                min(max(float(value.strip()), 1e-9), max_total_ratio)
+                for value in raw_bins.split(",") if value.strip()
+            })
+        except (TypeError, ValueError):
+            amount_bins = [0.0015, 0.002, 0.0025, 0.00275, 0.003]
+        if not amount_bins:
+            raise RuntimeError("ana_den6 online Amount離散binが空である")
+        positive_bin_tensor = next(iter(ratio_tensors.values())).new_tensor(amount_bins)
+        # 20260914/155928の実測構成はNo-opと5つのpositive Amountを同じ
+        # 離散actionとして比較していた。Actor/Critic実験以前の
+        # prior-residual経路でも同じ6-class action spaceを維持する。
+        bin_tensor = torch.cat([
+            positive_bin_tensor.new_zeros((1,)), positive_bin_tensor
+        ])
+        learned_total = sum(ratio_tensors.values()).clamp(1e-9, max_total_ratio)
+        amount_temperature = max(float(getattr(
+            self.args, "heuristic_guidance_online_amount_temperature", 0.35
+        )), 0.05)
+        if torch.is_tensor(amount_selector_logits):
+            selector = amount_selector_logits.reshape(amount_selector_logits.shape[0], -1)[0]
+            if int(selector.numel()) != int(bin_tensor.numel()):
+                raise RuntimeError(
+                    "ana_den6 Amount selectorと離散bin数が一致しない: "
+                    f"selector={int(selector.numel())}, bins={int(bin_tensor.numel())}"
+                )
+            amount_logits_uncalibrated = selector.float() / amount_temperature
+            # Softmax is shift invariant, so remove the unidentifiable common
+            # offset.  Bound the *forward logits* differentiably rather than
+            # multiplying by a detached inverse std: the old calibration kept
+            # the probabilities finite but still let the selector parameter
+            # norm grow from 4.85 to 98.7.
+            amount_logits_centered = (
+                amount_logits_uncalibrated - amount_logits_uncalibrated.mean()
+            )
+            amount_logit_calibration_scale = 1.0
+            amount_logit_std_cap = max(float(getattr(
+                self.args, "heuristic_guidance_online_amount_logit_std_cap", 0.35
+            )), 0.0)
+            if amount_logit_std_cap > 0.0:
+                # Softsign retains a nonzero derivative for large logits;
+                # tanh rounded to +/-1 and killed Amount learning after the
+                # first exploration window despite an unchanged hard bin.
+                network_amount_logits = amount_logit_std_cap * torch.nn.functional.softsign(
+                    amount_logits_centered / amount_logit_std_cap
+                )
+            else:
+                network_amount_logits = amount_logits_centered
+            positive_prior_logits = -torch.abs(
+                positive_bin_tensor.log()
+                - positive_bin_tensor.new_tensor(prior_total_ratio).log()
+            ) / amount_temperature
+            noop_prior = positive_prior_logits.amax() + float(getattr(
+                self.args, "heuristic_guidance_online_noop_prior_offset", -1.50
+            ))
+            prior_amount_logits = torch.cat([
+                noop_prior.reshape(1), positive_prior_logits
+            ])
+            # Keep the bounded logits and safe prior, but give the selector
+            # enough authority to overcome that prior. Candidate Where rank
+            # confidence alone was too small for any alternative bin to win,
+            # even with the maximum possible learned logit difference.
+            amount_logits = prior_amount_logits + _confidence_forward_full_backward(
+                network_amount_logits - prior_amount_logits, "Amount"
+            )
+            if geometry_joint:
+                # Every positive bin and no-op is reachable. A codec-specific
+                # Amount policy must not be trapped by the SparsePCGC prior.
+                amount_logits = network_amount_logits
+            uncalibrated_std = float(
+                amount_logits_centered.detach().std(unbiased=False).cpu()
+            ) if int(amount_logits_centered.numel()) > 1 else 0.0
+            calibrated_std = float(
+                amount_logits.detach().std(unbiased=False).cpu()
+            ) if int(amount_logits.numel()) > 1 else 0.0
+            if uncalibrated_std > 0.0:
+                amount_logit_calibration_scale = calibrated_std / uncalibrated_std
+        else:
+            # 単体再生・legacy manifest用。通常trainでは上の既存Network headを使う。
+            positive_amount_logits = -torch.abs(
+                positive_bin_tensor.log() - learned_total.log().reshape(1)
+            ) / amount_temperature
+            noop_logit = positive_amount_logits.amax() + float(getattr(
+                self.args, "heuristic_guidance_online_noop_prior_offset", -1.50
+            ))
+            amount_logits = torch.cat([
+                noop_logit.reshape(1), positive_amount_logits
+            ])
+            amount_logits_uncalibrated = amount_logits
+            amount_logit_calibration_scale = 1.0
+        amount_log_probs = torch.log_softmax(amount_logits, dim=0)
+        amount_prob = amount_log_probs.exp()
+        learned_total_for_backward = (
+            (amount_prob * bin_tensor).sum()
+            if torch.is_tensor(amount_selector_logits)
+            else learned_total
+        )
+        exact_anchor_active = current_step < exact_anchor_steps
+        effective_amount_gumbel_scale = 0.0
+        # hard Exact再生はexact_anchor_stepsだけで終わる。Where候補方策を
+        # Amount用200-Step移行係数へ連動させると、学習初期のNetwork residualと
+        # Gumbel探索がほぼ0になり、Heuristic順位の固定選択へ戻ってしまう。
+        candidate_policy_alpha = 0.0 if exact_anchor_active else 1.0
+        if exact_anchor_active:
+            selected_amount_bin = (
+                int(bin_tensor.numel()) - int(positive_bin_tensor.numel())
+            ) + torch.argmin(
+                torch.abs(positive_bin_tensor - float(prior_total_ratio))
+            )
+        elif amount_exploration_active and (
+            not factorized_behavior
+            or factorized_exploration_group in {"all", "Amount"}
+        ):
+            uniform = torch.rand_like(amount_logits).clamp_(1e-8, 1.0 - 1e-8)
+            gumbel = -torch.log(-torch.log(uniform))
+            # 従来はanchor移行係数residual_alphaをGumbelにも掛けたため、
+            # 10,240 Stepすべてで中央binを選び、Amountが学習不能だった。
+            # hard anchorは上の分岐で完全再生済みなので、その後は
+            # 学習全体のexploration decayだけを使う。
+            amount_gumbel_scale = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_amount_gumbel_scale",
+                2.0,
+            )), 0.0)
+            effective_amount_gumbel_scale = (
+                float(amount_gumbel_scale)
+                * float(exploration_multiplier)
+                * float(plan_exploration_factor)
+            )
+            selected_amount_bin = torch.argmax(
+                amount_logits
+                + gumbel * float(effective_amount_gumbel_scale)
+            )
+        else:
+            selected_amount_bin = torch.argmax(amount_logits)
+        # den6の初期総量はdataset/codec条件で異なる。UVG m=8では0.50%であり、
+        # 8i向けの0.225--0.275%学習binへStep 0から丸めるとworkerが保存した
+        # Exact planとは別の要求数になる。anchor中のhard forwardだけはworkerの
+        # total_ratioをそのまま再生し、anchor終了後だけNetworkの離散binを使う。
+        hard_total = (
+            positive_bin_tensor.new_tensor(float(prior_total_ratio))
+            if exact_anchor_active
+            else bin_tensor[selected_amount_bin]
+        )
+        no_op_selected = bool(
+            (not exact_anchor_active)
+            and int(selected_amount_bin.detach().cpu()) == 0
+            and int(bin_tensor.numel()) == int(positive_bin_tensor.numel()) + 1
+        )
+        coarse_total_ratio = (
+            hard_total.detach()
+            + learned_total_for_backward
+            - learned_total_for_backward.detach()
+        )
+        # 粗いtotal binの内側では、Add/Prune/Adjustそれぞれの既存Amount
+        # headが独立した対数残差を出す。従来は単一fine_sampleを3操作へ
+        # 一括乗算していたため、各headが異なる判断をしてもhard Amountへ
+        # 同じ残差として現れ、Actual方策勾配も個別headへ届かなかった。
+        # shared residual headはlegacy経路用に残すが、Exact online Amountには
+        # 使用しない。totalは離散bin、内訳は3つのAmount headが担当する。
+        fine_sigma_base = max(float(getattr(
+            self.args, "heuristic_guidance_online_amount_log_sigma", 0.08
+        )), 0.0) * float(residual_alpha) * float(exploration_multiplier)
+        operation_fine_means = {
+            name: torch.log(
+                ratio_tensors[name] / ratio_tensors[name].new_tensor(prior_ratios[name])
+            )
+            for name in operations
+        }
+        operation_fine_samples = {}
+        operation_fine_log_probs = {}
+        operation_fine_policy_means = {}
+        operation_fine_sigmas = {}
+        for name in operations:
+            fine_mean = _confidence_forward_full_backward(
+                operation_fine_means[name], "Fine"
+            )
+            operation_fine_policy_means[name] = fine_mean
+            fine_sigma = (
+                float(fine_sigma_base)
+                * float(
+                    plan_exploration_factor
+                    if str(factorized_exploration_group) == "Fine"
+                    else operation_exploration_factors[name]
+                )
+            )
+            operation_fine_sigmas[name] = fine_sigma
+            if (
+                amount_exploration_active
+                and fine_sigma > 0.0
+                and (
+                    not factorized_behavior
+                    or factorized_exploration_group in {"all", "Fine"}
+                )
+            ):
+                fine_noise = torch.randn_like(fine_mean).detach()
+                fine_sample = fine_mean + float(fine_sigma) * fine_noise
+                # Normal score-functionのmean勾配は1/sigmaで発散する。forwardの
+                # log-prob値は変えず、backwardだけsigma倍して標準化すると、
+                # exploration幅とは独立な有限分散のFine residual更新になる。
+                fine_log_prob = normalized_fine_log_prob(
+                    fine_mean, fine_sample, fine_sigma
+                )
+            else:
+                fine_sample = fine_mean
+                fine_log_prob = fine_mean.new_zeros(())
+            operation_fine_samples[name] = fine_sample
+            operation_fine_log_probs[name] = fine_log_prob
+
+        # The operation gate must precede requested_counts.  Heuristic shares
+        # are a safety prior; centered Network logits are a learnable residual
+        # that can override that prior without an Episode-dependent handoff.
+        prior_share_tensor = coarse_total_ratio.new_tensor([
+            prior_shares[name] / prior_share_sum for name in operations
+        ]).clamp_min(torch.finfo(coarse_total_ratio.dtype).eps)
+        if torch.is_tensor(operation_gate_logits) and int(operation_gate_logits.numel()) >= 3:
+            # gate head order: Prune/Add/Adjust; den6 order: Add/Prune/Adjust.
+            gate_logits_flat = operation_gate_logits.float().reshape(
+                operation_gate_logits.shape[0], 3, -1
+            ).mean(dim=(0, 2))
+            gate_logits_den6 = torch.stack([
+                gate_logits_flat[1], gate_logits_flat[0], gate_logits_flat[2]
+            ])
+            # ``_learned_operation_gates`` represents independent sigmoid
+            # gates on the configured +/-logit_scale (normally 6).  Feeding
+            # that full scale into a three-way softmax made a single update
+            # move Add share 0.40 -> 0.918.  Convert it to a dimensionless
+            # bounded log-share residual using that existing scale.  The
+            # Network can still override the prior (up to exp(2) pairwise
+            # odds), while the first optimizer step cannot saturate the mix.
+            gate_logit_scale = max(float(getattr(
+                self.args, "repair_operation_gate_logit_scale", 6.0
+            )), 1e-6)
+            gate_residual_raw = (
+                gate_logits_den6 - gate_logits_den6.mean()
+            ) / float(gate_logit_scale)
+            # Candidate Where remains an unordered-pool Actor decision, but
+            # Gate allocates a *composite* plan and has no candidate-wise
+            # Actual counterfactual.  Using the raw Gate MLP directly caused
+            # the measured E6 distribution shift 0.40/0.36/0.24 ->
+            # 0.13/0.12/0.75 although the local RD target assigned Adjust only
+            # about 4%.  Use the safe operation share as a forward prior and
+            # scale only the Network residual by measured RD alignment.  Full
+            # backward authority is retained by the STE helper; no Episode or
+            # requested operation-ratio schedule is introduced.
+            gate_residual = _confidence_forward_full_backward(
+                gate_residual_raw, "Gate"
+            )
+            gate_combined_logits = prior_share_tensor.log() + gate_residual
+            gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
+            if (
+                factorized_behavior
+                and exploration_active
+                and factorized_exploration_group in {"all", "Gate"}
+            ):
+                uniform_gate = torch.rand_like(gate_combined_logits).clamp_(
+                    1e-8, 1.0 - 1e-8
+                )
+                gate_gumbel = -torch.log(-torch.log(uniform_gate))
+                gate_behavior_logits = gate_combined_logits + (
+                    gate_gumbel
+                    * float(exploration_multiplier)
+                    * float(plan_exploration_factor)
+                )
+                gate_probs = torch.softmax(gate_behavior_logits, dim=0)
+            else:
+                gate_probs = gate_log_probs.exp()
+        else:
+            gate_combined_logits = prior_share_tensor.log()
+            gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
+            gate_probs = gate_log_probs.exp()
+        # Exact anchor is a measurement-only replay.  It must retain its cached
+        # counts and must not give the Network credit for the heuristic plan.
+        operation_share_for_plan = (
+            prior_share_tensor if exact_anchor_active else gate_probs
+        )
+        sampled_ratio_tensors = {
+            name: (
+                coarse_total_ratio
+                * operation_share_for_plan[index]
+                * torch.exp(operation_fine_samples[name])
+            )
+            for index, name in enumerate(operations)
+        }
+        sampled_total_ratio = sum(sampled_ratio_tensors.values())
+        amount_bin_log_prob = amount_log_probs[selected_amount_bin]
+        if exact_anchor_active:
+            # anchorのAmountはNetworkの選択ではなく教師planの強制再生。
+            # ここで圧縮改善creditを与えると、探索前に中央binへ
+            # selectorが固定されるため、forward値を保って勾配だけ無効化する。
+            amount_bin_log_prob = amount_bin_log_prob.detach()
+        amount_fine_log_prob = torch.stack([
+            operation_fine_log_probs[name] for name in operations
+        ]).mean()
+        if no_op_selected:
+            # Fine and Gate do not cause the zero-edit action.  Do not assign
+            # them score-function credit for an action they did not execute.
+            amount_fine_log_prob = amount_fine_log_prob.detach() * 0.0
+        sampled_total_value = float(sampled_total_ratio.detach().cpu())
+        if sampled_total_value > max_total_ratio:
+            scale = max_total_ratio / max(sampled_total_value, 1e-12)
+            sampled_ratio_tensors = {
+                name: value * float(scale) for name, value in sampled_ratio_tensors.items()
+            }
+            sampled_total_ratio = sum(sampled_ratio_tensors.values())
+        minimum_plan_count = (
+            len(operations) if exact_anchor_active else (0 if no_op_selected else 1)
+        )
+        sampled_total_value = max(
+            float(sampled_total_ratio.detach().cpu()),
+            float(minimum_plan_count) / float(point_count),
+        )
+        sampled_total_value = min(sampled_total_value, max_total_ratio)
+
+        shares_value = {
+            name: max(float(sampled_ratio_tensors[name].detach().cpu()), 0.0)
+            / max(sampled_total_value, 1e-12)
+            for name in operations
+        }
+        total_budget = max(
+            minimum_plan_count,
+            int(math.ceil(float(point_count) * sampled_total_value)),
+        )
+        total_budget = min(
+            total_budget,
+            max(int(math.floor(point_count * max_total_ratio)), minimum_plan_count),
+        )
+        requested_counts = self._den6_allocate_counts(total_budget, shares_value)
+        for name in operations:
+            if geometry_joint:
+                capacity = sum(int(c.get('operation_count', 1)) for c in pools[name])
+                requested_counts[name] = min(max(int(requested_counts[name]), 0), capacity)
+            else:
+                requested_counts[name] = min(max(int(requested_counts[name]), 0), len(pools[name]))
+        diagnostic_policy = str(getattr(
+            self.args, "heuristic_guidance_online_diagnostic_policy", "normal"
+        )).strip().lower()
+        if diagnostic_policy == "noop":
+            no_op_selected = True
+            selected_amount_bin = selected_amount_bin.new_zeros(())
+            # The diagnostic override is applied after the normal Amount
+            # decision.  Keep the executed action's score-function term in
+            # sync with that override; otherwise the no-op replay carries the
+            # positive Amount bin's log-probability (and can become entirely
+            # non-differentiable when the positive path was detached).
+            amount_bin_log_prob = amount_log_probs[selected_amount_bin]
+            amount_fine_log_prob = amount_fine_log_prob.detach() * 0.0
+            requested_counts = {name: 0 for name in operations}
+        elif diagnostic_policy == "heuristic":
+            anchor_plan = exact.get(
+                "heuristic_anchor_plan", exact.get("initial_heuristic_plan", {})
+            )
+            anchor_counts = (
+                dict(anchor_plan.get("operation_counts") or {})
+                if isinstance(anchor_plan, dict) else {}
+            )
+            if anchor_counts:
+                no_op_selected = False
+                requested_counts = {
+                    name: min(max(int(anchor_counts.get(name, 0)), 0), len(pools[name]))
+                    for name in operations
+                }
+
+        if isinstance(matched_anchor_record, dict):
+            stored_pool_sizes = dict(matched_anchor_record.get("pool_sizes") or {})
+            stored_counts = dict(matched_anchor_record.get("selected_counts") or {})
+            stored_indices = dict(matched_anchor_record.get("selected_indices") or {})
+            anchor_valid = all(
+                int(stored_pool_sizes.get(name, -1)) == len(pools[name])
+                and len(tuple(stored_indices.get(name, ())))
+                    == int(stored_counts.get(name, -1))
+                and all(
+                    0 <= int(index) < len(pools[name])
+                    for index in tuple(stored_indices.get(name, ()))
+                )
+                for name in operations
+            )
+            anchor_valid = bool(
+                anchor_valid
+                and str(matched_anchor_record.get("pool_identity_hash", ""))
+                == str(candidate_pool_identity_hash)
+            )
+            anchor_age_steps = current_step - int(
+                matched_anchor_record.get("created_step", current_step)
+            )
+            max_anchor_age_steps = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_matched_anchor_max_age_steps",
+                1600,
+            )), 1)
+            anchor_valid = bool(
+                anchor_valid and 0 <= anchor_age_steps <= max_anchor_age_steps
+            )
+            if anchor_valid:
+                matched_group = str(factorized_exploration_group)
+                if matched_group == "WhereAll" or matched_group.endswith("Where"):
+                    frozen_counts = (
+                        dict(matched_anchor_record.get("requested_counts") or stored_counts)
+                        if matched_group == "WhereAll" else stored_counts
+                    )
+                    requested_counts = {
+                        name: int(frozen_counts[name]) for name in operations
+                    }
+                    no_op_selected = sum(requested_counts.values()) == 0
+                else:
+                    # Reconstruct a strict one-factor counterfactual.  The
+                    # stored Amount/Gate/Fine components remain frozen and
+                    # only the currently explored component is substituted.
+                    stored_total = float(matched_anchor_record.get(
+                        "coarse_total_ratio", prior_total_ratio
+                    ))
+                    stored_gate = dict(
+                        matched_anchor_record.get("gate_shares") or {}
+                    )
+                    stored_fine = dict(
+                        matched_anchor_record.get("fine_log_residuals") or {}
+                    )
+                    current_total = float(hard_total.detach().cpu())
+                    current_gate = {
+                        name: float(gate_probs[index].detach().cpu())
+                        for index, name in enumerate(operations)
+                    }
+                    current_fine = {
+                        name: float(operation_fine_samples[name].detach().cpu())
+                        for name in operations
+                    }
+                    counterfactual_total = (
+                        current_total if matched_group == "Amount" else stored_total
+                    )
+                    counterfactual_gate = (
+                        current_gate if matched_group == "Gate" else stored_gate
+                    )
+                    counterfactual_fine = (
+                        current_fine if matched_group == "Fine" else stored_fine
+                    )
+                    if matched_group != "Amount":
+                        no_op_selected = bool(
+                            matched_anchor_record.get("no_op_selected", False)
+                        )
+                    if no_op_selected or counterfactual_total <= 0.0:
+                        requested_counts = {name: 0 for name in operations}
+                    else:
+                        counterfactual_ratios = {
+                            name: max(counterfactual_total, 0.0)
+                            * max(float(counterfactual_gate.get(
+                                name, prior_shares[name] / prior_share_sum
+                            )), 0.0)
+                            * math.exp(float(counterfactual_fine.get(name, 0.0)))
+                            for name in operations
+                        }
+                        ratio_sum = sum(counterfactual_ratios.values())
+                        if ratio_sum > max_total_ratio:
+                            ratio_scale = max_total_ratio / max(ratio_sum, 1e-12)
+                            counterfactual_ratios = {
+                                name: value * ratio_scale
+                                for name, value in counterfactual_ratios.items()
+                            }
+                            ratio_sum = sum(counterfactual_ratios.values())
+                        total_budget = min(
+                            max(1, int(math.ceil(point_count * ratio_sum))),
+                            max(int(math.floor(point_count * max_total_ratio)), 1),
+                        )
+                        ratio_shares = {
+                            name: counterfactual_ratios[name]
+                            / max(ratio_sum, 1e-12)
+                            for name in operations
+                        }
+                        requested_counts = self._den6_allocate_counts(
+                            total_budget, ratio_shares
+                        )
+                        requested_counts = {
+                            name: min(max(int(requested_counts[name]), 0), len(pools[name]))
+                            for name in operations
+                        }
+                matched_anchor_reused = True
+                matched_anchor_record["reuse_count"] = int(
+                    matched_anchor_record.get("reuse_count", 0)
+                ) + 1
+            else:
+                matched_anchor_runtime.pop(matched_anchor_key, None)
+                matched_anchor_record = None
+
+        # Adjustはremove+addの2 cellを変えるため、変更Voxel cell比も1%未満に制限する。
+        minimum_changed_cells = 4 if exact_anchor_active else minimum_plan_count
+        max_changed_cells = max(
+            int(math.floor(point_count * max_changed_ratio)), minimum_changed_cells
+        )
+        def changed_cells(counts):
+            return int(counts["Add"] + counts["Prune"] + 2 * counts["Adjust"])
+        while changed_cells(requested_counts) > max_changed_cells:
+            reducible = [
+                name for name in operations
+                if requested_counts[name] > (1 if exact_anchor_active else 0)
+            ]
+            if not reducible:
+                break
+            operation = max(
+                reducible,
+                key=lambda name: (
+                    2 if name == "Adjust" else 1,
+                    requested_counts[name],
+                ),
+            )
+            requested_counts[operation] -= 1
+
+        # den6順位を安全な基準とし、candidate-local RD順位を実際に学習した
+        # operationだけNetworkが上書きする。confidenceは入力依存であり、
+        # Episode番号やtrain/validation履歴による権限scheduleではない。
+        residual_weight_start = max(float(getattr(
+            self.args, "heuristic_guidance_network_residual_weight", 1.0
+        )), 0.0)
+        residual_weight_max = max(float(getattr(
+            self.args,
+            "heuristic_guidance_network_residual_weight_max",
+            residual_weight_start,
+        )), residual_weight_start)
+        residual_weight = min(max(float(getattr(
+            self.args,
+            "_heuristic_guidance_network_residual_weight_current",
+            residual_weight_start,
+        )), 0.0), residual_weight_max)
+        temperature = max(float(
+            getattr(self.args, "heuristic_guidance_online_where_temperature", 0.75)
+        ), 0.05)
+        configured_where_gumbel_scale = max(float(getattr(
+            self.args, "heuristic_guidance_online_gumbel_scale", 1.0
+        )), 0.0)
+        gumbel_scales = []
+        heuristic_prior_weight = max(float(getattr(
+            self.args, "heuristic_guidance_final_where_weight", 0.01
+        )), 0.0)
+        ordered_indices = {}
+        static_compatible = {}
+        candidate_log_probs = {}
+        candidate_probs = {}
+        candidate_entropies = []
+        candidate_entropy_by_operation = {}
+        combined_logits = {}
+        score_audit = {}
+        deterministic_top1_changed = {}
+        exploration_top1_changed = {}
+        exploration_heuristic_top1_selected = {}
+        exploration_selection_change_rates = {}
+        exploration_support_sizes = {}
+        exploration_tail_sizes = {}
+        exploration_change_budgets = {}
+        exploration_support_reserve_factors = {}
+        exploration_support_masks = {}
+        gumbel_audit = {}
+        topk_audit = {}
+        network_terms = {}
+        candidate_value_scores = {}
+        candidate_local_losses = []
+        candidate_pairwise_losses = []
+        candidate_critic_losses = []
+        candidate_actor_critic_losses = []
+        candidate_actor_logits = {}
+        candidate_critic_values = {}
+        candidate_critic_uncertainties = {}
+        candidate_proxy_critic_values = {}
+        candidate_proxy_critic_uncertainties = {}
+        candidate_proposal_logits = {}
+        candidate_proposal_masks = {}
+        candidate_actor_features = {}
+        candidate_critic_features = {}
+        exploration_added_indices = {name: [] for name in operations}
+        exploration_heuristic_rank_bands = {
+            name: {"count": 0, "min": 0, "max": 0, "mean": 0.0}
+            for name in operations
+        }
+        deterministic_indices_by_operation = {name: [] for name in operations}
+        candidate_pairwise_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_candidate_pairwise_weight",
+            0.0,
+        )), 0.0)
+        candidate_utility_correlations = {}
+        candidate_utility_audit = {}
+
+        def _score_stats(value):
+            finite = value.detach().float()[torch.isfinite(value.detach().float())]
+            if int(finite.numel()) == 0:
+                return {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0}
+            return {
+                "min": float(finite.amin().cpu()),
+                "max": float(finite.amax().cpu()),
+                "mean": float(finite.mean().cpu()),
+                "std": float(finite.std(unbiased=False).cpu()),
+            }
+
+        for operation_index, operation in enumerate(operations):
+            mapping = guidance.get("candidate_tensor_map", {}).get(operation, {})
+            rank_score = mapping.get("rank_score")
+            if not torch.is_tensor(rank_score):
+                return None
+            utility_target = mapping.get("local_utility_target")
+            # local utility is a non-Actual RD teacher.  In actor_critic mode
+            # Heuristic rank is only one input feature and is never added to
+            # the final action logit.
+            local_feature_gate = network_confidence_by_operation[operation]
+            base_network_score = network_scores[operation]
+            heuristic_term = float(heuristic_prior_weight) * rank_score.float()
+            calibration_scale = 1.0
+            if actual_residual_learning:
+                (
+                    actor_logit,
+                    critic_value,
+                    critic_uncertainty,
+                    proposal_logit,
+                    actor_features,
+                ) = self._den6_actor_critic_candidate_values(
+                    mapping, base_network_score, operation_index
+                )
+                candidate_actor_logits[operation] = actor_logit
+                candidate_critic_values[operation] = critic_value
+                candidate_critic_uncertainties[operation] = critic_uncertainty
+                candidate_proposal_logits[operation] = proposal_logit
+                candidate_actor_features[operation] = actor_features
+                # Keep full proxy observations for the plan Critic while the
+                # behavior Actor receives the restricted feature view above.
+                critic_features = actor_features.clone()
+                critic_features[:, 2] = self._den6_standardize_candidate_feature(
+                    mapping.get("local_rate_benefit", actor_logit.new_zeros(actor_logit.shape))
+                )
+                critic_features[:, 3] = self._den6_standardize_candidate_feature(
+                    mapping.get("local_geometry_risk", actor_logit.new_zeros(actor_logit.shape))
+                )
+                candidate_critic_features[operation] = critic_features
+                proxy_critic_output = self.den6_candidate_proxy_critic(
+                    critic_features.detach()
+                )
+                candidate_proxy_critic_values[operation] = proxy_critic_output[:, 0]
+                candidate_proxy_critic_uncertainties[operation] = (
+                    torch.nn.functional.softplus(proxy_critic_output[:, 1])
+                    .clamp_min(1e-4)
+                )
+                if self.training:
+                    self._den6_factorized_group_uncertainty[
+                        f"{operation}Where"
+                    ] = min(max(float(
+                        critic_uncertainty.detach().mean().cpu()
+                    ), 0.0), 1.0)
+                # Bound magnitude without changing the learned ordering.  The
+                # detached scale prevents raw Actor growth from eventually
+                # overwhelming H merely through parameter norm inflation.
+                actor_centered = actor_logit - actor_logit.mean()
+                actor_scale = actor_centered.detach().square().mean().sqrt().clamp_min(1.0)
+                actor_residual = 0.5 * torch.tanh(actor_centered / actor_scale)
+                candidate_value_score = actor_residual
+                candidate_value_scores[operation] = actor_logit
+                network_term_uncalibrated = actor_residual
+                if actor_critic_selection:
+                    network_term = actor_residual
+                    logits = actor_residual
+                else:
+                    actual_authority = self._den6_actual_residual_authority(
+                        f"{operation}Where"
+                    )
+                    candidate_authority = actor_residual.new_full(
+                        actor_residual.shape, float(actual_authority)
+                    )
+                    # Fixed/eval is conservative: a candidate may perturb the
+                    # Heuristic policy only when its Actual Critic lower bound
+                    # beats the Heuristic cutoff candidate.  Training still
+                    # explores the safe reservoir to collect contrary data.
+                    if (
+                        (not self.training or not exploration_active)
+                        and int(actor_residual.numel()) > 0
+                    ):
+                        valid_rank = torch.isfinite(heuristic_term)
+                        valid_indices = torch.nonzero(
+                            valid_rank, as_tuple=False
+                        ).reshape(-1)
+                        if int(valid_indices.numel()) > 0:
+                            cutoff_position = min(
+                                max(int(requested_counts[operation]), 1),
+                                int(valid_indices.numel()),
+                            ) - 1
+                            heuristic_order = torch.argsort(
+                                heuristic_term.index_select(0, valid_indices),
+                                descending=True,
+                            )
+                            cutoff_index = valid_indices[heuristic_order[cutoff_position]]
+                            cutoff_mean = critic_value[cutoff_index].detach()
+                            cutoff_uncertainty = critic_uncertainty[cutoff_index].detach()
+                            kappa = max(float(getattr(
+                                self.args,
+                                "heuristic_guidance_online_actual_lcb_kappa",
+                                1.0,
+                            )), 0.0)
+                            relative_mean = critic_value - cutoff_mean
+                            relative_uncertainty = torch.sqrt(
+                                critic_uncertainty.square()
+                                + cutoff_uncertainty.square()
+                            )
+                            lcb = relative_mean - float(kappa) * relative_uncertainty
+                            candidate_authority = candidate_authority * lcb.gt(0.0).to(
+                                candidate_authority.dtype
+                            )
+                    network_term_forward = actor_residual * candidate_authority
+                    network_term = (
+                        network_term_forward.detach()
+                        + actor_residual
+                        - actor_residual.detach()
+                    )
+                    logits = heuristic_term + network_term
+                network_terms[operation] = network_term
+            else:
+                candidate_value_score = base_network_score
+                candidate_value_scores[operation] = candidate_value_score
+                network_term_uncalibrated = (
+                    float(candidate_policy_alpha)
+                    * float(residual_weight)
+                    * candidate_value_score
+                )
+                # 20260914/155928: Heuristic順位を初期方策とし、Networkの
+                # hard-forward authorityだけをRD整合confidenceで制限する。
+                # STEによりbackwardは縮小せず、confidenceが低い初期にも
+                # candidate-local RDを学習できる。
+                network_term_forward = (
+                    network_term_uncalibrated * local_feature_gate
+                )
+                network_term = (
+                    network_term_forward.detach()
+                    + network_term_uncalibrated
+                    - network_term_uncalibrated.detach()
+                ) * float(calibration_scale)
+                network_terms[operation] = network_term
+                logits = heuristic_term + network_term
+            static_mask = mapping.get("static_compatible")
+            if (
+                torch.is_tensor(static_mask)
+                and int(static_mask.numel()) == int(logits.numel())
+            ):
+                static_mask_device = static_mask.to(
+                    device=logits.device, dtype=torch.bool
+                ).reshape_as(logits)
+                if not bool(static_mask_device.any()):
+                    raise RuntimeError(
+                        f"ana_den6 onlineの{operation}候補に有効Voxelがない"
+                    )
+                policy_logits = logits.masked_fill(~static_mask_device, float("-inf"))
+                static_compatible[operation] = (
+                    static_mask_device.detach().to(device="cpu").tolist()
+                )
+            else:
+                policy_logits = logits
+            # A real Proposal changes pool membership before Actor selection.
+            # The subset always mixes stable spatial coverage, learned value,
+            # and uncertainty.  Actual evidence changes the mixture authority;
+            # Episode number and den6 rank never do.
+            proposal_mask = torch.isfinite(policy_logits)
+            if (
+                actual_residual_learning
+                and bool(getattr(
+                    self.args, "heuristic_guidance_online_learned_proposal", True
+                ))
+                and diagnostic_policy not in {"heuristic", "random_safe"}
+            ):
+                valid_indices = torch.nonzero(
+                    proposal_mask, as_tuple=False
+                ).reshape(-1)
+                valid_count_for_proposal = int(valid_indices.numel())
+                configured_max = int(getattr(
+                    self.args,
+                    "heuristic_guidance_online_proposal_max_candidates",
+                    2048,
+                ))
+                reserve_factor = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_proposal_reserve_factor",
+                    2.0,
+                )), 1.0)
+                minimum_count = max(
+                    int(requested_counts[operation]),
+                    int(math.ceil(max(int(requested_counts[operation]), 1) * reserve_factor)),
+                )
+                proposal_count = valid_count_for_proposal
+                if configured_max > 0:
+                    proposal_count = min(
+                        valid_count_for_proposal,
+                        max(minimum_count, configured_max),
+                    )
+                broaden_explored_safe_pool = bool(
+                    exploration_active
+                    and bool(getattr(
+                        self.args,
+                        "heuristic_guidance_online_exploration_full_safe_pool",
+                        True,
+                    ))
+                    and (
+                        not factorized_behavior
+                        or factorized_exploration_group in {
+                            "all", "WhereAll", f"{operation}Where"
+                        }
+                    )
+                )
+                proposal_count = exploration_proposal_count(
+                    valid_count_for_proposal,
+                    proposal_count,
+                    broaden_explored_safe_pool,
+                )
+                if proposal_count < valid_count_for_proposal:
+                    group_name = f"{operation}Where"
+                    proposal_quality = self._den6_group_actual_quality(
+                        group_name, "proposal"
+                    )
+                    critic_quality = self._den6_group_actual_quality(
+                        group_name, "critic"
+                    )
+                    # Proposal controls membership, not final Actor authority.
+                    # It earns operation-local authority and cannot freeze all
+                    # operations because another Proposal pair was incorrect.
+                    actual_authority = proposal_quality * (
+                        0.25 + 0.75 * critic_quality
+                    )
+                    coverage_fraction = min(max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_proposal_coverage_fraction",
+                        0.40,
+                    )), 0.10), 0.80)
+                    uncertainty_fraction = min(max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_proposal_uncertainty_fraction",
+                        0.20,
+                    )), 0.05), 0.50)
+                    # Always retain the full deterministic Heuristic baseline
+                    # plan in support.  Proposal may improve membership around
+                    # it, but an untrained head cannot delete the known-safe
+                    # action before Actual evidence exists.
+                    heuristic_core_count = min(
+                        max(int(requested_counts[operation]), 0),
+                        proposal_count,
+                    )
+                    heuristic_core = torch.topk(
+                        heuristic_term.masked_fill(~proposal_mask, float("-inf")),
+                        k=heuristic_core_count,
+                    ).indices if heuristic_core_count > 0 else valid_indices[:0]
+                    remaining_count = max(proposal_count - heuristic_core_count, 0)
+                    learned_fraction = min(
+                        1.0 - coverage_fraction,
+                        0.15 + 0.55 * actual_authority,
+                    )
+                    uncertainty_fraction = min(
+                        uncertainty_fraction,
+                        max(1.0 - coverage_fraction - learned_fraction, 0.0),
+                    )
+                    learned_count = int(round(remaining_count * learned_fraction))
+                    uncertainty_count = int(round(
+                        remaining_count * uncertainty_fraction
+                    ))
+                    coverage_count = max(
+                        remaining_count - learned_count - uncertainty_count, 0
+                    )
+                    chosen = [heuristic_core] if heuristic_core_count > 0 else []
+                    if coverage_count > 0:
+                        coverage_key = f"{matched_frame_codec_key}|{operation}"
+                        visits = getattr(
+                            self, "_den6_proposal_coverage_visits", OrderedDict()
+                        )
+                        visit_index = int(visits.get(coverage_key, 0))
+                        visits[coverage_key] = visit_index + 1
+                        visits.move_to_end(coverage_key)
+                        while len(visits) > max(int(getattr(
+                            self.args,
+                            "heuristic_guidance_online_proposal_coverage_entries",
+                            4096,
+                        )), 1):
+                            visits.popitem(last=False)
+                        self._den6_proposal_coverage_visits = visits
+                        base_offset = int.from_bytes(hashlib.blake2b(
+                            coverage_key.encode("utf-8"), digest_size=8
+                        ).digest(), byteorder="little", signed=False)
+                        offset = (
+                            base_offset + visit_index * max(coverage_count, 1)
+                        ) % max(valid_count_for_proposal, 1)
+                        # Rotating stratified coverage ensures every safe
+                        # reservoir member remains reachable over revisits; it
+                        # is not tied to den6 rank or Episode number.
+                        positions = (
+                            offset
+                            + torch.div(
+                                torch.arange(
+                                    coverage_count,
+                                    device=valid_indices.device,
+                                    dtype=torch.long,
+                                ) * valid_count_for_proposal,
+                                max(coverage_count, 1),
+                                rounding_mode="floor",
+                            )
+                        ) % max(valid_count_for_proposal, 1)
+                        chosen.append(valid_indices.index_select(0, positions))
+                    if learned_count > 0:
+                        proposal_value = candidate_proposal_logits[operation].masked_fill(
+                            ~proposal_mask, float("-inf")
+                        )
+                        chosen.append(torch.topk(
+                            proposal_value, k=min(learned_count, valid_count_for_proposal)
+                        ).indices)
+                    if uncertainty_count > 0:
+                        uncertainty_value = candidate_critic_uncertainties[operation].masked_fill(
+                            ~proposal_mask, float("-inf")
+                        )
+                        chosen.append(torch.topk(
+                            uncertainty_value,
+                            k=min(uncertainty_count, valid_count_for_proposal),
+                        ).indices)
+                    selected_proposal_indices = torch.unique(torch.cat(chosen))
+                    if int(selected_proposal_indices.numel()) < proposal_count:
+                        # Fill duplicates from proposal value, never heuristic rank.
+                        fill_order = torch.argsort(
+                            candidate_proposal_logits[operation].masked_fill(
+                                ~proposal_mask, float("-inf")
+                            ), descending=True
+                        )
+                        selected_flag = torch.zeros_like(proposal_mask)
+                        selected_flag[selected_proposal_indices] = True
+                        fill = fill_order[
+                            torch.isfinite(policy_logits[fill_order])
+                            & ~selected_flag[fill_order]
+                        ][:proposal_count - int(selected_proposal_indices.numel())]
+                        selected_proposal_indices = torch.cat(
+                            (selected_proposal_indices, fill), dim=0
+                        )
+                    learned_mask = torch.zeros_like(proposal_mask)
+                    learned_mask[selected_proposal_indices] = True
+                    proposal_mask = learned_mask
+                    policy_logits = policy_logits.masked_fill(
+                        ~proposal_mask, float("-inf")
+                    )
+            if matched_anchor_reused:
+                # Proposal membership is allowed to evolve, but an exact
+                # counterfactual must retain the previously encoded incumbent.
+                # Re-admit only those already safety-checked anchor candidates;
+                # the explored group may then replace a small subset below.
+                anchor_indices = tuple(
+                    (matched_anchor_record.get("selected_indices") or {}).get(
+                        operation, ()
+                    )
+                )
+                if anchor_indices:
+                    anchor_index_tensor = torch.as_tensor(
+                        anchor_indices,
+                        device=policy_logits.device,
+                        dtype=torch.long,
+                    )
+                    proposal_mask = proposal_mask.clone()
+                    proposal_mask[anchor_index_tensor] = True
+                    policy_logits = policy_logits.clone()
+                    policy_logits[anchor_index_tensor] = logits[anchor_index_tensor]
+            candidate_proposal_masks[operation] = proposal_mask
+            if (
+                torch.is_tensor(utility_target)
+                and int(utility_target.numel()) == int(policy_logits.numel())
+            ):
+                utility_target = utility_target.to(
+                    device=policy_logits.device, dtype=policy_logits.dtype
+                )
+                local_valid = torch.isfinite(policy_logits) & torch.isfinite(utility_target)
+                if bool(local_valid.any()):
+                    local_prediction = candidate_value_score[local_valid]
+                    # 004957と同じbounded teacher。utilityの順位は保ったまま、
+                    # codec attribution外れ値がlistwise分布を支配するのを防ぐ。
+                    local_target = 0.5 * torch.tanh(utility_target[local_valid])
+                    candidate_local_losses.append(
+                        candidate_listwise_local_credit(
+                            local_prediction, local_target
+                        )
+                    )
+                    if actual_residual_learning:
+                        # Dense proxy targets train only the proxy head.  The
+                        # Actual head remains untrained until a strict matched
+                        # codec comparison exists, so its uncertainty cannot
+                        # recreate den6 ordering in Proposal membership.
+                        critic_prediction = candidate_proxy_critic_values[
+                            operation
+                        ][local_valid]
+                        critic_uncertainty = candidate_proxy_critic_uncertainties[
+                            operation
+                        ][local_valid]
+                        critic_error = critic_prediction - local_target
+                        critic_regression = torch.nn.functional.smooth_l1_loss(
+                            critic_prediction,
+                            local_target,
+                            beta=0.25,
+                        )
+                        uncertainty_target = (
+                            critic_error.detach().abs() + 0.05
+                        ).clamp(max=2.0)
+                        critic_calibration = torch.nn.functional.smooth_l1_loss(
+                            critic_uncertainty,
+                            uncertainty_target,
+                            beta=0.25,
+                        )
+                        candidate_critic_losses.append(
+                            critic_regression + 0.1 * critic_calibration
+                        )
+                        candidate_actor_critic_losses.append(
+                            candidate_listwise_local_credit(
+                                local_prediction,
+                                critic_prediction.detach(),
+                            )
+                        )
+                    if candidate_pairwise_weight > 0.0:
+                        candidate_pairwise_losses.append(
+                            candidate_pairwise_local_credit(
+                                local_prediction,
+                                local_target,
+                                max_pairs=getattr(
+                                    self.args,
+                                    "heuristic_guidance_online_candidate_pairwise_max_pairs",
+                                    256,
+                                ),
+                            )
+                        )
+                    pred_centered = local_prediction.detach().float()
+                    pred_centered = pred_centered - pred_centered.mean()
+                    target_centered = local_target.detach().float()
+                    target_centered = target_centered - target_centered.mean()
+                    denominator = (
+                        pred_centered.square().sum().sqrt()
+                        * target_centered.square().sum().sqrt()
+                    )
+                    candidate_utility_correlations[operation] = (
+                        float((pred_centered * target_centered).sum().cpu())
+                        / max(float(denominator.cpu()), 1e-12)
+                    )
+                    candidate_utility_audit[operation] = {
+                        "target": _score_stats(local_target),
+                        "prediction": _score_stats(local_prediction),
+                        "valid_count": int(local_valid.sum().detach().cpu()),
+                    }
+                    rate_target = mapping.get("local_rate_benefit")
+                    geometry_target = mapping.get("local_geometry_risk")
+                    if torch.is_tensor(rate_target):
+                        candidate_utility_audit[operation]["rate"] = _score_stats(
+                            rate_target.to(local_prediction.device)[local_valid]
+                        )
+                    if torch.is_tensor(geometry_target):
+                        candidate_utility_audit[operation]["geometry"] = _score_stats(
+                            geometry_target.to(local_prediction.device)[local_valid]
+                        )
+                    valid_count_for_rank = int(local_prediction.numel())
+                    if valid_count_for_rank > 1:
+                        prediction_rank = torch.argsort(torch.argsort(
+                            local_prediction.detach().float()
+                        )).float()
+                        target_rank = torch.argsort(torch.argsort(
+                            local_target.detach().float()
+                        )).float()
+                        prediction_rank = prediction_rank - prediction_rank.mean()
+                        target_rank = target_rank - target_rank.mean()
+                        rank_denominator = (
+                            prediction_rank.square().sum().sqrt()
+                            * target_rank.square().sum().sqrt()
+                        ).clamp_min(1e-12)
+                        candidate_utility_audit[operation]["spearman"] = float(
+                            ((prediction_rank * target_rank).sum() / rank_denominator).cpu()
+                        )
+                        utility_k = min(8, valid_count_for_rank)
+                        prediction_top = set(torch.topk(
+                            local_prediction.detach(), utility_k
+                        ).indices.cpu().tolist())
+                        target_top = set(torch.topk(
+                            local_target.detach(), utility_k
+                        ).indices.cpu().tolist())
+                        candidate_utility_audit[operation]["topk_overlap"] = (
+                            len(prediction_top & target_top) / float(utility_k)
+                        )
+                        pair_count = min(
+                            max(int(getattr(
+                                self.args,
+                                "heuristic_guidance_online_candidate_pairwise_max_pairs",
+                                256,
+                            )), 0),
+                            valid_count_for_rank // 2,
+                        )
+                        if pair_count > 0:
+                            target_order = torch.argsort(local_target.detach())
+                            lower = target_order[:pair_count]
+                            upper = target_order[-pair_count:].flip(0)
+                            target_gap = (
+                                local_target.detach()[upper]
+                                - local_target.detach()[lower]
+                            )
+                            clear = torch.isfinite(target_gap) & target_gap.gt(0.0)
+                            if bool(clear.any()):
+                                predicted_gap = (
+                                    local_prediction.detach()[upper[clear]]
+                                    - local_prediction.detach()[lower[clear]]
+                                )
+                                candidate_utility_audit[operation]["pairwise_accuracy"] = float(
+                                    predicted_gap.gt(0.0).float().mean().cpu()
+                                )
+            combined_logits[operation] = policy_logits
+            valid_for_top1 = torch.isfinite(policy_logits)
+            heuristic_for_top1 = heuristic_term.masked_fill(
+                ~valid_for_top1, float("-inf")
+            )
+            deterministic_top1_changed[operation] = bool(
+                int(torch.argmax(heuristic_for_top1).detach().cpu())
+                != int(torch.argmax(policy_logits).detach().cpu())
+            )
+            valid_count = int(valid_for_top1.sum().detach().cpu())
+            audit_k = min(8, valid_count)
+            heuristic_topk = torch.topk(
+                heuristic_for_top1, k=audit_k
+            ).indices.detach().cpu().tolist()
+            combined_topk = torch.topk(
+                policy_logits, k=audit_k
+            ).indices.detach().cpu().tolist()
+            heuristic_topk_set = set(int(value) for value in heuristic_topk)
+            combined_topk_set = set(int(value) for value in combined_topk)
+            common_topk = heuristic_topk_set & combined_topk_set
+            heuristic_positions = {
+                int(value): index for index, value in enumerate(heuristic_topk)
+            }
+            combined_positions = {
+                int(value): index for index, value in enumerate(combined_topk)
+            }
+            topk_audit[operation] = {
+                "k": int(audit_k),
+                "heuristic_indices": [int(value) for value in heuristic_topk],
+                "combined_indices": [int(value) for value in combined_topk],
+                "overlap_rate": (
+                    float(len(common_topk)) / float(max(audit_k, 1))
+                ),
+                "mean_rank_displacement": (
+                    sum(abs(
+                        heuristic_positions[index] - combined_positions[index]
+                    ) for index in common_topk) / float(max(len(common_topk), 1))
+                ),
+            }
+            score_audit[operation] = {
+                "heuristic": _score_stats(heuristic_term),
+                "network_raw": _score_stats(raw_network_scores[operation]),
+                "network_normalized": _score_stats(network_scores[operation]),
+                "network_weighted_uncalibrated": _score_stats(
+                    network_term_uncalibrated
+                ),
+                "network_weighted": _score_stats(network_term),
+                "combined": _score_stats(policy_logits),
+                "calibration_scale": float(calibration_scale),
+                "local_utility_gate": float(local_feature_gate.detach().cpu()),
+                "selection_mode": str(selection_mode),
+                "actor_logit": _score_stats(
+                    candidate_actor_logits.get(operation, network_term)
+                ),
+                "critic_value": _score_stats(
+                    candidate_critic_values.get(operation, candidate_value_score)
+                ),
+                "critic_uncertainty": _score_stats(
+                    candidate_critic_uncertainties.get(
+                        operation, candidate_value_score.new_zeros(candidate_value_score.shape)
+                    )
+                ),
+                "normalization": dict(
+                    network_score_normalization_audit.get(operation, {})
+                ),
+            }
+            heuristic_std = score_audit[operation]["heuristic"]["std"]
+            network_std = score_audit[operation]["network_weighted"]["std"]
+            score_audit[operation]["network_std_share"] = (
+                float(network_std) / max(float(heuristic_std + network_std), 1e-12)
+            )
+            scaled_logits = policy_logits / float(temperature)
+            log_probs = torch.log_softmax(scaled_logits, dim=0)
+            probs = torch.softmax(scaled_logits, dim=0)
+            candidate_log_probs[operation] = log_probs
+            candidate_probs[operation] = probs
+            finite_policy = torch.isfinite(log_probs)
+            candidate_entropy = -(
+                probs[finite_policy] * log_probs[finite_policy]
+            ).sum()
+            candidate_entropies.append(candidate_entropy)
+            candidate_entropy_by_operation[operation] = candidate_entropy
+            operation_exploration_active = bool(
+                exploration_active
+                and (
+                    not factorized_behavior
+                    or factorized_exploration_group in {
+                        "all", "WhereAll", f"{operation}Where"
+                    }
+                )
+            )
+            configured_max_candidate_changes = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_exploration_max_candidate_changes",
+                0,
+            )), 0)
+            configured_candidate_change_fraction = min(max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_exploration_candidate_fraction",
+                0.50,
+            )), 0.0), 1.0)
+            candidate_change_factor = (
+                float(exploration_multiplier)
+                * float(operation_exploration_factors[operation])
+                if exploration_mode == "annealed"
+                else float(operation_exploration_factors[operation])
+            )
+            effective_max_candidate_changes = (
+                exploration_candidate_change_budget(
+                    configured_max_candidate_changes,
+                    requested_counts[operation],
+                    configured_candidate_change_fraction,
+                    candidate_change_factor,
+                )
+            )
+            exploration_change_budgets[operation] = int(
+                effective_max_candidate_changes
+            )
+            if operation_exploration_active:
+                uniform = torch.rand_like(scaled_logits).clamp_(1e-8, 1.0 - 1e-8)
+                gumbel = -torch.log(-torch.log(uniform))
+                finite_scaled = scaled_logits.detach()[
+                    torch.isfinite(scaled_logits.detach())
+                ]
+                score_std = (
+                    float(finite_scaled.std(unbiased=False).cpu())
+                    if int(finite_scaled.numel()) > 1 else 0.0
+                )
+                if actual_residual_learning:
+                    uncertainty_scale = float(
+                        candidate_critic_uncertainties[operation]
+                        .detach().mean().cpu()
+                    )
+                    # The old scale was proportional only to Actor logit std.
+                    # A fresh nearly-uniform Actor therefore received almost no
+                    # stochastic perturbation and converged to proxy ordering in
+                    # E1.  Keep an absolute logit-scale floor; Actual evidence,
+                    # not Episode number, still controls contraction below.
+                    exploration_logit_scale = max(
+                        score_std,
+                        max(float(getattr(
+                            self.args,
+                            "heuristic_guidance_online_gumbel_logit_floor",
+                            0.10,
+                        )), 0.0),
+                    )
+                    operation_gumbel_scale = (
+                        max(exploration_logit_scale, 1e-3)
+                        * max(uncertainty_scale, 1e-3)
+                        * float(configured_where_gumbel_scale)
+                        * float(exploration_multiplier)
+                        * float(operation_exploration_factors[operation])
+                    )
+                else:
+                    operation_gumbel_scale = (
+                        score_std
+                        * float(configured_where_gumbel_scale)
+                        * float(exploration_multiplier)
+                        * float(operation_exploration_factors[operation])
+                    )
+                gumbel_scales.append(operation_gumbel_scale)
+                # Sample only among candidates that the current behavior
+                # score regards as plausible.  The online shortlist reserve
+                # is the upper bound at low ranking quality; as measured RD
+                # ranking improves, the support contracts toward the number
+                # actually requested while retaining a non-zero reserve.
+                configured_reserve = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_compact_reserve_factor",
+                    4.0,
+                )), 1.0)
+                adaptive_reserve = (
+                    1.0
+                    + (configured_reserve - 1.0)
+                    * float(operation_exploration_factors[operation])
+                )
+                finite_indices = torch.nonzero(
+                    torch.isfinite(scaled_logits), as_tuple=False
+                ).reshape(-1)
+                valid_count_for_support = int(finite_indices.numel())
+                requested_for_support = max(int(requested_counts[operation]), 1)
+                support_count = min(
+                    valid_count_for_support,
+                    max(
+                        requested_for_support,
+                        int(math.ceil(requested_for_support * adaptive_reserve)),
+                    ),
+                )
+                support_indices = torch.topk(
+                    scaled_logits, k=max(support_count, 1)
+                ).indices
+                support_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
+                support_mask[support_indices] = True
+                # Heuristic上位候補だけを反復すると、Actual RDは低いが
+                # rankingの誤りをActor/Criticが観測できない。合法・安全性filter後の
+                # tailから少数をrotating coverageでsupportへ入れる。これは
+                # Episode scheduleではなく、Actual品質が上がるとoperation factorと
+                # 共に自然に減る安全pool内の探索である。
+                tail_fraction = min(max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_exploration_tail_fraction",
+                    1.0,
+                )), 0.0), 1.0)
+                max_tail = effective_max_candidate_changes
+                tail_count = min(
+                    max_tail,
+                    max(
+                        int(math.ceil(
+                            requested_for_support * tail_fraction
+                            * float(operation_exploration_factors[operation])
+                        )),
+                        0,
+                    ),
+                    # Candidates below the incumbent selection boundary are
+                    # the informative tail.  Previously this used
+                    # ``support_count``; when the reserve covered the complete
+                    # Proposal subset (the common case), tail_count became
+                    # zero and no lower-priority safe action could be tested.
+                    max(valid_count_for_support - requested_for_support, 0),
+                )
+                tail_indices = finite_indices.new_empty((0,), dtype=torch.long)
+                if tail_count > 0:
+                    ranked_indices = finite_indices[torch.argsort(
+                        scaled_logits[finite_indices], descending=True
+                    )]
+                    tail_pool = ranked_indices[
+                        min(requested_for_support, valid_count_for_support):
+                    ]
+                    rotation = int(getattr(
+                        self, "_den6_exploration_rotation", 0
+                    ))
+                    stride = max(int(tail_pool.numel()) // tail_count, 1)
+                    positions = (
+                        rotation + torch.arange(
+                            tail_count, device=tail_pool.device, dtype=torch.long
+                        ) * stride
+                    ) % max(int(tail_pool.numel()), 1)
+                    tail_indices = tail_pool[positions]
+                    support_mask[tail_indices] = True
+                    self._den6_exploration_rotation = rotation + 1
+                sampled_base = scaled_logits.clone()
+                if int(tail_indices.numel()) > 0:
+                    # Tailを強制選択せず、incumbent選択境界までだけ引き上げ、
+                    # uncertainty-scaled Gumbelで試される可能性を与える。
+                    incumbent_boundary_count = min(
+                        requested_for_support, valid_count_for_support
+                    )
+                    incumbent_boundary = torch.topk(
+                        scaled_logits[finite_indices],
+                        k=max(incumbent_boundary_count, 1),
+                    ).values.min().detach()
+                    sampled_base[tail_indices] = torch.maximum(
+                        sampled_base[tail_indices], incumbent_boundary
+                    )
+                sampled_support_score = (
+                    sampled_base
+                    + gumbel * float(operation_gumbel_scale)
+                ).masked_fill(~support_mask, float("-inf")).detach()
+                deterministic_remainder_score = scaled_logits.masked_fill(
+                    support_mask, float("-inf")
+                ).detach()
+                exploration_support_sizes[operation] = int(support_mask.sum().cpu())
+                exploration_tail_sizes[operation] = int(tail_indices.numel())
+                exploration_support_reserve_factors[operation] = float(
+                    adaptive_reserve
+                )
+                exploration_support_masks[operation] = support_mask
+                gumbel_audit[operation] = _score_stats(
+                    (gumbel * float(operation_gumbel_scale))[support_mask]
+                )
+            else:
+                sampled_support_score = scaled_logits.detach()
+                deterministic_remainder_score = scaled_logits.new_full(
+                    scaled_logits.shape, float("-inf")
+                )
+                support_mask = torch.isfinite(scaled_logits)
+                exploration_support_sizes[operation] = int(support_mask.sum().cpu())
+                exploration_tail_sizes[operation] = 0
+                exploration_support_reserve_factors[operation] = 1.0
+                exploration_support_masks[operation] = support_mask
+                gumbel_audit[operation] = _score_stats(
+                    scaled_logits.new_zeros(scaled_logits.shape)
+                )
+            deterministic_top_index = int(
+                torch.argmax(scaled_logits).detach().cpu()
+            )
+            behavior_top_index = int(
+                torch.argmax(sampled_support_score).detach().cpu()
+            )
+            heuristic_top_index = int(
+                torch.argmax(heuristic_for_top1).detach().cpu()
+            )
+            exploration_top1_changed[operation] = bool(
+                behavior_top_index != deterministic_top_index
+            )
+            exploration_heuristic_top1_selected[operation] = bool(
+                behavior_top_index == heuristic_top_index
+            )
+            try:
+                support_order = torch.argsort(
+                    sampled_support_score, descending=True, stable=True
+                )
+                remainder_order = torch.argsort(
+                    deterministic_remainder_score, descending=True, stable=True
+                )
+            except TypeError:
+                tie_break = torch.arange(
+                    scaled_logits.numel(), device=scaled_logits.device,
+                    dtype=scaled_logits.dtype
+                )
+                support_order = torch.argsort(
+                    sampled_support_score - tie_break * 1e-12, descending=True
+                )
+                remainder_order = torch.argsort(
+                    deterministic_remainder_score - tie_break * 1e-12,
+                    descending=True,
+                )
+            support_order = support_order[
+                torch.isfinite(sampled_support_score[support_order])
+            ]
+            remainder_order = remainder_order[
+                torch.isfinite(deterministic_remainder_score[remainder_order])
+            ]
+            # Build an incumbent plan and change only a small, explicit subset.
+            # Sampling the complete requested set changed hundreds of candidates
+            # at once, so one Actual scalar could not identify their credit.
+            deterministic_order = torch.argsort(scaled_logits, descending=True)
+            if matched_anchor_reused:
+                anchor_indices = tuple(
+                    (matched_anchor_record.get("selected_indices") or {}).get(
+                        operation, ()
+                    )
+                )
+                if anchor_indices:
+                    anchor_prefix = torch.as_tensor(
+                        anchor_indices,
+                        device=scaled_logits.device,
+                        dtype=torch.long,
+                    )
+                    anchor_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
+                    anchor_mask[anchor_prefix] = True
+                    deterministic_order = torch.cat((
+                        anchor_prefix,
+                        deterministic_order[~anchor_mask[deterministic_order]],
+                    ), dim=0)
+            if diagnostic_policy == "heuristic":
+                deterministic_order = torch.argsort(
+                    heuristic_for_top1, descending=True
+                )
+                operation_exploration_active = False
+            elif diagnostic_policy == "random_safe":
+                valid_indices = torch.nonzero(
+                    torch.isfinite(scaled_logits), as_tuple=False
+                ).reshape(-1)
+                random_order = valid_indices.index_select(
+                    0, torch.randperm(valid_indices.numel(), device=valid_indices.device)
+                )
+                invalid_indices = torch.nonzero(
+                    ~torch.isfinite(scaled_logits), as_tuple=False
+                ).reshape(-1)
+                deterministic_order = torch.cat((random_order, invalid_indices), dim=0)
+                operation_exploration_active = False
+            audit_selection_count = min(
+                max(int(requested_counts[operation]), 0),
+                int(valid_for_top1.sum().detach().cpu()),
+            )
+            if audit_selection_count > 0:
+                deterministic_prefix = deterministic_order[:audit_selection_count]
+                deterministic_indices_by_operation[operation] = [
+                    int(value) for value in deterministic_prefix.detach().cpu().tolist()
+                ]
+                if (
+                    operation_exploration_active
+                    and audit_selection_count > effective_max_candidate_changes
+                ):
+                    incumbent_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
+                    incumbent_mask[deterministic_prefix] = True
+                    alternatives = support_order[~incumbent_mask[support_order]]
+                    change_count = min(
+                        effective_max_candidate_changes,
+                        audit_selection_count,
+                        int(alternatives.numel()),
+                    )
+                    if change_count > 0:
+                        kept = deterministic_prefix[:-change_count]
+                        explored = alternatives[:change_count]
+                        behavior_prefix = torch.cat((kept, explored), dim=0)
+                        exploration_added_indices[operation] = [
+                            int(value) for value in explored.detach().cpu().tolist()
+                        ]
+                    else:
+                        behavior_prefix = deterministic_prefix
+                elif operation_exploration_active:
+                    # A genuinely small plan is already credit-identifiable;
+                    # preserve ordinary stochastic sampling instead of forcing
+                    # the deterministic incumbent.
+                    behavior_prefix = support_order[:audit_selection_count]
+                    exploration_added_indices[operation] = [
+                        int(value) for value in behavior_prefix.detach().cpu().tolist()
+                        if int(value) not in set(
+                            deterministic_prefix.detach().cpu().tolist()
+                        )
+                    ]
+                else:
+                    behavior_prefix = deterministic_prefix
+                explored_for_rank = exploration_added_indices[operation]
+                if explored_for_rank:
+                    heuristic_order_for_rank = torch.argsort(
+                        heuristic_for_top1, descending=True
+                    )
+                    inverse_heuristic_rank = torch.empty_like(
+                        heuristic_order_for_rank
+                    )
+                    inverse_heuristic_rank[heuristic_order_for_rank] = torch.arange(
+                        heuristic_order_for_rank.numel(),
+                        device=heuristic_order_for_rank.device,
+                        dtype=heuristic_order_for_rank.dtype,
+                    )
+                    explored_tensor = torch.as_tensor(
+                        explored_for_rank,
+                        device=inverse_heuristic_rank.device,
+                        dtype=torch.long,
+                    )
+                    # Report local, one-based Heuristic ranks.  The manifest's
+                    # pool_rank is global/interleaved across operations and is
+                    # not an intuitive exploration band.
+                    local_ranks = (
+                        inverse_heuristic_rank.index_select(0, explored_tensor) + 1
+                    ).detach().cpu().tolist()
+                    exploration_heuristic_rank_bands[operation] = {
+                        "count": int(len(local_ranks)),
+                        "min": int(min(local_ranks)),
+                        "max": int(max(local_ranks)),
+                        "mean": float(sum(local_ranks) / len(local_ranks)),
+                    }
+                selected_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
+                selected_mask[behavior_prefix] = True
+                deterministic_tail = deterministic_order[
+                    ~selected_mask[deterministic_order]
+                ]
+                order_tensor = torch.cat((behavior_prefix, deterministic_tail), dim=0)
+                deterministic_selection = set(
+                    deterministic_prefix.detach().cpu().tolist()
+                )
+                behavior_selection = set(
+                    behavior_prefix.detach().cpu().tolist()
+                )
+                exploration_selection_change_rates[operation] = (
+                    1.0
+                    - len(deterministic_selection & behavior_selection)
+                    / float(audit_selection_count)
+                )
+            else:
+                exploration_selection_change_rates[operation] = 0.0
+                order_tensor = deterministic_order
+            ordered_indices[operation] = order_tensor.cpu().tolist()
+
+        candidate_local_loss = (
+            torch.stack(candidate_local_losses).mean()
+            if candidate_local_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
+        candidate_pairwise_loss = (
+            torch.stack(candidate_pairwise_losses).mean()
+            if candidate_pairwise_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
+        candidate_critic_loss = (
+            torch.stack(candidate_critic_losses).mean()
+            if candidate_critic_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
+        candidate_actor_critic_loss = (
+            torch.stack(candidate_actor_critic_losses).mean()
+            if candidate_actor_critic_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
+        gumbel_scale = (
+            sum(gumbel_scales) / float(len(gumbel_scales))
+            if gumbel_scales else 0.0
+        )
+
+        # Gate share controls conflict priority as well as requested counts.
+        # The cached heuristic order remains only a deterministic tie-break.
+        priority = tuple(exact.get("operation_priority") or operations)
+        if set(priority) != set(operations):
+            priority = operations
+        action_ratio_stack = torch.stack([sampled_ratio_tensors[name] for name in operations])
+        priority_index = {name: index for index, name in enumerate(priority)}
+        operation_order = (
+            priority
+            if exact_anchor_active
+            else tuple(sorted(
+                operations,
+                key=lambda name: (
+                    -float(gate_probs[operations.index(name)].detach().cpu()),
+                    priority_index[name],
+                ),
+            ))
+        )
+        if (
+            factorized_actual_credit
+            # Moving one operation to the end is meaningful only for a
+            # ``*Where`` counterfactual.  Slicing ``Gate``/``Fine`` with
+            # ``[:-5]`` produced an empty operation name and later caused
+            # ``ordered_indices['']`` to raise KeyError.
+            and str(factorized_exploration_group).endswith("Where")
+            and not matched_anchor_reused
+        ):
+            explored_operation_for_anchor = str(factorized_exploration_group)[:-5]
+            # Establish the incumbent with the explored group last, then reuse
+            # this exact order.  Fixed groups therefore resolve conflicts first
+            # in both plans and cannot be displaced by the counterfactual.
+            operation_order = tuple(
+                name for name in operation_order
+                if name != explored_operation_for_anchor
+            ) + (explored_operation_for_anchor,)
+        if matched_anchor_reused:
+            stored_order = tuple(matched_anchor_record.get("operation_order") or ())
+            if len(stored_order) == len(operations) and set(stored_order) == set(operations):
+                # Strict matching requires exactly the encoded incumbent's
+                # application order.  Moving the explored operation to the end
+                # changes conflict resolution and makes more than one factor
+                # differ, even when requested counts are identical.
+                operation_order = stored_order
+
+        # Keep malformed legacy/runtime anchor data from reaching the plan
+        # builder as an invalid dictionary key.  A valid order must contain
+        # each supported operation exactly once.
+        if len(operation_order) != len(operations) or set(operation_order) != set(operations):
+            operation_order = tuple(operations)
+
+        # 1Stepにつき、この1回の順序・1回の候補sampleから1planだけを構築する。
+        # 初回候補写像時にGT occupied適合性を厳密に保存済みなら、100万Voxelを
+        # 毎Step Python setへ再変換しない。旧schemaだけは従来経路へ戻す。
+        static_compatibility_available = all(
+            len(static_compatible.get(name, ())) == len(pools[name])
+            for name in operations
+        )
+        occupied = None
+        if not static_compatibility_available:
+            occupied = {
+                tuple(int(value) for value in row)
+                for row in voxel_coords[0].transpose(0, 1).detach().cpu().tolist()
+            }
+        selected = []
+        removes = set()
+        adds = set()
+        # Fit loss is defined only on true Add operations.  ``adds`` also
+        # contains Adjust destinations, so preserve the operation provenance
+        # while the conflict-free plan is assembled.
+        true_add_targets = set()
+        selected_counts = {name: 0 for name in operations}
+        joint_geometry_result = None
+        if geometry_joint:
+            from ..utils.pointcloud.geometry_joint_policy import select_joint_geometry_plan
+            joint_geometry_result = select_joint_geometry_plan(
+                voxel_coords, exact, pools, requested_counts, candidate_value_scores,
+                self.args, exploration=float(exploration_multiplier) if self.training and diagnostic_policy == 'normal' else 0.,
+                heuristic_only=diagnostic_policy == 'heuristic', masks=candidate_proposal_masks,
+                context_head=self.geometry_joint_context, random_only=diagnostic_policy == 'random_safe')
+            (selected, removes, adds, true_add_targets, selected_counts,
+             joint_where_log_prob, joint_where_entropy, joint_geometry_audit) = joint_geometry_result
+        for operation in (() if geometry_joint else operation_order):
+            for candidate_index in ordered_indices[operation]:
+                if selected_counts[operation] >= requested_counts[operation]:
+                    break
+                candidate = pools[operation][candidate_index]
+                if static_compatibility_available:
+                    if not static_compatible[operation][candidate_index]:
+                        continue
+                    compatible = self._den6_candidate_conflict_free(
+                        candidate, removes, adds
+                    )
+                else:
+                    compatible = self._den6_candidate_compatible(
+                        candidate, occupied, removes, adds
+                    )
+                if not compatible:
+                    continue
+                candidate_removes, candidate_adds = self._den6_candidate_coord_sets(candidate)
+                removes.update(candidate_removes)
+                adds.update(candidate_adds)
+                if operation == "Add":
+                    true_add_targets.update(candidate_adds)
+                selected.append((operation, candidate_index, candidate))
+                selected_counts[operation] += 1
+
+        # 衝突で要求数に届かなくても別pattern探索は行わず、同じsample内の到達planを使う。
+        if sum(selected_counts.values()) <= 0 and not no_op_selected:
+            raise RuntimeError(
+                "ana_den6 onlineの1sample planで有効候補を1件も選べない: "
+                f"requested={requested_counts}, selected={selected_counts}"
+            )
+
+        if (
+            factorized_actual_credit
+            and str(factorized_exploration_group) in {
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
+            and not matched_anchor_reused
+            # Gate/Fine cannot change an executed no-op plan, so saving such
+            # an anchor would manufacture a comparison with no action delta.
+            and not (
+                no_op_selected
+                and str(factorized_exploration_group) in {"Gate", "Fine"}
+            )
+        ):
+            anchor_indices_by_operation = {name: [] for name in operations}
+            for operation, candidate_index, _ in selected:
+                anchor_indices_by_operation[operation].append(int(candidate_index))
+            matched_anchor_runtime[matched_anchor_key] = {
+                "pool_sizes": {name: len(pools[name]) for name in operations},
+                "pool_identity_hash": str(candidate_pool_identity_hash),
+                "requested_counts": dict(requested_counts),
+                "selected_counts": {
+                    name: int(selected_counts[name]) for name in operations
+                },
+                "selected_indices": {
+                    name: tuple(anchor_indices_by_operation[name])
+                    for name in operations
+                },
+                "operation_order": tuple(operation_order),
+                "coarse_total_ratio": float(hard_total.detach().cpu()),
+                "amount_bin_index": int(selected_amount_bin.detach().cpu()),
+                "gate_shares": {
+                    name: float(gate_probs[index].detach().cpu())
+                    for index, name in enumerate(operations)
+                },
+                "fine_log_residuals": {
+                    name: float(operation_fine_samples[name].detach().cpu())
+                    for name in operations
+                },
+                "no_op_selected": bool(no_op_selected),
+                "created_step": int(current_step),
+                "policy_version": int(current_step),
+                "reuse_count": 0,
+            }
+            pending_runtime = getattr(
+                self, "_den6_pending_matched_groups", OrderedDict()
+            )
+            pending_runtime[matched_frame_codec_key] = {
+                "group": str(factorized_exploration_group),
+                "anchor_key": str(matched_anchor_key),
+                "created_step": int(current_step),
+                "attempts": 0,
+            }
+            pending_runtime.move_to_end(matched_frame_codec_key)
+            pending_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_pending_matched_frames",
+                1024,
+            )), 1)
+            while len(pending_runtime) > pending_capacity:
+                pending_runtime.popitem(last=False)
+            self._den6_pending_matched_groups = pending_runtime
+            anchor_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_matched_anchor_memory_entries",
+                512,
+            )), 1)
+            while len(matched_anchor_runtime) > anchor_capacity:
+                matched_anchor_runtime.popitem(last=False)
+
+        source_rows = voxel_coords[0].transpose(0, 1).contiguous().to(dtype=torch.long)
+        remove_rows = (
+            torch.as_tensor(sorted(removes), device=source_rows.device, dtype=torch.long)
+            if removes else source_rows.new_empty((0, 3))
+        )
+        if remove_rows.numel() > 0:
+            combined_rows = torch.cat([source_rows, remove_rows], dim=0)
+            mins = combined_rows.amin(dim=0)
+            spans = (combined_rows.amax(dim=0) - mins + 1).clamp_min(1)
+            def keys(rows):
+                shifted = rows - mins
+                return shifted[:, 0] * spans[1] * spans[2] + shifted[:, 1] * spans[2] + shifted[:, 2]
+            source_keys = keys(source_rows)
+            remove_keys = torch.unique(keys(remove_rows), sorted=True)
+            positions = torch.searchsorted(remove_keys, source_keys)
+            in_bounds = positions < remove_keys.numel()
+            safe = positions.clamp(max=max(int(remove_keys.numel()) - 1, 0))
+            keep = ~(in_bounds & (remove_keys[safe] == source_keys))
+            source_rows = source_rows[keep]
+        add_rows = (
+            torch.as_tensor(sorted(adds), device=source_rows.device, dtype=torch.long)
+            if adds else source_rows.new_empty((0, 3))
+        )
+        combined_final_rows = torch.cat([source_rows, add_rows], dim=0)
+        if combined_final_rows.numel() > 0:
+            # sourceはcanonical unique、addsはset、両者の交差は上のden6
+            # compatibilityで除外済みである。全点torch.unique(dim=0)を再実行
+            # せず、同じ(x,y,z)辞書順へcollision-free keyで並べる。
+            final_mins = combined_final_rows.amin(dim=0)
+            final_spans = (
+                combined_final_rows.amax(dim=0) - final_mins + 1
+            ).clamp_min(1)
+            shifted_final = combined_final_rows - final_mins
+            final_keys = (
+                shifted_final[:, 0] * final_spans[1] * final_spans[2]
+                + shifted_final[:, 1] * final_spans[2]
+                + shifted_final[:, 2]
+            )
+            final_rows = combined_final_rows.index_select(
+                0, torch.argsort(final_keys)
+            )
+        else:
+            final_rows = combined_final_rows
+        final_coords = final_rows.transpose(0, 1).contiguous().unsqueeze(0)
+
+        selected_where_log_probs = []
+        selected_where_log_probs_by_operation = {name: [] for name in operations}
+        for operation, candidate_index, _ in selected:
+            selected_log_prob = candidate_log_probs[operation][candidate_index]
+            selected_where_log_probs.append(selected_log_prob)
+            selected_where_log_probs_by_operation[operation].append(selected_log_prob)
+        where_log_prob = (
+            torch.stack(selected_where_log_probs).mean()
+            if selected_where_log_probs
+            else action_ratio_stack.new_zeros(())
+        )
+        where_log_prob_by_operation = {
+            name: (
+                torch.stack(selected_where_log_probs_by_operation[name]).mean()
+                if selected_where_log_probs_by_operation[name]
+                else action_ratio_stack.new_zeros(())
+            )
+            for name in operations
+        }
+        if geometry_joint:
+            where_log_prob = joint_where_log_prob
+        # coarse selectorをoperation数+1で希釈しない。旧meanでは後半の
+        # fine exploration=0時に実質1/4となり、Geometry creditが消えていた。
+        amount_log_prob = amount_bin_log_prob + amount_fine_log_prob
+        # ``gate_probs`` already caused requested_counts above.  Its log-prob
+        # now describes the executed allocation instead of post-hoc imitation.
+        selected_share = gate_probs.new_tensor([
+            float(selected_counts[name]) for name in operations
+        ])
+        selected_share = selected_share / selected_share.sum().clamp_min(1.0)
+        action_log_prob = (
+            (selected_share.detach() * gate_log_probs).sum()
+            if not no_op_selected
+            else gate_log_probs.sum().detach() * 0.0
+        )
+        action_entropy = -(gate_probs * gate_log_probs).sum()
+
+        # Evaluate the stored anchor action under the *current* policy.  This
+        # gives every factorized group a pairwise preference diagnostic and
+        # avoids pretending that a composite Actual scalar is an individual
+        # candidate label.
+        anchor_group_log_prob = action_ratio_stack.new_zeros(())
+        if isinstance(matched_anchor_record, dict) and matched_anchor_reused:
+            matched_group = str(factorized_exploration_group)
+            if matched_group == "WhereAll":
+                anchor_where_scores = []
+                for matched_operation in operations:
+                    anchor_indices = tuple(
+                        (matched_anchor_record.get("selected_indices") or {}).get(
+                            matched_operation, ()
+                        )
+                    )
+                    if not anchor_indices:
+                        continue
+                    index_tensor = torch.as_tensor(
+                        anchor_indices,
+                        device=candidate_log_probs[matched_operation].device,
+                        dtype=torch.long,
+                    )
+                    anchor_where_scores.append(
+                        candidate_log_probs[matched_operation]
+                        .index_select(0, index_tensor).mean()
+                    )
+                if anchor_where_scores:
+                    anchor_group_log_prob = torch.stack(
+                        anchor_where_scores
+                    ).mean()
+            elif matched_group.endswith("Where"):
+                matched_operation = matched_group[:-5]
+                anchor_indices = tuple(
+                    (matched_anchor_record.get("selected_indices") or {}).get(
+                        matched_operation, ()
+                    )
+                )
+                if anchor_indices:
+                    index_tensor = torch.as_tensor(
+                        anchor_indices,
+                        device=candidate_log_probs[matched_operation].device,
+                        dtype=torch.long,
+                    )
+                    anchor_group_log_prob = candidate_log_probs[
+                        matched_operation
+                    ].index_select(0, index_tensor).mean()
+            elif matched_group == "Amount":
+                anchor_bin = min(max(int(matched_anchor_record.get(
+                    "amount_bin_index", 0
+                )), 0), int(amount_log_probs.numel()) - 1)
+                anchor_group_log_prob = amount_log_probs[anchor_bin]
+            elif matched_group == "Gate":
+                anchor_counts = dict(
+                    matched_anchor_record.get("selected_counts") or {}
+                )
+                anchor_share = gate_log_probs.new_tensor([
+                    float(anchor_counts.get(name, 0)) for name in operations
+                ])
+                anchor_share = anchor_share / anchor_share.sum().clamp_min(1.0)
+                anchor_group_log_prob = (
+                    anchor_share.detach() * gate_log_probs
+                ).sum()
+            elif matched_group == "Fine":
+                stored_fine = dict(
+                    matched_anchor_record.get("fine_log_residuals") or {}
+                )
+                anchor_scores = []
+                for name in operations:
+                    stored_value = operation_fine_policy_means[name].new_tensor(
+                        float(stored_fine.get(name, 0.0))
+                    )
+                    sigma = float(operation_fine_sigmas[name])
+                    # Match the current action's density *and* sigma-scaled
+                    # backward.  A quadratic without the Normal constant and
+                    # without sigma scaling gave the anchor a different
+                    # likelihood and gradients up to 1/sigma stronger.
+                    anchor_scores.append(
+                        normalized_fine_log_prob(
+                            operation_fine_policy_means[name], stored_value, sigma
+                        )
+                        if sigma > 0.0
+                        else operation_fine_policy_means[name] * 0.0
+                    )
+                anchor_group_log_prob = torch.stack(anchor_scores).mean()
+
+        # Candidate-local attributionからGate/Amount/Fine用の低分散RD教師を
+        # 作る。rateとgeometryは別々に同一集合内で標準化してからcandidate
+        # local lossと同じ係数で合成し、Heuristic rankは教師に使わない。
+        local_rate_by_op = {}
+        local_geometry_by_op = {}
+        for name in operations:
+            mapping = guidance.get("candidate_tensor_map", {}).get(name, {})
+            rate_value = mapping.get("local_rate_benefit")
+            geometry_value = mapping.get("local_geometry_risk")
+            if torch.is_tensor(rate_value) and torch.is_tensor(geometry_value):
+                local_rate_by_op[name] = rate_value.to(
+                    device=gate_probs.device, dtype=gate_probs.dtype
+                )
+                local_geometry_by_op[name] = geometry_value.to(
+                    device=gate_probs.device, dtype=gate_probs.dtype
+                )
+        operation_local_loss = gate_probs.new_zeros(())
+        amount_local_loss = gate_probs.new_zeros(())
+        fine_local_loss = gate_probs.new_zeros(())
+        operation_utility_target = gate_probs.detach()
+        operation_utility_raw_target = gate_probs.detach()
+        operation_utility_confidence = 1.0
+        operation_utility_aggregation_agreement = 1.0
+        amount_utility_target = amount_prob.detach()
+        amount_utility_confidence = 1.0
+        fine_utility_confidence = 1.0
+        operation_rate_summary = gate_probs.new_zeros((len(operations),))
+        operation_geometry_summary = gate_probs.new_zeros((len(operations),))
+        if len(local_rate_by_op) == len(operations):
+            all_rate = torch.cat([local_rate_by_op[name] for name in operations])
+            all_geometry = torch.cat([
+                local_geometry_by_op[name] for name in operations
+            ])
+
+            def _global_standardize(value):
+                centered = value - value.mean()
+                return centered / centered.square().mean().sqrt().clamp_min(
+                    torch.finfo(value.dtype).eps
+                )
+
+            # Candidate RD must not inherit the *safety cap* used to bound the
+            # scalar training loss.  Coupling these values made changing the
+            # plotted loss mixture silently change every action target.
+            local_geometry_weight = max(float(getattr(
+                self.args, "heuristic_guidance_online_local_geometry_weight", 0.50
+            )), 0.0) * max(float(getattr(
+                self.args, "rd_geometry_weight_multiplier", 1.0
+            )), 0.0)
+            global_utility = (
+                _global_standardize(all_rate)
+                - float(local_geometry_weight) * _global_standardize(all_geometry)
+            )
+            utility_by_op = {}
+            offset = 0
+            operation_values = []
+            operation_reference_values = []
+            for name in operations:
+                count = int(local_rate_by_op[name].numel())
+                values = global_utility[offset:offset + count]
+                offset += count
+                utility_by_op[name] = values
+                # The tail-sensitive summary keeps useful operation-level
+                # signal.  Its confidence is validated below against the
+                # outlier-insensitive mean-RD summary, so an optimistic Prune
+                # outlier cannot obtain authority on its own.
+                operation_values.append(
+                    torch.logsumexp(values, dim=0)
+                    - math.log(max(count, 1))
+                )
+                # A second, outlier-insensitive summary is not the training
+                # target; it only tells us whether the operation conclusion is
+                # supported by average per-cell RD in the original proxy unit.
+                operation_reference_values.append(
+                    (local_rate_by_op[name] - float(local_geometry_weight)
+                     * local_geometry_by_op[name]).mean()
+                )
+            operation_values = torch.stack(operation_values)
+            operation_reference_values = torch.stack(operation_reference_values)
+            operation_rate_summary = torch.stack([
+                local_rate_by_op[name].mean() for name in operations
+            ])
+            operation_geometry_summary = torch.stack([
+                local_geometry_by_op[name].mean() for name in operations
+            ])
+            operation_utility_target = torch.softmax(
+                operation_values.detach(), dim=0
+            )
+            operation_utility_raw_target = torch.softmax(
+                operation_reference_values.detach(), dim=0
+            )
+            # A local proxy can rank candidates reliably while carrying very
+            # little information about the cross-operation allocation.  Do
+            # not let a nearly uniform target override the one-per-step
+            # Actual RD correction.  Normalized entropy provides a detached,
+            # data-dependent confidence without an Episode schedule or a
+            # target operation ratio.
+            def _target_information_confidence(probability):
+                probability = probability.detach().float().clamp_min(
+                    torch.finfo(torch.float32).tiny
+                )
+                if int(probability.numel()) <= 1:
+                    return 0.0
+                entropy = -(probability * probability.log()).sum()
+                maximum_entropy = math.log(int(probability.numel()))
+                return min(max(
+                    1.0 - float(entropy.cpu()) / max(maximum_entropy, 1e-12),
+                    0.0,
+                ), 1.0)
+
+            operation_utility_confidence = _target_information_confidence(
+                operation_utility_target
+            )
+            target_centered = operation_utility_target.float()
+            target_centered = target_centered - target_centered.mean()
+            reference_centered = operation_utility_raw_target.float()
+            reference_centered = reference_centered - reference_centered.mean()
+            aggregation_denominator = (
+                target_centered.square().sum().sqrt()
+                * reference_centered.square().sum().sqrt()
+            ).clamp_min(torch.finfo(target_centered.dtype).eps)
+            operation_utility_aggregation_agreement = float(
+                ((target_centered * reference_centered).sum()
+                 / aggregation_denominator).clamp(min=0.0, max=1.0).cpu()
+            )
+            operation_utility_confidence *= float(
+                operation_utility_aggregation_agreement
+            )
+            operation_local_loss = float(operation_utility_confidence) * -(
+                operation_utility_target * gate_log_probs
+            ).sum()
+
+            # Aggregate rate and geometry in their own proxy units before
+            # normalizing across amount bins.  Summing already standardized
+            # candidate utility made every extra candidate positive and
+            # structurally favored the largest bin.  Zero is the no-edit RD.
+            target_share_dict = {
+                name: float(operation_utility_target[index].cpu())
+                for index, name in enumerate(operations)
+            }
+            bin_rate_values = []
+            bin_geometry_values = []
+            for ratio_value in bin_tensor.detach().cpu().tolist():
+                bin_budget = max(0, int(math.ceil(point_count * float(ratio_value))))
+                bin_counts = self._den6_allocate_counts(
+                    bin_budget, target_share_dict
+                )
+                rate_sum = operation_values.new_zeros(())
+                geometry_sum = operation_values.new_zeros(())
+                for name in operations:
+                    take = min(bin_counts[name], int(utility_by_op[name].numel()))
+                    if take > 0:
+                        top_index = torch.topk(utility_by_op[name], k=take).indices
+                        rate_sum = rate_sum + local_rate_by_op[name].index_select(
+                            0, top_index
+                        ).sum()
+                        geometry_sum = geometry_sum + local_geometry_by_op[name].index_select(
+                            0, top_index
+                        ).sum()
+                bin_rate_values.append(rate_sum)
+                bin_geometry_values.append(geometry_sum)
+            bin_values = (
+                _global_standardize(torch.stack(bin_rate_values))
+                - float(local_geometry_weight)
+                * _global_standardize(torch.stack(bin_geometry_values))
+            )
+            # Local attribution can rank edited Amount bins, but it does not
+            # observe the Actual no-edit counterfactual.  Keep the restored
+            # six-class action space while learning zero-vs-edit only from the
+            # one-per-step Actual RD signal.
+            has_noop_bin = (
+                int(bin_tensor.numel()) == int(positive_bin_tensor.numel()) + 1
+            )
+            positive_amount_utility_target = torch.softmax(
+                bin_values.detach()[1:] if has_noop_bin else bin_values.detach(),
+                dim=0,
+            )
+            amount_utility_target = (
+                torch.cat((
+                    positive_amount_utility_target.new_zeros((1,)),
+                    positive_amount_utility_target,
+                ))
+                if has_noop_bin else positive_amount_utility_target
+            )
+            amount_utility_confidence = _target_information_confidence(
+                positive_amount_utility_target
+            )
+            positive_amount_log_probs = torch.log_softmax(
+                amount_logits[1:] if has_noop_bin else amount_logits, dim=0
+            )
+            amount_local_loss = float(amount_utility_confidence) * -(
+                positive_amount_utility_target * positive_amount_log_probs
+            ).sum()
+
+            # Fine heads refine the three operation amounts inside the coarse
+            # bin.  Their bounded residual target uses the same RD operation
+            # distribution; global Actual credit still supplies plan bias.
+            target_total_ratio = (
+                amount_utility_target.detach() * bin_tensor.detach()
+            ).sum().clamp_min(1e-9)
+            fine_targets = []
+            fine_predictions = []
+            for index, name in enumerate(operations):
+                target_ratio = (
+                    target_total_ratio * operation_utility_target[index].detach()
+                ).clamp_min(1e-9)
+                prior_ratio = operation_fine_means[name].new_tensor(
+                    prior_ratios[name]
+                ).clamp_min(1e-9)
+                target_log_residual = torch.tanh(
+                    torch.log(target_ratio / prior_ratio)
+                ) * float(amount_beta)
+                fine_targets.append(target_log_residual)
+                fine_predictions.append(operation_fine_means[name])
+            # Fine residuals inherit both decisions.  They receive strong
+            # local supervision only when the proxy distinguishes both the
+            # operation allocation and the total amount; otherwise global
+            # Actual RD remains their unbiased teacher.
+            fine_utility_confidence = (
+                float(operation_utility_confidence)
+                * float(amount_utility_confidence)
+            )
+            fine_local_loss = float(fine_utility_confidence) * torch.nn.functional.smooth_l1_loss(
+                torch.stack(fine_predictions),
+                torch.stack(fine_targets).detach(),
+                beta=max(float(amount_beta) * 0.25, 1e-3),
+            )
+
+        # Candidate-local credit learns Where ranking inside each operation.
+        # Cross-operation Gate/Amount/Fine targets above use one shared RD
+        # coefficient and are returned separately for conservative weighting;
+        # the repeated-frame Actual correction remains the global teacher.
+        actor_proxy_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_actor_proxy_weight",
+            0.0,
+        )), 0.0)
+        # prior_residual now uses the same dedicated Actual Actor as the pure
+        # actor_critic mode.  Do not silently restore the legacy proxy-imitation
+        # weight just because H is retained in the forward policy.
+        effective_actor_proxy_weight = (
+            actor_proxy_weight if actual_residual_learning else 1.0
+        )
+        actor_proxy_loss = (
+            candidate_local_loss
+            + float(candidate_pairwise_weight) * candidate_pairwise_loss
+        )
+        actor_critic_distill_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_actor_critic_distill_weight",
+            0.10,
+        )), 0.0)
+        # The proxy observes every candidate before any action is executed.  It
+        # is useful for a low-variance Critic, but directly teaching the Actor
+        # made it reproduce that ordering within E1.  Actor proxy imitation is
+        # now an explicit legacy/ablation weight (zero by default); executed
+        # Actual-RD policy and same-frame set contrast own the default Actor.
+        candidate_local_credit_loss = (
+            candidate_critic_loss
+            + float(effective_actor_proxy_weight) * actor_proxy_loss
+            + float(actor_critic_distill_weight) * candidate_actor_critic_loss
+        )
+        if factorized_actual_credit and factorized_exploration_group != "all":
+            if factorized_exploration_group == "WhereAll":
+                policy_log_prob = torch.stack(tuple(
+                    where_log_prob_by_operation[name] for name in operations
+                )).mean()
+            elif factorized_exploration_group.endswith("Where"):
+                explored_operation = factorized_exploration_group[:-5]
+                policy_log_prob = where_log_prob_by_operation[explored_operation]
+            elif factorized_exploration_group == "Amount":
+                policy_log_prob = amount_bin_log_prob
+            elif factorized_exploration_group == "Gate":
+                policy_log_prob = action_log_prob
+            elif factorized_exploration_group == "Fine":
+                policy_log_prob = amount_fine_log_prob
+            else:
+                policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
+        else:
+            policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
+        # Exploration entropy belongs to candidate selection.  Including Gate
+        # and Amount here changed an unseen frame's deterministic operation
+        # share from 0.4/0.4/0.2 toward uniform before any comparable Actual
+        # outcome existed.  Amount already has Gumbel sampling and Gate is
+        # trained from repeated-frame Actual credit, so neither needs an
+        # artificial uniform target.
+        if factorized_actual_credit and factorized_exploration_group == "WhereAll":
+            policy_entropy = torch.stack(tuple(
+                candidate_entropy_by_operation[name] for name in operations
+            )).mean()
+        elif factorized_actual_credit and factorized_exploration_group.endswith("Where"):
+            entropy_operation = factorized_exploration_group[:-5]
+            policy_entropy = candidate_entropy_by_operation[entropy_operation]
+        else:
+            policy_entropy = torch.stack(candidate_entropies).mean()
+        if exact_anchor_active:
+            # hard anchorの実行planはHeuristicが強制したものであり、Networkの
+            # sampleではない。Actual値はframe baseline初期化に使うが、その
+            # 性能をAmount/gate/Whereへ方策creditとして与えてはいけない。
+            # requires_gradは契約上維持し、backwardだけ厳密に0とする。
+            policy_log_prob = policy_log_prob.detach() + 0.0 * policy_log_prob
+            policy_entropy = policy_entropy.detach() + 0.0 * policy_entropy
+        if geometry_joint:
+            policy_entropy = joint_where_entropy
+
+        selected_ids = [str(candidate.get("candidate_id", "")) for _, _, candidate in selected]
+        executed_ids_by_operation = {
+            name: tuple(
+                str(candidate.get("candidate_id", ""))
+                for selected_operation, _, candidate in selected
+                if selected_operation == name
+            )
+            for name in operations
+        }
+        deterministic_ids_by_operation = {
+            name: tuple(
+                str(pools[name][index].get("candidate_id", ""))
+                for index in deterministic_indices_by_operation[name]
+                if 0 <= int(index) < len(pools[name])
+            )
+            for name in operations
+        }
+        # All WhereAll candidate sets are variables; hashing their IDs would
+        # reject precisely the changed plans needed for Actual learning.
+        matched_anchor_hash = matched_plan_comparison_hash(
+            str(factorized_exploration_group), executed_ids_by_operation,
+            selected_counts, requested_counts, operation_order,
+            candidate_pool_identity_hash,
+        )
+        edited_delta_payload = json.dumps({
+            "base": str(getattr(self.args, "_current_input_file", "")),
+            "removes": sorted(removes),
+            "adds": sorted(adds),
+        }, sort_keys=True, separators=(",", ":"))
+        final_edited_voxel_hash = hashlib.sha256(
+            edited_delta_payload.encode("utf-8")
+        ).hexdigest()
+        anchor_plan_for_delta = exact.get(
+            "heuristic_anchor_plan", exact.get("initial_heuristic_plan", {})
+        )
+        anchor_ids_for_delta = set(
+            str(value) for value in (
+                anchor_plan_for_delta.get("candidate_ids", ())
+                if isinstance(anchor_plan_for_delta, dict) else ()
+            )
+        )
+        selected_id_set = set(selected_ids)
+        residual_changed_count = len(selected_id_set.symmetric_difference(anchor_ids_for_delta))
+        residual_changed_ratio = residual_changed_count / max(
+            float(len(selected_id_set | anchor_ids_for_delta)), 1.0
+        )
+        selected_indices_by_operation = {name: [] for name in operations}
+        for operation, candidate_index, _ in selected:
+            selected_indices_by_operation[operation].append(int(candidate_index))
+        candidate_pool_sizes = {name: len(pools[name]) for name in operations}
+        candidate_valid_counts = {
+            name: (
+                int(sum(bool(value) for value in static_compatible[name]))
+                if len(static_compatible.get(name, ())) == len(pools[name])
+                else len(pools[name])
+            )
+            for name in operations
+        }
+        candidate_duplicate_counts = {
+            name: (
+                len([
+                    candidate
+                    for candidate in pools[name]
+                    if str(candidate.get("candidate_id", ""))
+                ])
+                - len({
+                    str(candidate.get("candidate_id", ""))
+                    for candidate in pools[name]
+                    if str(candidate.get("candidate_id", ""))
+                })
+            )
+            for name in operations
+        }
+        candidate_pool_rank_ranges = {}
+        for name in operations:
+            pool_rank = guidance.get("candidate_tensor_map", {}).get(
+                name, {}
+            ).get("pool_rank")
+            if torch.is_tensor(pool_rank) and int(pool_rank.numel()) > 0:
+                candidate_pool_rank_ranges[name] = (
+                    int(pool_rank.amin().detach().cpu()),
+                    int(pool_rank.amax().detach().cpu()),
+                )
+            else:
+                candidate_pool_rank_ranges[name] = (0, max(len(pools[name]) - 1, 0))
+        selected_pool_rank_samples = {}
+        selected_candidate_indices = {}
+        heuristic_top1_selected = {}
+        selected_outside_heuristic_budget_rates = {}
+        selected_outside_exploration_support_rates = {}
+        candidate_entropy_values = {}
+        candidate_normalized_entropy = {}
+        candidate_max_probability = {}
+        candidate_top2_probability_gap = {}
+        selected_where_residual_terms = []
+        all_selected_rank_values = []
+        for operation in operations:
+            mapping = guidance.get("candidate_tensor_map", {}).get(operation, {})
+            pool_rank = mapping.get("pool_rank")
+            indices = selected_indices_by_operation[operation]
+            if torch.is_tensor(pool_rank) and int(pool_rank.numel()) == len(pools[operation]):
+                if indices:
+                    index_tensor = torch.as_tensor(indices, device=pool_rank.device, dtype=torch.long)
+                    # 選択VoxelごとのCPU同期を避け、操作単位で一括取得する。
+                    ranks = pool_rank.index_select(0, index_tensor).detach().cpu().tolist()
+                    ranks = [int(rank) for rank in ranks]
+                else:
+                    ranks = []
+            else:
+                ranks = list(indices)
+            selected_pool_rank_samples[operation] = ranks[:8]
+            selected_candidate_indices[operation] = int(indices[0]) if indices else -1
+            heuristic_top1_selected[operation] = bool(0 in ranks)
+            heuristic_budget = max(int(requested_counts[operation]), 1)
+            selected_outside_heuristic_budget_rates[operation] = (
+                sum(int(rank) >= heuristic_budget for rank in ranks)
+                / float(max(len(ranks), 1))
+            )
+            support_mask = exploration_support_masks[operation].detach().cpu()
+            selected_outside_exploration_support_rates[operation] = (
+                sum(not bool(support_mask[int(index)]) for index in indices)
+                / float(max(len(indices), 1))
+            )
+            all_selected_rank_values.extend(float(rank) for rank in ranks)
+            entropy_value = float(
+                candidate_entropy_by_operation[operation].detach().cpu()
+            )
+            candidate_entropy_values[operation] = entropy_value
+            proposal_eligible_count = int(
+                candidate_proposal_masks[operation].sum().detach().cpu()
+            )
+            candidate_normalized_entropy[operation] = entropy_value / max(
+                math.log(max(proposal_eligible_count, 2)), 1e-12
+            )
+            probs = candidate_probs[operation]
+            top_probability = torch.topk(probs, k=min(2, int(probs.numel()))).values
+            candidate_max_probability[operation] = float(top_probability[0].detach().cpu())
+            candidate_top2_probability_gap[operation] = float(
+                (top_probability[0] - top_probability[1]).detach().cpu()
+                if int(top_probability.numel()) > 1 else top_probability[0].detach().cpu()
+            )
+            for index in indices:
+                selected_where_residual_terms.append(
+                    network_terms[operation][index]
+                )
+        where_residual_tensor = (
+            torch.stack(selected_where_residual_terms)
+            if selected_where_residual_terms
+            else action_ratio_stack.new_zeros((1,))
+        )
+        amount_delta_ratios = {
+            name: float(selected_counts[name]) / max(float(point_count), 1.0)
+            - float(prior_ratios[name])
+            for name in operations
+        }
+        amount_delta_tensor = action_ratio_stack.new_tensor(
+            [amount_delta_ratios[name] for name in operations]
+        )
+        selected_total_ratio = sum(selected_counts.values()) / max(float(point_count), 1.0)
+        selected_changed_ratio = (
+            selected_counts["Add"] + selected_counts["Prune"] + 2 * selected_counts["Adjust"]
+        ) / max(float(point_count), 1.0)
+        plan_feature_parts = []
+        if actual_residual_learning:
+            for name in operations:
+                indices = selected_indices_by_operation[name]
+                if indices:
+                    index_tensor = torch.as_tensor(
+                        indices,
+                        device=candidate_critic_values[name].device,
+                        dtype=torch.long,
+                    )
+                    selected_q = candidate_critic_values[name].index_select(
+                        0, index_tensor
+                    )
+                    selected_features = candidate_critic_features[name].index_select(
+                        0, index_tensor
+                    )
+                    plan_feature_parts.extend((
+                        selected_q.mean(),
+                        selected_q.std(unbiased=False),
+                        selected_features[:, 2].mean(),
+                        selected_features[:, 3].mean(),
+                    ))
+                else:
+                    plan_feature_parts.extend(
+                        action_ratio_stack.new_zeros(()) for _ in range(4)
+                    )
+            plan_feature_parts.extend(gate_probs.reshape(-1).unbind())
+            plan_feature_parts.extend((
+                action_ratio_stack.new_tensor(float(selected_total_ratio)),
+                hard_total.reshape(()),
+                action_ratio_stack.new_tensor(float(no_op_selected)),
+            ))
+            plan_feature = torch.stack(tuple(plan_feature_parts)).float()
+            if int(plan_feature.numel()) != 18:
+                raise RuntimeError(
+                    f"den6 Actor/Critic plan feature size mismatch: {int(plan_feature.numel())}"
+                )
+            plan_critic_output = self.den6_plan_critic(
+                plan_feature.reshape(1, -1)
+            ).reshape(-1)
+            plan_critic_mean = plan_critic_output[0]
+            plan_critic_log_variance = plan_critic_output[1].clamp(-8.0, 8.0)
+            if self.training:
+                amount_entropy_value = float((
+                    -(amount_prob.detach() * amount_log_probs.detach()).sum()
+                    / max(math.log(max(int(amount_prob.numel()), 2)), 1e-12)
+                ).cpu())
+                gate_entropy_value = float((
+                    -(gate_probs.detach() * gate_probs.detach().clamp_min(1e-12).log()).sum()
+                    / max(math.log(len(operations)), 1e-12)
+                ).cpu())
+                self._den6_factorized_group_uncertainty.update({
+                    "WhereAll": min(max(float(sum(
+                        self._den6_factorized_group_uncertainty.get(
+                            f"{name}Where", 1.0
+                        )
+                        for name in operations
+                    ) / float(len(operations))), 0.0), 1.0),
+                    "Amount": min(max(amount_entropy_value, 0.0), 1.0),
+                    "Gate": min(max(gate_entropy_value, 0.0), 1.0),
+                    "Fine": min(max(float(plan_exploration_factor), 0.0), 1.0),
+                })
+        else:
+            plan_feature = action_ratio_stack.new_zeros((18,))
+            plan_critic_mean = action_ratio_stack.new_zeros(())
+            plan_critic_log_variance = action_ratio_stack.new_zeros(())
+        # Retain gradients on the actual operation-specific decision tensors.
+        # Parameter norms alone cannot attribute the shared Candidate Actor to
+        # Add/Prune/Adjust.  These tensors make the audit reflect the gradient
+        # entering each operation's Where logits and Fine Amount residual,
+        # while the coarse Amount selector remains correctly reported as one
+        # joint plan-level decision.
+        operation_decision_tensors = {}
+        if (bool(getattr(self, "training", False))
+                and bool(getattr(self.args, "heuristic_guidance_online_grad_audit", False))):
+            for name in operations:
+                where_tensor = candidate_actor_logits.get(name)
+                amount_tensor = operation_fine_policy_means.get(name)
+                row = {}
+                if torch.is_tensor(where_tensor) and where_tensor.requires_grad:
+                    where_tensor.retain_grad()
+                    row["where"] = where_tensor
+                if torch.is_tensor(amount_tensor) and amount_tensor.requires_grad:
+                    amount_tensor.retain_grad()
+                    row["amount"] = amount_tensor
+                operation_decision_tensors[name] = row
+        self._den6_online_operation_decision_tensors = operation_decision_tensors
+        debug = {
+            "plan_count": 1,
+            "pool_reference_count": 1,
+            "guidance_cpu_tensor_cache_hit": bool(
+                guidance.get("cpu_tensor_cache_hit", False)
+            ),
+            "guidance_disk_tensor_cache_hit": bool(
+                guidance.get("disk_tensor_cache_hit", False)
+            ),
+            "static_candidate_compatibility_used": bool(
+                static_compatibility_available
+            ),
+            "candidate_actual_encode_count": 0,
+            "proposal_source": (
+                "den6_unordered_safe_pool_actor_critic"
+                if actual_residual_learning
+                else "den6_pool_confidence_bounded_network_residual"
+            ),
+            "performance_source": (
+                "geometry_joint_conditional_occupancy_actual_actor"
+                if geometry_joint else "exact_teacher_anchor"
+                if exact_anchor_active
+                else "network_actor_critic_no_rank_fusion"
+                if actor_critic_selection
+                else "heuristic_prior_plus_actual_actor_residual"
+                if actual_residual_learning
+                else "heuristic_prior_plus_rd_aligned_network_residual"
+            ),
+            "network_only_performance": False,
+            "teacher_bootstrap_active": bool(exact.get("teacher_bootstrap_active", False)),
+            "selected_action_index": -1,
+            "selected_action_mask": [
+                int(selected_counts[name] > 0) for name in operations
+            ],
+            "selected_action_count": sum(
+                int(selected_counts[name] > 0) for name in operations
+            ),
+            "action_policy_role": "network_gate_causally_allocates_operation_counts",
+            "shared_amount_residual_used": False,
+            "selected_counts": selected_counts,
+            "selected_amount_ratios": {
+                name: float(selected_counts[name]) / max(float(point_count), 1.0)
+                for name in operations
+            },
+            "operation_order": ">".join(operation_order),
+            "variant_index": 0,
+            "selected_candidate_ids": selected_ids,
+            "residual_alpha": float(residual_alpha),
+            "candidate_policy_alpha": float(candidate_policy_alpha),
+            "selection_mode": str(selection_mode),
+            "diagnostic_policy": str(diagnostic_policy),
+            "factorized_exploration_group": str(factorized_exploration_group),
+            "matched_actual_anchor_hash": str(matched_anchor_hash),
+            "matched_actual_anchor_reused": bool(matched_anchor_reused),
+            "matched_actual_anchor_key": str(matched_anchor_key),
+            "matched_actual_frame_codec_key": str(matched_frame_codec_key),
+            "matched_actual_anchor_age_steps": int(
+                current_step - int(matched_anchor_record.get("created_step", current_step))
+            ) if isinstance(matched_anchor_record, dict) else 0,
+            "matched_actual_anchor_age_confidence": (
+                max(
+                    0.0,
+                    1.0 - (
+                        current_step - int(matched_anchor_record.get(
+                            "created_step", current_step
+                        ))
+                    ) / float(max(int(getattr(
+                        self.args,
+                        "heuristic_guidance_online_matched_anchor_max_age_steps",
+                        1600,
+                    )), 1)),
+                )
+                if isinstance(matched_anchor_record, dict) else 1.0
+            ),
+            "candidate_pool_identity_hash": str(candidate_pool_identity_hash),
+            "final_edited_voxel_hash": str(final_edited_voxel_hash),
+            "deterministic_candidate_ids": deterministic_ids_by_operation,
+            "factorized_exploration_counts": dict(
+                getattr(self, "_den6_factorized_group_counts", {})
+            ),
+            "factorized_exploration_score_audit": dict(
+                getattr(self, "_den6_last_factorized_group_scores", {})
+            ),
+            "heuristic_candidate_prior_weight": float(heuristic_prior_weight),
+            "where_residual_weight": float(residual_weight),
+            "where_residual_weight_start": float(residual_weight_start),
+            "where_residual_weight_max": float(residual_weight_max),
+            "network_confidence_mode": str(getattr(
+                self.args, "heuristic_guidance_network_confidence_mode", "rd_alignment"
+            )),
+            "network_confidence_by_operation": {
+                name: float(network_confidence_by_operation[name].cpu())
+                for name in operations
+            },
+            "network_plan_confidence": float(network_plan_confidence.cpu()),
+            "actual_residual_authority": float(
+                self._den6_actual_residual_authority()
+            ),
+            "actual_group_authority": {
+                group: float(self._den6_group_actual_authority(group))
+                for group in (
+                    "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
+                    "Amount", "Gate", "Fine",
+                )
+            },
+            "actual_group_stats": {
+                group: dict(values)
+                for group, values in dict(getattr(
+                    self, "_den6_actual_group_stats", {}
+                )).items()
+            },
+            "learned_proposal_actual_quality": float(max(
+                2.0 * (float(getattr(
+                    self, "_den6_matched_actual_pair_accuracy", 0.0
+                )) - 0.5),
+                0.0,
+            )),
+            "learned_proposal_actual_accuracy": float(getattr(
+                self, "_den6_matched_actual_pair_accuracy", 0.0
+            )),
+            "learned_proposal_actual_comparisons": int(getattr(
+                self, "_den6_matched_actual_pair_count", 0
+            )),
+            "learned_proposal_authority": float(
+                min(
+                    max(2.0 * (float(getattr(
+                        self, "_den6_matched_actual_pair_accuracy", 0.0
+                    )) - 0.5), 0.0),
+                    min(max(float(getattr(
+                        self, "_den6_actual_candidate_critic_quality", 0.0
+                    )), 0.0), 1.0),
+                )
+                * min(max(float(getattr(
+                    self, "_den6_actual_action_evidence", 0.0
+                )), 0.0), 1.0)
+            ),
+            "network_confidence_audit": network_confidence_audit,
+            "residual_changed_candidate_count": int(residual_changed_count),
+            "residual_changed_candidate_ratio": float(residual_changed_ratio),
+            "unique_plan_cache_source": bool(unique_plan_mode),
+            "has_where_alternatives": bool(has_where_alternatives),
+            "candidate_pool_sizes": candidate_pool_sizes,
+            "proposal_subset_sizes": {
+                name: int(candidate_proposal_masks[name].sum().detach().cpu())
+                for name in operations
+            },
+            "proposal_subset_fraction": {
+                name: float(candidate_proposal_masks[name].float().mean().detach().cpu())
+                for name in operations
+            },
+            "candidate_valid_counts": candidate_valid_counts,
+            "candidate_duplicate_counts": candidate_duplicate_counts,
+            "candidate_pool_rank_ranges": candidate_pool_rank_ranges,
+            "selected_candidate_indices": selected_candidate_indices,
+            "selected_pool_rank_samples": selected_pool_rank_samples,
+            "selected_heuristic_rank_mean": (
+                float(sum(all_selected_rank_values) / len(all_selected_rank_values))
+                if all_selected_rank_values else 0.0
+            ),
+            "heuristic_top1_selected": heuristic_top1_selected,
+            "heuristic_top1_selected_rate": (
+                sum(float(value) for value in heuristic_top1_selected.values())
+                / float(len(operations))
+            ),
+            "selected_outside_heuristic_budget_rate": (
+                selected_outside_heuristic_budget_rates
+            ),
+            "selected_outside_exploration_support_rate": (
+                selected_outside_exploration_support_rates
+            ),
+            "score_audit": score_audit,
+            "candidate_local_credit_loss": candidate_local_credit_loss,
+            "geometry_joint_policy": joint_geometry_audit if geometry_joint else {},
+            "candidate_ranking_local_loss": candidate_local_loss,
+            "candidate_pairwise_local_loss": candidate_pairwise_loss,
+            "candidate_critic_local_loss": candidate_critic_loss,
+            "candidate_proxy_critic_local_loss": candidate_critic_loss,
+            "candidate_actor_critic_distill_loss": candidate_actor_critic_loss,
+            "candidate_actor_proxy_loss": actor_proxy_loss,
+            "candidate_actor_proxy_weight": float(effective_actor_proxy_weight),
+            "actor_rank_feature_enabled": bool(getattr(
+                self.args,
+                "heuristic_guidance_online_actor_use_rank_feature",
+                False,
+            )),
+            "candidate_pairwise_local_weight": float(candidate_pairwise_weight),
+            "operation_local_loss": operation_local_loss,
+            "amount_local_loss": amount_local_loss,
+            "fine_local_loss": fine_local_loss,
+            "candidate_utility_correlation": candidate_utility_correlations,
+            "candidate_utility_audit": candidate_utility_audit,
+            "operation_utility_target": {
+                name: float(operation_utility_target[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "operation_utility_raw_target": {
+                name: float(operation_utility_raw_target[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "operation_utility_confidence": float(operation_utility_confidence),
+            "operation_utility_aggregation_agreement": float(
+                operation_utility_aggregation_agreement
+            ),
+            "amount_utility_confidence": float(amount_utility_confidence),
+            "fine_utility_confidence": float(fine_utility_confidence),
+            "operation_rate_summary": {
+                name: float(operation_rate_summary[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "operation_geometry_summary": {
+                name: float(operation_geometry_summary[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "amount_utility_target": [
+                float(value) for value in amount_utility_target.detach().cpu().tolist()
+            ],
+            "topk_audit": topk_audit,
+            "deterministic_top1_changed": deterministic_top1_changed,
+            "deterministic_top1_changed_rate": (
+                sum(float(value) for value in deterministic_top1_changed.values())
+                / float(len(operations))
+            ),
+            "exploration_top1_changed": exploration_top1_changed,
+            "exploration_top1_changed_rate": (
+                sum(float(value) for value in exploration_top1_changed.values())
+                / float(len(operations))
+            ),
+            "exploration_heuristic_top1_selected": (
+                exploration_heuristic_top1_selected
+            ),
+            "exploration_selection_change_rate": (
+                exploration_selection_change_rates
+            ),
+            "learning_adaptive_exploration": True,
+            "actual_action_evidence": float(getattr(
+                self, "_den6_actual_action_evidence", 0.0
+            )),
+            "actual_action_comparisons": int(getattr(
+                self, "_den6_actual_action_comparisons", 0
+            )),
+            "plan_exploration_factor": float(plan_exploration_factor),
+            "operation_exploration_factors": operation_exploration_factors,
+            "exploration_support_sizes": exploration_support_sizes,
+            "exploration_tail_sizes": exploration_tail_sizes,
+            "exploration_change_budgets": exploration_change_budgets,
+            "exploration_support_reserve_factors": (
+                exploration_support_reserve_factors
+            ),
+            "where_gumbel_audit": gumbel_audit,
+            "candidate_entropy_by_operation": candidate_entropy_values,
+            "candidate_normalized_entropy": candidate_normalized_entropy,
+            "candidate_max_probability": candidate_max_probability,
+            "candidate_top2_probability_gap": candidate_top2_probability_gap,
+            "delta_where_logit_mean": float(where_residual_tensor.mean().detach().cpu()),
+            "delta_where_logit_std": float(
+                where_residual_tensor.std(unbiased=False).detach().cpu()
+            ),
+            "delta_where_logit_abs_max": float(
+                where_residual_tensor.abs().max().detach().cpu()
+            ),
+            "anchor_phase": float(anchor_phase),
+            "requested_counts": requested_counts,
+            "amount_bin_index": int(selected_amount_bin.detach().cpu()),
+            "amount_bin_ratio": float(hard_total.detach().cpu()),
+            "no_op_selected": bool(no_op_selected),
+            "amount_bin_probabilities": [
+                float(value) for value in amount_prob.detach().cpu().tolist()
+            ],
+            "amount_logit_calibration_scale": float(amount_logit_calibration_scale),
+            "amount_logit_std_uncalibrated": float(
+                amount_logits_uncalibrated.detach().std(unbiased=False).cpu()
+            ) if int(amount_logits_uncalibrated.numel()) > 1 else 0.0,
+            "amount_fine_log_residual": float(
+                torch.stack([
+                    operation_fine_samples[name].reshape(())
+                    for name in operations
+                ]).mean().detach().cpu()
+            ),
+            "amount_fine_score_gradient_scale": (
+                sum(
+                    float(fine_sigma_base)
+                    * float(operation_exploration_factors[name])
+                    for name in operations
+                ) / float(len(operations))
+            ),
+            "operation_amount_log_residuals": {
+                name: float(operation_fine_samples[name].detach().cpu())
+                for name in operations
+            },
+            "operation_amount_mean_log_residuals": {
+                name: float(operation_fine_means[name].detach().cpu())
+                for name in operations
+            },
+            "delta_amount_ratios": amount_delta_ratios,
+            "delta_amount_mean": float(amount_delta_tensor.mean().detach().cpu()),
+            "delta_amount_std": float(
+                amount_delta_tensor.std(unbiased=False).detach().cpu()
+            ),
+            "delta_amount_abs_max": float(
+                amount_delta_tensor.abs().max().detach().cpu()
+            ),
+            "operation_amount_log_probs": {
+                name: operation_fine_log_probs[name]
+                for name in operations
+            },
+            "amount_total_ratio_before_count": float(sampled_total_ratio.detach().cpu()),
+            "amount_mode": (
+                "exact_fixed"
+                if current_step < exact_anchor_steps
+                else "network_discrete_plus_fine_residual"
+            ),
+            "removed_voxel_count": len(removes),
+            "added_voxel_count": len(adds),
+            # Device tensor used by Geometry Fit; unlike the final-set
+            # difference, this excludes Adjust destinations by construction.
+            "selected_add_target_coords": (
+                torch.as_tensor(
+                    sorted(true_add_targets),
+                    device=source_rows.device,
+                    dtype=torch.long,
+                ).reshape(-1, 3).transpose(0, 1).contiguous().unsqueeze(0)
+                if true_add_targets
+                else source_rows.new_empty((1, 3, 0))
+            ),
+            "ratio_fallback_applied": selected_counts != requested_counts,
+            "selected_total_ratio": float(selected_total_ratio),
+            "selected_changed_voxel_ratio": float(selected_changed_ratio),
+            "one_pattern_only": True,
+            "exploration_active": bool(exploration_active),
+            "amount_exploration_active": bool(amount_exploration_active),
+            "exploration_mode": str(exploration_mode),
+            "exploration_multiplier": float(exploration_multiplier),
+            "scheduled_exploration_multiplier": float(
+                scheduled_exploration_multiplier
+            ),
+            "post_window_exploration": bool(post_window_exploration),
+            "post_window_learning_need": float(post_window_learning_need),
+            "behavior_exploration_phase": float(1.0 - exploration_multiplier),
+            "effective_where_gumbel_scale": float(gumbel_scale),
+            "effective_amount_log_sigma": float(fine_sigma_base),
+            "effective_amount_log_sigma_by_operation": {
+                name: float(fine_sigma_base)
+                * float(operation_exploration_factors[name])
+                for name in operations
+            },
+            "effective_amount_gumbel_scale": float(effective_amount_gumbel_scale),
+            "policy_log_prob": policy_log_prob,
+            "policy_entropy": policy_entropy,
+            "anchor_policy_credit_disabled": bool(exact_anchor_active),
+            "where_log_prob": where_log_prob,
+            "amount_log_prob": amount_log_prob,
+            "amount_bin_log_prob": amount_bin_log_prob,
+            "_actual_credit_amount_log_probs": amount_log_probs,
+            "_actual_credit_amount_bin_index": int(selected_amount_bin.detach().cpu()),
+            "_actual_credit_group_log_prob": policy_log_prob,
+            "_actual_credit_anchor_group_log_prob": anchor_group_log_prob,
+            "amount_bin_entropy": -(
+                amount_prob * torch.log(amount_prob.clamp_min(1e-12))
+            ).sum(),
+            "action_log_prob": action_log_prob,
+            "operation_gate_probabilities": {
+                name: float(gate_probs[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "operation_gate_selected_shares": {
+                name: float(selected_share[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "operation_gate_share_l1_error": float(
+                (gate_probs.detach() - selected_share.detach()).abs().mean().cpu()
+            ),
+            # Internal differentiable state for same-frame Actual set
+            # comparison.  These values are consumed after the single
+            # composite codec encode and are not candidate codec evaluations.
+            # In actor_critic mode Actual preference must update the Actor
+            # logits, not the upstream legacy base score.  The old tensor here
+            # silently bypassed den6_candidate_actor.
+            "_actual_credit_network_scores": (
+                candidate_value_scores if actual_residual_learning else network_scores
+            ),
+            "_actual_credit_proposal_scores": candidate_proposal_logits,
+            "_actual_credit_proposal_features": candidate_actor_features,
+            "_actual_credit_candidate_ids": {
+                name: [str(candidate.get("candidate_id", "")) for candidate in pools[name]]
+                for name in operations
+            },
+            "_actual_credit_selected_ids": {
+                name: [
+                    str(pools[name][index].get("candidate_id", ""))
+                    for index in selected_indices_by_operation[name]
+                ]
+                for name in operations
+            },
+            "_actual_credit_explored_indices": {
+                name: [
+                    int(index) for index in exploration_added_indices[name]
+                    if int(index) in set(selected_indices_by_operation[name])
+                ]
+                for name in operations
+            },
+            "_actual_credit_explored_features": {
+                name: (
+                    candidate_actor_features[name].index_select(
+                        0,
+                        torch.as_tensor(
+                            [
+                                int(index) for index in exploration_added_indices[name]
+                                if int(index) in set(selected_indices_by_operation[name])
+                            ],
+                            device=candidate_actor_features[name].device,
+                            dtype=torch.long,
+                        ),
+                    )
+                    if actual_residual_learning and any(
+                        int(index) in set(selected_indices_by_operation[name])
+                        for index in exploration_added_indices[name]
+                    )
+                    else action_ratio_stack.new_empty((0, 7))
+                )
+                for name in operations
+            },
+            "_actual_credit_explored_critic_features": {
+                name: (
+                    candidate_critic_features[name].index_select(
+                        0,
+                        torch.as_tensor(
+                            [
+                                int(index) for index in exploration_added_indices[name]
+                                if int(index) in set(selected_indices_by_operation[name])
+                            ],
+                            device=candidate_critic_features[name].device,
+                            dtype=torch.long,
+                        ),
+                    )
+                    if actual_residual_learning and any(
+                        int(index) in set(selected_indices_by_operation[name])
+                        for index in exploration_added_indices[name]
+                    )
+                    else action_ratio_stack.new_empty((0, 7))
+                )
+                for name in operations
+            },
+            "exploration_candidate_changes": {
+                name: len(exploration_added_indices[name]) for name in operations
+            },
+            "exploration_heuristic_rank_bands": exploration_heuristic_rank_bands,
+            "_actor_critic_plan_feature": plan_feature,
+            "_actor_critic_plan_value": plan_critic_mean,
+            "_actor_critic_plan_log_variance": plan_critic_log_variance,
+            "_actor_critic_selected_changed_ratio": action_ratio_stack.new_tensor(
+                float(selected_changed_ratio)
+            ),
+            # Keep the exact executed ratio in the forward pass while sending
+            # the continuous Amount/Gate/Fine derivative backward.  The old
+            # new_tensor(float(...)) detached this value, making the edit
+            # efficiency objective unable to lower the operation ratio.
+            "_actor_critic_selected_operation_ratio": (
+                action_ratio_stack.new_tensor(float(selected_total_ratio))
+                + action_ratio_stack.sum()
+                - action_ratio_stack.sum().detach()
+            ),
+        }
+        plan_hash_payload = {
+            "candidate_ids": selected_ids,
+            "operation_counts": selected_counts,
+            "operation_order": debug["operation_order"],
+        }
+        debug["plan_hash"] = hashlib.sha256(
+            json.dumps(plan_hash_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        # 訓練時のshadow Studentへ渡すのは、このStepで実際に選択・実行した
+        # 1 planだけである。Pool全体や未実行候補は渡さず、推論時にも保持しない。
+        selected_count_sum = max(sum(selected_counts.values()), 1)
+        debug["single_plan_shadow_teacher"] = {
+            "plan_key": debug["plan_hash"],
+            "total_ratio_percent": 100.0 * float(selected_total_ratio),
+            "shares": {
+                name: float(selected_counts[name]) / float(selected_count_sum)
+                for name in operations
+            },
+            "operation_order": debug["operation_order"],
+            "candidates": [
+                {
+                    "candidate_id": str(candidate.get("candidate_id", "")),
+                    "operation": operation,
+                    "remove_coords": list(candidate.get("remove_coords") or []),
+                    "add_coords": list(candidate.get("add_coords") or []),
+                }
+                for operation, _, candidate in selected
+            ],
+            # ActualとGeometryはtrain.pyで同じ実行planの測定後に設定する。
+            "actual_gain_percent": 0.0,
+            "geometry": {},
+            "_teacher_role": "elite",
+        }
+
+        # Step 0はden6 Heuristicだけで作ったinitial planと一致することを検査する。
+        if exact_anchor_active:
+            initial_plan = exact.get(
+                "heuristic_anchor_plan", exact.get("initial_heuristic_plan", {})
+            )
+            expected_hash = ""
+            if isinstance(initial_plan, dict) and bool(initial_plan.get("available", False)):
+                expected_hash = str(initial_plan.get("final_voxel_hash", ""))
+            if not expected_hash:
+                expected_hash = str(exact.get("final_voxel_hash", ""))
+            if expected_hash:
+                values = final_rows.detach().cpu().numpy()
+                actual_hash = hashlib.sha256(
+                    values.astype("int64", copy=False).tobytes(order="C")
+                ).hexdigest()
+                debug["final_voxel_hash"] = actual_hash
+                debug["expected_final_voxel_hash"] = expected_hash
+                if actual_hash != expected_hash:
+                    raise RuntimeError(
+                        "Step 0のonline den6 Heuristic planがworker結果と一致しない: "
+                        f"actual={actual_hash}, expected={expected_hash}"
+                    )
+            if isinstance(initial_plan, dict) and bool(initial_plan.get("available", False)):
+                expected_ids = [str(value) for value in initial_plan.get("candidate_ids", ())]
+                expected_counts = {
+                    name: int(dict(initial_plan.get("operation_counts") or {}).get(name, 0))
+                    for name in operations
+                }
+                expected_order = str(dict(initial_plan.get("metadata") or {}).get("operation_order", ""))
+                if selected_ids != expected_ids or selected_counts != expected_counts or debug["operation_order"] != expected_order:
+                    raise RuntimeError(
+                        "Step 0のonline den6 Heuristic candidate planがworker結果と一致しない: "
+                        f"ids_match={selected_ids == expected_ids}, counts={selected_counts}/{expected_counts}, "
+                        f"order={debug['operation_order']}/{expected_order}"
+                    )
+        return final_coords, debug
+
+    def _scale_amount_downstream_grad(self, ratio, op_name=""):
+        # Amount ratio のforward値は変えず、backwardだけ強める。
+        # 操作ごとに圧縮損失への感度が違うため、Prune/Add/Moveで別々の倍率を使う。
+        # ratio.detach() + scale * (ratio - ratio.detach()) は、
+        # forwardではratioと同じ値になり、backwardではscale倍の勾配を返す。
+        op_name = str(op_name).strip().lower()
+
+        if op_name in {"drop", "prune", "delete"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_drop_amount_downstream_grad_scale",
+                    getattr(self.args, "repair_amount_downstream_grad_scale", 6.0),
+                )
+            )
+        elif op_name in {"add", "insert"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_add_amount_downstream_grad_scale",
+                    getattr(self.args, "repair_amount_downstream_grad_scale", 6.0),
+                )
+            )
+        elif op_name in {"move", "adjust", "disp"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_move_amount_downstream_grad_scale",
+                    getattr(self.args, "repair_amount_downstream_grad_scale", 6.0),
+                )
+            )
+        else:
+            scale = float(getattr(self.args, "repair_amount_downstream_grad_scale", 6.0))
+
+        max_scale = max(float(getattr(self.args, "repair_amount_downstream_grad_max_scale", 8.0)), 1.0)
+        scale = min(max(scale, 1.0), max_scale)
+        return ratio.detach() + scale * (ratio - ratio.detach())
+
+    def _scale_where_downstream_grad(self, value, op_name=""):
+        # These legacy STE multipliers must not attenuate the dedicated
+        # Actual score-function path (0.005 * 1/6 for Prune in old defaults).
+        # Forward is identical; codec-specific Actual credit retains its own
+        # measured advantage and downstream safety clipping.
+        from ..utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
+        if sparsepcgc_credit_training(self.args):
+            return value
+        # Where score / logit のforward値は変えず、backwardだけ強める。
+        # これにより圧縮損失 L_com から drop_head / add_head / move_voxel_head へ戻る勾配を操作別に調整する。
+        op_name = str(op_name).strip().lower()
+
+        if op_name in {"drop", "prune", "delete"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_drop_where_downstream_grad_scale",
+                    getattr(self.args, "repair_where_downstream_grad_scale", 1.0),
+                )
+            )
+        elif op_name in {"add", "insert"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_add_where_downstream_grad_scale",
+                    getattr(self.args, "repair_where_downstream_grad_scale", 1.0),
+                )
+            )
+        elif op_name in {"move", "adjust", "disp"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_move_where_downstream_grad_scale",
+                    getattr(self.args, "repair_where_downstream_grad_scale", 1.0),
+                )
+            )
+        else:
+            scale = float(getattr(self.args, "repair_where_downstream_grad_scale", 1.0))
+
+        # Where勾配倍率を安全範囲に制限する。
+        # 既存実装では max(scale, 1.0) により1倍未満へ下げられなかった。
+        # しかし Add Where だけが突出している場合は、forward値を変えずに
+        # backwardだけ弱める必要がある。
+        min_scale = max(
+            float(getattr(self.args, "repair_where_downstream_grad_min_scale", 0.05)),
+            1e-4,
+        )
+        max_scale = max(
+            float(getattr(self.args, "repair_where_downstream_grad_max_scale", 8.0)),
+            min_scale,
+        )
+        scale = min(max(scale, min_scale), max_scale)
+
+        return value.detach() + scale * (value - value.detach())
+
+    def _ratio_bias(self, ratio, max_ratio):
+        # 学習した操作量を位置scoreへ戻し、何個選ぶかとどこを選ぶかの勾配をつなぐ。
+        if max_ratio <= 0.0:
+            return ratio.new_zeros(ratio.shape)
+        normalized = (ratio / float(max_ratio)).clamp(1e-4, 1.0 - 1e-4)
+        return self._safe_logit(normalized) * float(getattr(self.args, "repair_operation_amount_bias_scale", 2.0))
+
+    def _max_add_ratio(self):
+        # targetなしAmount学習では、target_add_ratioを上限決定に使わない。
+        # max_add_ratioだけをAdd Amountの探索上限として使う。
+        if self._sparsepcgc_add_experiment_active():
+            max_ratio = float(getattr(self.args, "sparsepcgc_add_max_ratio", getattr(self.args, "max_add_ratio", 0.30)))
+            max_ratio = max_ratio * self._sparsepcgc_add_warmup()
+        else:
+            max_ratio = float(getattr(self.args, "max_add_ratio", 0.30))
+        return min(max(max_ratio, 0.0), 0.30)
+
+    def _sparsepcgc_add_warmup(self):
+        steps = max(int(getattr(self.args, "sparsepcgc_add_warmup_steps", 0)), 0)
+        if steps <= 0:
+            return 1.0
+        step = int(getattr(self.args, "_global_train_step", 0)) + 1
+        return min(1.0, max(0.0, float(step) / float(steps)))
+
+    def _repair_move_warmup(self):
+        # Move is much more destructive for SparsePCGC than add/drop, so let its cap ramp in slowly.
+        if not self.training:
+            return 1.0
+        steps = max(int(getattr(self.args, "repair_move_warmup_steps", 0)), 0)
+        if steps <= 0:
+            return 1.0
+        step = int(getattr(self.args, "_global_train_step", 0)) + 1
+        return min(1.0, max(0.0, float(step) / float(steps)))
+
+    def _sparsepcgc_add_experiment_active(self):
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key != "sparsepcgc":
+            return False
+        if not bool(getattr(self.args, "sparsepcgc_enable_add_experiment", False)):
+            return False
+        if bool(getattr(self.args, "sparsepcgc_add_only_when_compression_primary", True)):
+            return str(getattr(self.args, "loss_mode", "legacy_total")).strip().lower() == "compression_primary"
+        return True
+
+    def _target_add_count(self, point_count, candidate_ratio_override=None, force_min_count=None):
+        if point_count <= 0 or not self._add_enabled():
+            return 0, 0.0
+        max_ratio = self._max_add_ratio()
+        if max_ratio <= 0.0:
+            return 0, 0.0
+        if candidate_ratio_override is None:
+            start = float(getattr(self.args, "repair_add_candidate_ratio_start", 0.0)) or max_ratio
+            end = float(getattr(self.args, "repair_add_candidate_ratio_end", 0.0)) or max_ratio
+            phase = self._behavior_exploration_phase()
+            candidate_ratio = start + (end - start) * phase
+        else:
+            candidate_ratio = float(candidate_ratio_override)
+        candidate_ratio = min(max(candidate_ratio, 0.0), max_ratio)
+        max_add_points = int(math.ceil(max_ratio * float(point_count))) if max_ratio > 0.0 else 0
+        expected_points = candidate_ratio * float(point_count)
+        if force_min_count is None:
+            force_min_count = bool(getattr(self.args, "repair_force_min_add_voxels", False))
+        min_expected = max(float(getattr(self.args, "repair_add_min_expected_voxels", 1.0)), 0.0)
+        if candidate_ratio <= 0.0:
+            add_points = 0
+        elif force_min_count or expected_points >= min_expected:
+            add_points = int(math.ceil(expected_points))
+        else:
+            add_points = 0
+        return min(add_points, max_add_points, point_count), float(candidate_ratio)
+
+    @staticmethod
+    def _gumbel_like(values):
+        eps = torch.finfo(values.dtype).eps
+        uniform = torch.rand_like(values).clamp(eps, 1.0 - eps)
+        return -torch.log(-torch.log(uniform))
+
+    @staticmethod
+    def _random_ratio_mask_like(values, max_ratio, point_mask=None):
+        max_ratio = max(float(max_ratio), 0.0)
+        if max_ratio <= 0.0:
+            return torch.zeros_like(values)
+        B = values.shape[0]
+        ratios = torch.rand((B, 1, 1), device=values.device, dtype=values.dtype) * min(max_ratio, 1.0)
+        mask = (torch.rand_like(values) < ratios).to(dtype=values.dtype)
+        if point_mask is not None:
+            mask = mask * point_mask.to(device=values.device, dtype=values.dtype)
+        return mask
+
+    def _operation_amount_logit(self, actuator_features, head):
+        # amount head の raw logit を返す。
+        # ratio化後の sigmoid が飽和しても、logit側には直接勾配を残す。
+        mean_feat = actuator_features.mean(dim=2, keepdim=True)
+        max_feat = actuator_features.amax(dim=2, keepdim=True)
+        if actuator_features.shape[2] > 1:
+            std_feat = actuator_features.std(dim=2, keepdim=True, unbiased=False)
+        else:
+            std_feat = torch.zeros_like(mean_feat)
+        pooled = (
+            mean_feat
+            + float(getattr(self.args, "repair_amount_pool_std_weight", 0.50)) * std_feat
+            + float(getattr(self.args, "repair_amount_pool_max_weight", 0.25)) * max_feat
+        )
+        scale = float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0))
+        raw_logit = torch.nan_to_num(head(pooled), nan=0.0, posinf=scale, neginf=-scale)
+        bounded_logit = scale * torch.tanh(raw_logit / max(scale, 1e-6))
+        return raw_logit + (bounded_logit - raw_logit).detach()
+
+    def _target_ratio_logit(self, target_ratio, max_ratio, like_tensor):
+        # target_ratio / max_ratio を logit 空間へ写像する。
+        # ratio損失だけでは sigmoid 飽和時に勾配が消えるため、
+        # amount head の raw logit を直接目標へ寄せる補助教師として使う。
+        max_ratio = max(float(max_ratio), 1e-9)
+        target_prob = target_ratio / max_ratio
+        if not torch.is_tensor(target_prob):
+            target_prob = like_tensor.new_tensor(float(target_prob))
+        target_prob = target_prob.to(device=like_tensor.device, dtype=like_tensor.dtype)
+        target_prob_max = min(
+            max(float(getattr(self.args, "repair_operation_amount_target_prob_max", 0.98)), 0.50),
+            1.0 - 1e-4,
+        )
+        target_prob = target_prob.clamp(1e-4, target_prob_max)
+        return torch.log(target_prob / (1.0 - target_prob))
+
+    def _actual_oracle_amount_bce_loss(self, learned_ratio, target_ratio, max_ratio):
+        # actual oracleが採択した編集量をAmount headへ返すための損失。
+        # 小さいratio同士のMSEは勾配が弱すぎるため、max_ratioで正規化したBCEを使う。
+        if max_ratio <= 0.0:
+            return learned_ratio.new_zeros(())
+        pred_prob = (learned_ratio / float(max_ratio)).clamp(1e-4, 1.0 - 1e-4)
+        if not torch.is_tensor(target_ratio):
+            target_ratio = learned_ratio.new_tensor(float(target_ratio))
+        target_prob = target_ratio.to(device=learned_ratio.device, dtype=learned_ratio.dtype) / float(max_ratio)
+        target_prob = target_prob.clamp(0.0, 1.0 - 1e-4)
+        target_prob = target_prob.expand_as(pred_prob)
+        loss = -(
+            target_prob.detach() * pred_prob.log()
+            + (1.0 - target_prob.detach()) * torch.log1p(-pred_prob)
+        )
+        return torch.nan_to_num(loss.mean(), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def forward(
+        self,
+        pts_xyz,
+        structure,
+        cause_scores,
+        policy_probs,
+        actuator_features,
+        repair_priority=None,
+        coord_scale=None,
+        selection_mask=None,
+        octree_context=None,
+        full_octree_context=None,
+        full_cloud_amount_terms=None,
+        network_only_policy_terms=None,
+        external_executable_plan=None,
+    ):
+        external_plan_authority = external_executable_plan is not None
+        timing_enabled = bool(
+            getattr(self.args, "debug_timing", False)
+            or getattr(self.args, "_profile_runtime_this_step", False)
+        )
+        runtime_timing = {}
+        if timing_enabled:
+            if pts_xyz.is_cuda:
+                torch.cuda.synchronize(pts_xyz.device)
+            runtime_start = time.perf_counter()
+            runtime_cursor = runtime_start
+
+            def _mark_runtime(name):
+                nonlocal runtime_cursor
+                if pts_xyz.is_cuda:
+                    torch.cuda.synchronize(pts_xyz.device)
+                now = time.perf_counter()
+                runtime_timing[name] = float(now - runtime_cursor)
+                runtime_cursor = now
+        else:
+            runtime_start = None
+
+        snap_strength = float(getattr(self.args, "repair_snap_strength", getattr(self.args, "disp_snap_strength", 0.35)))
+        max_offset = self._max_offset(pts_xyz, coord_scale)
+        stage_raw = str(getattr(self.args, "training_stage", "joint")).strip().lower()
+        force_joint_actuator = (
+            str(getattr(self.args, "loss_mode", "legacy_total")).strip().lower() == "compression_primary"
+            and bool(getattr(self.args, "cp_force_joint_actuator", True))
+        )
+        # compression_primaryではloss構造を固定するため、actuator強度もjoint相当に固定する。
+        # legacy_totalでは既存のdiagnosis/joint差をそのまま残す。
+        stage = "joint" if force_joint_actuator else stage_raw
+        if stage == "diagnosis":
+            actuator_strength = float(getattr(self.args, "diagnosis_actuator_strength", 0.1))
+        else:
+            actuator_strength = float(getattr(self.args, "repair_actuator_strength", 1.0))
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        sparsepcgc_context = compress_key == "sparsepcgc"
+        network_only_codec_mode = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
+        )
+        if network_only_codec_mode and not isinstance(network_only_policy_terms, dict):
+            raise RuntimeError(
+                "Network-only policy output is required; legacy fallback is forbidden"
+            )
+        add_enabled = self._add_enabled()
+        prune_enabled = self._prune_enabled()
+        disp_enabled = self._disp_enabled()
+        # SparsePCGCはSparse Tensorのactive coordinate数がbit数に直結しやすい。
+        # 新規empty voxelへのaddはactive coordinateを増やすため、既定ではSparsePCGC時だけ止める。
+        sparsepcgc_add_experiment_active = self._sparsepcgc_add_experiment_active()
+        if sparsepcgc_context and bool(getattr(self.args, "sparsepcgc_disable_add", True)) and not sparsepcgc_add_experiment_active:
+            add_enabled = False
+        operation_enabled = add_enabled or prune_enabled or disp_enabled
+        threshold_cap_mode = self._threshold_cap_mode()
+
+        preserve = policy_probs[:, 0:1, :]
+        p_chain = policy_probs[:, 1:2, :]
+        p_sibling = policy_probs[:, 2:3, :]
+        p_parent = policy_probs[:, 3:4, :]
+        p_context = policy_probs[:, 4:5, :]
+        p_comp = policy_probs[:, 5:6, :]
+        p_outlier = policy_probs[:, 6:7, :] if policy_probs.shape[1] > 6 else policy_probs.new_zeros(preserve.shape)
+        base_repair_gate = (1.0 - preserve).clamp(0.0, 1.0)
+        if selection_mask is not None:
+            if selection_mask.ndim == 2:
+                selection_mask = selection_mask.unsqueeze(1)
+            if selection_mask.ndim != 3 or selection_mask.shape[0] != pts_xyz.shape[0] or selection_mask.shape[2] != pts_xyz.shape[2]:
+                raise ValueError("selection_mask must broadcast to [B, 1, N].")
+            selection_mask = selection_mask.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            base_repair_gate = base_repair_gate * selection_mask
+        target_ratio = float(getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20)))
+        if not operation_enabled:
+            target_ratio = 0.0
+        max_repair_ratio = max(float(getattr(self.args, "max_repair_ratio", target_ratio)), target_ratio)
+        if not operation_enabled:
+            max_repair_ratio = 0.0
+        gate_cap_ratio = max_repair_ratio if bool(getattr(self.args, "repair_learn_operation_amounts", True)) else target_ratio
+        if bool(getattr(self.args, "repair_priority_gate", True)) and repair_priority is not None:
+            priority = repair_priority.to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, 1.0)
+            priority_gate = self._priority_topk_gate(
+                priority,
+                target_ratio=max(gate_cap_ratio, 1e-4),
+                tau=float(getattr(self.args, "repair_priority_gate_tau", 0.08)),
+            )
+            repair_gate = base_repair_gate * priority_gate
+        else:
+            repair_gate = base_repair_gate
+        if bool(getattr(self.args, "repair_gate_mean_cap", True)):
+            gate_mean = self._masked_mean(repair_gate, selection_mask).detach().clamp_min(1e-6)
+            # 操作量を学習する場合は固定targetではなく広めの候補上限でrepair候補を残す。
+            gate_scale = (gate_cap_ratio / gate_mean).clamp_max(1.0)
+            repair_gate = repair_gate * gate_scale
+
+        node_score = cause_scores[:, 0:1, :]
+        single_score = cause_scores[:, 1:2, :]
+        lowprob_score = cause_scores[:, 2:3, :] if cause_scores.shape[1] > 2 else preserve.new_zeros(preserve.shape)
+        if cause_scores.shape[1] >= 8:
+            quant_score = cause_scores[:, 4:5, :]
+            sparse_score = cause_scores[:, 5:6, :]
+            local_outlier_score = cause_scores[:, 6:7, :]
+        else:
+            quant_score = preserve.new_zeros(preserve.shape)
+            sparse_score = cause_scores[:, 4:5, :] if cause_scores.shape[1] > 4 else preserve.new_zeros(preserve.shape)
+            local_outlier_score = cause_scores[:, 5:6, :] if cause_scores.shape[1] > 5 else preserve.new_zeros(preserve.shape)
+        shape_score = cause_scores[:, -1:, :]
+        leaf_actuator_prior = self._leaf_pattern_actuator_priors(
+            structure,
+            preserve,
+        )
+        leaf_drop_prior = leaf_actuator_prior["delete_prior"]
+        leaf_add_prior = leaf_actuator_prior["add_prior"]
+        leaf_move_prior = leaf_actuator_prior["move_prior"]
+        full_context_available = isinstance(full_octree_context, dict) and bool(full_octree_context)
+
+        actuator_parent_occupancy_code = 0
+        actuator_sibling_count = 0
+        actuator_ancestor_count = 0
+        full_context_bonus = preserve.new_zeros(preserve.shape)
+
+        if full_context_available:
+            actuator_parent_occupancy_code = int(full_octree_context.get("parent_occupancy_code", 0) or 0)
+
+            sibling_ids = full_octree_context.get("sibling_node_ids", None)
+            if sibling_ids is None:
+                sibling_ids = full_octree_context.get("sibling_paths", [])
+            actuator_sibling_count = len(sibling_ids) if hasattr(sibling_ids, "__len__") else 0
+
+            ancestor_ids = full_octree_context.get("ancestor_node_ids", [])
+            actuator_ancestor_count = len(ancestor_ids) if hasattr(ancestor_ids, "__len__") else 0
+
+            # 親・兄弟・祖先文脈が存在するSubtreeほど、構造操作候補として少しだけ強める。
+            # まずは小さい補正に留め、既存policyを壊さない。
+            context_strength = min(
+                (float(actuator_sibling_count) + 0.5 * float(actuator_ancestor_count)) / 8.0,
+                1.0,
+            )
+            full_context_bonus = preserve.new_full(preserve.shape, context_strength)
+
+        # 初期Octree/Subtreeのglobal voxel座標系を優先して使う。
+        voxel_step, voxel_offset, uses_context_voxel_frame = self._context_voxel_step_and_offset(
+            pts_xyz,
+            coord_scale,
+            octree_context,
+        )
+        voxel_norm = (voxel_step * math.sqrt(3.0)).clamp_min(1e-9)
+
+        context_voxel_coords = None
+        if isinstance(octree_context, dict) and octree_context.get("global_voxel_coords", None) is not None:
+            context_voxel_coords = octree_context["global_voxel_coords"]
+        else:
+            if bool(getattr(self.args, "warn_missing_input_voxel", True)):
+                global_step = getattr(self.args, "_global_train_step", "NA")
+                sample_name = getattr(self.args, "_current_sample_name", "NA")
+                print(
+                    f"[Warning] Voxel is NOT found! "
+                    f"Network input prebuilt Octree/Voxel was not passed to Actuator. "
+                    f"global_step={global_step}, sample={sample_name}, "
+                    f"fallback=local_recomputed"
+                )
+        if context_voxel_coords is not None:
+            if not torch.is_tensor(context_voxel_coords):
+                context_voxel_coords = torch.as_tensor(context_voxel_coords)
+            context_voxel_coords = context_voxel_coords.to(device=pts_xyz.device, dtype=torch.long)
+
+        if context_voxel_coords is not None:
+            if context_voxel_coords.ndim == 2 and context_voxel_coords.shape[-1] == 3:
+                context_voxel_coords = context_voxel_coords.transpose(0, 1).unsqueeze(0)
+            elif context_voxel_coords.ndim == 3 and context_voxel_coords.shape[-1] == 3:
+                context_voxel_coords = context_voxel_coords.permute(0, 2, 1).contiguous()
+
+            if context_voxel_coords.ndim != 3 or context_voxel_coords.shape[1] != 3:
+                raise ValueError("octree_context['global_voxel_coords'] must have shape [N, 3], [B, N, 3], or [B, 3, N].")
+
+            if context_voxel_coords.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                context_voxel_coords = context_voxel_coords.expand(pts_xyz.shape[0], -1, -1)
+
+            if context_voxel_coords.shape[0] != pts_xyz.shape[0]:
+                raise ValueError("octree_context global_voxel_coords batch size does not match pts_xyz.")
+
+            if int(context_voxel_coords.shape[2]) != int(pts_xyz.shape[2]):
+                raise ValueError(
+                    "octree_context['global_voxel_coords'] point count must match pts_xyz. "
+                    "This usually means subtree_tree was not sliced as a subset of full cloud global coords. "
+                    "Build canonical_subtree_tree from full_octree_context using selected_subtree_keys before calling Actuator."
+                )
+
+        if context_voxel_coords is not None:
+            # Network入力前に作った初期Octree/Voxel座標をそのまま使う。
+            voxel_coords = context_voxel_coords.contiguous()
+            actuator_voxel_mode = "prebuilt_global_voxel_coords"
+            actuator_local_recomputed = False
+        else:
+            if bool(getattr(self.args, "forbid_local_voxel_recompute", False)):
+                raise ValueError(
+                    "StructureRepairActuator requires octree_context['global_voxel_coords'] when "
+                    "forbid_local_voxel_recompute=True."
+                )
+            # prebuilt voxelがない場合だけfallbackとして再Voxel化する。
+            # SparsePCGC時はcanonical共通関数を通し、round(xyz/voxel_size) → round(/posQuantscale) に統一する。
+            voxel_coords = self._sparsepcgc_quantized_coords(
+                pts_xyz,
+                coord_scale,
+                fallback_voxel_step=voxel_step,
+                global_offset=voxel_offset,
+            )
+            actuator_voxel_mode = "local_recomputed"
+            actuator_local_recomputed = True
+
+        point_parent_node_ids = None
+        point_child_slots = None
+        point_valid_empty_child_mask = None
+
+        if isinstance(octree_context, dict):
+            point_parent_node_ids = octree_context.get("point_parent_node_ids", None)
+            point_child_slots = octree_context.get("point_child_slots", None)
+            point_valid_empty_child_mask = octree_context.get("point_valid_empty_child_mask", None)
+        # ここから先はprebuilt/localどちらでも共通で必要である。
+        voxel_cache = self._build_voxel_cache(voxel_coords)
+        # Phase3: 点操作とは別に、occupied voxel集合としての編集状態を作る。
+        # 既存のpts_out/final_wはこの時点では変更しない。
+        voxel_edit_state_enabled = bool(getattr(self.args, "repair_voxel_edit_state", True))
+        voxel_edit_mode = "prune_add_move_voxel_state" if voxel_edit_state_enabled else "disabled"
+
+        voxel_edit_initial_coords = voxel_coords.detach()
+        voxel_edit_initial_count = self._unique_voxel_count_from_cache(voxel_cache)
+
+        neighbor_offsets = self.neighbor_offsets.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        neighbor_offsets_long = self.neighbor_offsets.to(device=pts_xyz.device, dtype=torch.long)
+
+        empty_target_mask = self._empty_neighbor_target_mask(voxel_coords, voxel_cache=voxel_cache)
+        online_den6_single_proposal = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            in {"ana_den6_online", "single_plan_student"}
+        )
+
+        B, _, N = pts_xyz.shape
+
+        child_slot_mask = self._child_slot_target_mask(voxel_coords, octree_context)
+        if child_slot_mask is not None and not online_den6_single_proposal:
+            empty_target_mask = empty_target_mask & child_slot_mask
+            actuator_target_mode = "octree_child_slot_masked"
+        else:
+            # ana_den6のAdd/Adjust valid条件は26近傍のempty voxelである。
+            # Network側だけchild-slot maskを追加すると、本物のSparsePCGC固定
+            # symbol pairが全消失するため、online単一planは同じ条件を使う。
+            actuator_target_mode = (
+                "den6_neighbor_empty_voxel"
+                if online_den6_single_proposal else "neighbor_empty_voxel"
+            )
+
+        parent_occupancy_codes, source_child_slots = self._point_parent_codes_and_child_slots(voxel_coords)
+        occupancy_code_popularity = self._occupancy_code_popularity(
+            octree_context,
+            full_octree_context,
+            pts_xyz,
+        )
+        source_child_bits = torch.bitwise_left_shift(
+            torch.ones_like(source_child_slots, dtype=torch.long),
+            source_child_slots,
+        )
+        parent_codes_without_source = torch.bitwise_and(
+            parent_occupancy_codes,
+            255 - source_child_bits,
+        )
+        base_pattern_popularity = occupancy_code_popularity.index_select(
+            0,
+            parent_occupancy_codes.reshape(-1).clamp(0, 255),
+        ).view(B, N)
+        drop_pattern_gain = occupancy_code_popularity.index_select(
+            0,
+            parent_codes_without_source.reshape(-1).clamp(0, 255),
+        ).view(B, N) - base_pattern_popularity
+
+        current_voxels_n3 = voxel_coords.transpose(1, 2).contiguous()
+        # Child slot depends only on coordinate parity.  Compute it directly
+        # as [B,N,26], avoiding another [B,N,26,3] integer tensor.
+        target_child_slots = (
+            (current_voxels_n3[:, :, 0:1] + neighbor_offsets_long[:, 0].view(1, 1, -1)).remainder(2)
+            + 2 * (current_voxels_n3[:, :, 1:2] + neighbor_offsets_long[:, 1].view(1, 1, -1)).remainder(2)
+            + 4 * (current_voxels_n3[:, :, 2:3] + neighbor_offsets_long[:, 2].view(1, 1, -1)).remainder(2)
+        ).to(dtype=torch.long)
+        target_child_bits = torch.bitwise_left_shift(
+            torch.ones_like(target_child_slots, dtype=torch.long),
+            target_child_slots,
+        )
+        parent_code_expanded = parent_occupancy_codes[:, :, None].expand_as(target_child_bits)
+        add_pattern_codes = torch.bitwise_or(parent_code_expanded, target_child_bits)
+        move_pattern_codes = torch.bitwise_or(
+            torch.bitwise_and(parent_code_expanded, 255 - source_child_bits[:, :, None]),
+            target_child_bits,
+        )
+
+        add_pattern_gain = occupancy_code_popularity.index_select(
+            0,
+            add_pattern_codes.reshape(-1).clamp(0, 255),
+        ).view(B, N, -1) - base_pattern_popularity[:, :, None]
+        move_pattern_gain = occupancy_code_popularity.index_select(
+            0,
+            move_pattern_codes.reshape(-1).clamp(0, 255),
+        ).view(B, N, -1) - base_pattern_popularity[:, :, None]
+
+        pattern_gain_scale = max(float(getattr(self.args, "repair_pattern_prior_scale", 6.0)), 0.0)
+        drop_pattern_prior = torch.tanh(drop_pattern_gain * pattern_gain_scale).unsqueeze(1)
+        add_pattern_prior = torch.tanh(add_pattern_gain * pattern_gain_scale)
+        move_pattern_prior = torch.tanh(move_pattern_gain * pattern_gain_scale)
+
+        leaf_target_direction_prior = self._leaf_pattern_target_direction_priors(
+            structure,
+            target_child_slots,
+            preserve,
+            leaf_actuator_prior=leaf_actuator_prior,
+        )
+        leaf_add_target_bias = leaf_target_direction_prior["add_target_bias"]
+        leaf_move_target_bias = leaf_target_direction_prior["move_target_bias"]
+
+        # ana_den6_residualでは、proxy特徴ではなくden6 anchor近傍の局所候補shortlistを使う。
+        heuristic_guidance = self._heuristic_guidance_state(structure)
+        exact_den6_candidate_mode = bool(
+            isinstance(heuristic_guidance, dict)
+            and str(heuristic_guidance.get("formula_basis", ""))
+            in {
+                "ana_den6_exact_ranked_editcandidate_pool_v2",
+                "ana_den6_exact_ranked_editcandidate_pool_online_v1",
+                "ana_den6_exact_one_pattern_anchor_online_v4",
+                "ana_den6_exact_one_pattern_anchor_online_v5",
+                "ana_den6_exact_compact_candidate_shortlist_online_v5",
+                "ana_den6_exact_unique_plan_online_v6",
+                "ana_den6_exact_one_pattern_anchor_online_v6",
+                "ana_den6_exact_single_plan_teacher_online_v8",
+                "mynet_fast_unordered_safe_pool_v1",
+                "mynet_geometry_octree_safe_pool_v1",
+            }
+        )
+        exact_add_source_mask = self._fit_heuristic_candidate_mask(
+            heuristic_guidance, "Add", preserve
+        )
+        exact_prune_source_mask = self._fit_heuristic_candidate_mask(
+            heuristic_guidance, "Prune", preserve
+        )
+        exact_move_source_mask = self._fit_heuristic_candidate_mask(
+            heuristic_guidance, "Adjust", preserve
+        )
+        # target方向はN×26と大きいため、Add/Adjust処理直前にsparse poolから展開する。
+
+        # leaf pattern診断を「参考bias」ではなく、操作候補集合の制限にも使う。
+        leaf_operation_masks = self._leaf_pattern_operation_masks(
+            structure,
+            preserve,
+        )
+        leaf_delete_op_mask = leaf_operation_masks["delete_mask"]
+        leaf_add_op_mask = leaf_operation_masks["add_mask"]
+        leaf_move_op_mask = leaf_operation_masks["move_mask"]
+        actual_oracle_enabled = bool(leaf_operation_masks.get("actual_oracle_enabled", False))
+        actual_oracle_apply_teacher_actions = bool(
+            getattr(self.args, "sparsepcgc_actual_oracle_apply_teacher_actions", False)
+        )
+        hard_leaf_operation_mask_enabled = bool(leaf_operation_masks.get("enabled", False)) and (
+            (not actual_oracle_enabled) or actual_oracle_apply_teacher_actions
+        )
+        actual_oracle_has_drop = bool(leaf_delete_op_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_has_add = bool(leaf_add_op_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_has_move = bool(leaf_move_op_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_drop_bad_mask = leaf_operation_masks.get(
+            "actual_oracle_drop_bad_mask",
+            torch.zeros_like(leaf_delete_op_mask, dtype=torch.bool),
+        ).to(device=pts_xyz.device, dtype=torch.bool)
+        actual_oracle_add_bad_mask = leaf_operation_masks.get(
+            "actual_oracle_add_bad_mask",
+            torch.zeros_like(leaf_add_op_mask, dtype=torch.bool),
+        ).to(device=pts_xyz.device, dtype=torch.bool)
+        actual_oracle_move_bad_mask = leaf_operation_masks.get(
+            "actual_oracle_move_bad_mask",
+            torch.zeros_like(leaf_move_op_mask, dtype=torch.bool),
+        ).to(device=pts_xyz.device, dtype=torch.bool)
+        actual_oracle_drop_bad_score = leaf_operation_masks.get(
+            "actual_oracle_drop_bad_score",
+            torch.zeros_like(leaf_delete_op_mask, dtype=pts_xyz.dtype),
+        ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        actual_oracle_add_bad_score = leaf_operation_masks.get(
+            "actual_oracle_add_bad_score",
+            torch.zeros_like(leaf_add_op_mask, dtype=pts_xyz.dtype),
+        ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        actual_oracle_move_bad_score = leaf_operation_masks.get(
+            "actual_oracle_move_bad_score",
+            torch.zeros_like(leaf_move_op_mask, dtype=pts_xyz.dtype),
+        ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        actual_oracle_has_bad_drop = bool(actual_oracle_drop_bad_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_has_bad_add = bool(actual_oracle_add_bad_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_has_bad_move = bool(actual_oracle_move_bad_mask.detach().any().item()) if actual_oracle_enabled else False
+        prune_after_prior_mode = self._prune_after_prior_mode()
+        prune_after_prior_network_mode = prune_after_prior_mode in {"network", "direct_network"}
+        require_actual_gate_non_prune = bool(
+            getattr(self.args, "sparsepcgc_actual_gate_non_prune", True)
+        )
+        require_actual_gate_prune = bool(
+            getattr(self.args, "sparsepcgc_actual_gate_prune", True)
+        )
+        hard_prune_actual_allowed = (
+            exact_den6_candidate_mode
+            or (not require_actual_gate_prune)
+            or prune_after_prior_network_mode
+            or (actual_oracle_enabled and actual_oracle_has_drop)
+        )
+        hard_add_actual_allowed = (
+            exact_den6_candidate_mode
+            or (not require_actual_gate_non_prune)
+            or (actual_oracle_enabled and actual_oracle_has_add)
+        )
+        hard_move_actual_allowed = (
+            exact_den6_candidate_mode
+            or (not require_actual_gate_non_prune)
+            or (actual_oracle_enabled and actual_oracle_has_move)
+        )
+        actual_oracle_add_direction_index = leaf_operation_masks.get(
+            "actual_oracle_best_add_direction_index",
+            torch.full_like(leaf_add_op_mask, -1, dtype=torch.long),
+        ).to(device=pts_xyz.device, dtype=torch.long)
+        actual_oracle_bad_add_direction_index = leaf_operation_masks.get(
+            "actual_oracle_bad_add_direction_index",
+            torch.full_like(leaf_add_op_mask, -1, dtype=torch.long),
+        ).to(device=pts_xyz.device, dtype=torch.long)
+        actual_oracle_move_direction_index = leaf_operation_masks.get(
+            "actual_oracle_move_direction_index",
+            torch.full_like(leaf_move_op_mask, -1, dtype=torch.long),
+        ).to(device=pts_xyz.device, dtype=torch.long)
+        actual_oracle_bad_move_direction_index = leaf_operation_masks.get(
+            "actual_oracle_move_bad_direction_index",
+            torch.full_like(leaf_move_op_mask, -1, dtype=torch.long),
+        ).to(device=pts_xyz.device, dtype=torch.long)
+
+        child_slot_candidate_ratio = None
+        if child_slot_mask is not None:
+            child_slot_candidate_ratio = child_slot_mask.to(dtype=pts_xyz.dtype).mean()
+        else:
+            child_slot_candidate_ratio = pts_xyz.new_zeros(())
+
+        if selection_mask is None:
+            selection_bool = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
+        else:
+            selection_bool = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            selection_bool = selection_bool.to(device=pts_xyz.device, dtype=torch.bool)
+
+        voxel_point_counts = self._voxel_point_counts(voxel_coords, voxel_cache=voxel_cache).to(device=pts_xyz.device)
+        before_occupied_voxels = self._unique_voxel_count_from_cache(voxel_cache, selection_bool)
+        (
+            drop_operation_gate,
+            add_operation_gate,
+            move_operation_gate,
+            operation_gate_prob,
+            operation_gate_hard,
+            operation_gate_logit,
+        ) = self._learned_operation_gates(
+            actuator_features,
+            prune_enabled=prune_enabled,
+            add_enabled=add_enabled,
+            move_enabled=disp_enabled,
+        )
+        if network_only_codec_mode:
+            gate_prob_t = network_only_policy_terms["gate_probability"].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+            gate_hard_t = network_only_policy_terms["gate_hard"].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+            gate_st_t = network_only_policy_terms["gates"].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+            enabled_t = gate_prob_t.new_tensor(
+                [float(prune_enabled), float(add_enabled), float(disp_enabled)]
+            ).view(1, 3, 1)
+            operation_gate_prob = gate_prob_t * enabled_t
+            operation_gate_hard = gate_hard_t * enabled_t
+            operation_gate_logit = network_only_policy_terms["gate_logits"].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+            gate_st_t = gate_st_t * enabled_t
+            drop_operation_gate = gate_st_t[:, 0:1]
+            add_operation_gate = gate_st_t[:, 1:2]
+            move_operation_gate = gate_st_t[:, 2:3]
+        # den6の「1候補」はAdd/Prune/Adjustのいずれか1操作ではなく、3操作を
+        # まとめた1つの複合planである。ここではPoolを参照せず、入力特徴から
+        # 計算したden6判断規則を初期prior、Networkを学習可能なresidualとする。
+        single_proposal_formula = (
+            str(heuristic_guidance.get("formula_basis", ""))
+            if isinstance(heuristic_guidance, dict) else ""
+        )
+        teacher_guided_single_proposal = bool(
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+            and single_proposal_formula
+            == "ana_den6_single_proposal_network_residual_online_v7"
+        )
+        network_only_single_proposal = bool(
+            single_proposal_formula == "network_only_where_amount_action_inference_v1"
+            or network_only_codec_mode
+        )
+        network_single_proposal = bool(
+            teacher_guided_single_proposal or network_only_single_proposal
+        )
+        if not network_only_single_proposal:
+            drop_operation_gate, add_operation_gate, move_operation_gate = self._apply_heuristic_action_guidance(
+                heuristic_guidance,
+                drop_operation_gate,
+                add_operation_gate,
+                move_operation_gate,
+                prune_enabled=prune_enabled,
+                add_enabled=add_enabled,
+                move_enabled=disp_enabled,
+            )
+        if network_only_codec_mode:
+            operation_gate_prob = gate_prob_t * enabled_t
+        else:
+            operation_gate_prob = torch.cat([drop_operation_gate, add_operation_gate, move_operation_gate], dim=1)
+        if teacher_guided_single_proposal:
+            # den6の1候補は「3操作から1つを選ぶ」のではなく、Add/Prune/Adjustを
+            # 同時に含む1つの複合planである。Action headは各操作の確率・優先度を
+            # 学習するが、hard forwardで操作自体を消してno-opへ逃げることは許さない。
+            enabled_operation_mask = operation_gate_prob.new_tensor([
+                float(prune_enabled), float(add_enabled), float(disp_enabled)
+            ]).view(1, 3, 1).expand_as(operation_gate_prob)
+            operation_gate_hard = enabled_operation_mask
+            operation_gate_st = (
+                operation_gate_hard.detach()
+                + operation_gate_prob
+                - operation_gate_prob.detach()
+            )
+            drop_operation_gate = operation_gate_st[:, 0:1]
+            add_operation_gate = operation_gate_st[:, 1:2]
+            move_operation_gate = operation_gate_st[:, 2:3]
+        elif network_only_codec_mode:
+            operation_gate_hard = gate_hard_t * enabled_t
+        else:
+            operation_gate_hard = (
+                operation_gate_prob >= min(max(float(getattr(self.args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
+            ).to(dtype=operation_gate_prob.dtype)
+        if actual_oracle_enabled and actual_oracle_apply_teacher_actions:
+            if prune_after_prior_mode != "network":
+                if actual_oracle_has_drop and prune_enabled:
+                    drop_operation_gate = torch.ones_like(drop_operation_gate)
+                else:
+                    drop_operation_gate = torch.zeros_like(drop_operation_gate)
+            if actual_oracle_has_add and add_enabled:
+                add_operation_gate = torch.ones_like(add_operation_gate)
+            else:
+                add_operation_gate = torch.zeros_like(add_operation_gate)
+            if actual_oracle_has_move and disp_enabled:
+                move_operation_gate = torch.ones_like(move_operation_gate)
+            else:
+                move_operation_gate = torch.zeros_like(move_operation_gate)
+
+        if timing_enabled:
+            _mark_runtime("setup")
+
+        codec_prune_prior_enabled = bool(
+            prune_enabled and getattr(self.args, "sparsepcgc_codec_prune_prior", False)
+        )
+        prune_after_prior_mode = self._prune_after_prior_mode()
+        prune_after_prior_network_mode = prune_after_prior_mode in {"network", "direct_network"}
+        configured_codec_prior_block_size = int(
+            getattr(self.args, "sparsepcgc_codec_prune_prior_block_size", 0)
+        )
+        if configured_codec_prior_block_size > 0:
+            codec_prune_prior_block_size = configured_codec_prior_block_size
+        else:
+            dataset_key = str(getattr(self.args, "dataname", "")).strip().lower()
+            if dataset_key == "8i":
+                codec_prune_prior_block_size = 64 if int(N) > 50000 else 8
+            else:
+                codec_prune_prior_block_size = 32 if int(N) > 20000 else 8
+        codec_prune_prior_ratio = min(
+            max(float(getattr(self.args, "sparsepcgc_codec_prune_prior_ratio", 0.05)), 0.0),
+            0.30,
+        )
+        codec_prune_prior_warmup_steps = max(
+            int(getattr(self.args, "sparsepcgc_codec_prune_prior_warmup_steps", 200)),
+            0,
+        )
+        current_train_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        codec_prune_prior_phase = 0.0
+        if codec_prune_prior_enabled and self.training and codec_prune_prior_warmup_steps > 0:
+            codec_prune_prior_phase = max(
+                1.0 - float(current_train_step) / float(codec_prune_prior_warmup_steps),
+                0.0,
+            )
+        phase0_network_prune_mode = self._network_phase0_prune_mode(codec_prune_prior_phase)
+        # single-actionではPruneだけがAction gateを迂回すると複数操作になる。
+        if network_single_proposal:
+            phase0_network_prune_mode = False
+        # ============================================================
+        # Hybrid Prune Prior
+        # ============================================================
+        # codec_prune_prior_phaseはwarmup終了で0になる。
+        # しかし、完全にpriorを消すと未学習Networkが悪い5% Pruneを選び続ける。
+        # そのため、warmup後も弱いprior biasをtailとして残し、
+        # Network scoreへ段階的に移行する。
+        # ============================================================
+        codec_prune_prior_hybrid_alpha = 0.0
+
+        if (
+            codec_prune_prior_enabled
+            and self.training
+            and not self._direct_network_prune_mode()
+            and bool(getattr(self.args, "sparsepcgc_hybrid_prune_prior", True))
+        ):
+            if codec_prune_prior_phase > 0.0:
+                codec_prune_prior_hybrid_alpha = float(codec_prune_prior_phase)
+            else:
+                hybrid_tail_steps = max(
+                    int(getattr(self.args, "sparsepcgc_hybrid_prior_tail_steps", 1200)),
+                    0,
+                )
+                hybrid_tail_start_alpha = min(
+                    max(float(getattr(self.args, "sparsepcgc_hybrid_prior_tail_alpha", 0.35)), 0.0),
+                    1.0,
+                )
+                if hybrid_tail_steps > 0 and hybrid_tail_start_alpha > 0.0:
+                    tail_step = max(current_train_step - codec_prune_prior_warmup_steps, 0)
+                    tail_phase = max(
+                        1.0 - float(tail_step) / float(hybrid_tail_steps),
+                        0.0,
+                    )
+                    codec_prune_prior_hybrid_alpha = float(hybrid_tail_start_alpha * tail_phase)
+
+        codec_prune_prior_hybrid_alpha = min(
+            max(float(codec_prune_prior_hybrid_alpha), 0.0),
+            1.0,
+        )
+        # ============================================================
+        # Hybrid Hard Action Alpha
+        # ============================================================
+        # codec_prune_prior_hybrid_alpha は主に score/logit bias 用である。
+        # しかし今回の問題は「hard actionがPhase0後にNetwork top-kへ急に切り替わる」
+        # ことなので、hard action自体にも別のtail alphaを持たせる。
+        # ============================================================
+        codec_prune_prior_hard_action_alpha = 0.0
+
+        if (
+            codec_prune_prior_enabled
+            and self.training
+            and not self._direct_network_prune_mode()
+            and bool(getattr(self.args, "sparsepcgc_hybrid_hard_action", True))
+        ):
+            if codec_prune_prior_phase > 0.0:
+                codec_prune_prior_hard_action_alpha = 1.0
+            else:
+                hard_tail_steps = max(
+                    int(getattr(self.args, "sparsepcgc_hybrid_hard_action_tail_steps", 2000)),
+                    0,
+                )
+                hard_tail_start_alpha = min(
+                    max(float(getattr(self.args, "sparsepcgc_hybrid_hard_action_tail_alpha", 0.85)), 0.0),
+                    1.0,
+                )
+
+                if hard_tail_steps > 0 and hard_tail_start_alpha > 0.0:
+                    hard_tail_step = max(current_train_step - codec_prune_prior_warmup_steps, 0)
+                    hard_tail_phase = max(
+                        1.0 - float(hard_tail_step) / float(hard_tail_steps),
+                        0.0,
+                    )
+                    codec_prune_prior_hard_action_alpha = float(
+                        hard_tail_start_alpha * hard_tail_phase
+                    )
+
+        codec_prune_prior_hard_action_alpha = min(
+            max(float(codec_prune_prior_hard_action_alpha), 0.0),
+            1.0,
+        )
+        if heuristic_guidance is not None:
+            # den6はcandidateをvoxel単位で順位付けして選ぶ。旧codec block actionは
+            # 同じAmountでもblock境界で操作数を減らすため、anchor中は混在させない。
+            codec_prune_prior_hard_action_alpha = 0.0
+        codec_prune_prior_score = torch.zeros(
+            (B, 1, N),
+            device=pts_xyz.device,
+            dtype=pts_xyz.dtype,
+        )
+        codec_prune_prior_block_counts = [0 for _ in range(B)]
+        if codec_prune_prior_enabled:
+            codec_prune_prior_score, codec_prune_prior_block_counts = self._codec_prune_block_prior(
+                voxel_coords,
+                codec_prune_prior_block_size,
+            )
+            codec_prune_prior_score = codec_prune_prior_score.to(
+                device=pts_xyz.device,
+                dtype=pts_xyz.dtype,
+            )
+        if codec_prune_prior_phase > 0.0:
+            hard_prune_actual_allowed = True
+            warm_drop_gate = torch.maximum(
+                drop_operation_gate,
+                drop_operation_gate.new_tensor(codec_prune_prior_phase),
+            )
+            drop_operation_gate = (
+                warm_drop_gate.detach()
+                + drop_operation_gate
+                - drop_operation_gate.detach()
+            )
+        # ============================================================
+        # Prune gate monotonic floor
+        # ============================================================
+        # 旧設計では前Stepのdrop_operation_gateをfloorとして残していた。
+        # しかしHybrid訓練では、過去Stepのgateが現在Stepの操作選択を固定し、
+        # NetworkがAmount/Whereを学習する余地を狭める。
+        # そのため既定では無効化する。
+        # ============================================================
+        prune_gate_monotonic_floor = (
+            getattr(self.args, "_sparsepcgc_last_drop_gate_floor", None)
+            if bool(getattr(self.args, "sparsepcgc_prune_gate_monotonic_floor", False))
+            else None
+        )        
+
+        if self.training and prune_enabled and prune_gate_monotonic_floor is not None:
+            try:
+                prune_gate_monotonic_floor = float(prune_gate_monotonic_floor)
+            except Exception:
+                prune_gate_monotonic_floor = None
+        else:
+            prune_gate_monotonic_floor = None
+        if self.training and prune_enabled and prune_gate_monotonic_floor is not None:
+            drop_gate_floor_tensor = drop_operation_gate.new_tensor(float(prune_gate_monotonic_floor))
+            drop_operation_gate_monotonic = torch.maximum(drop_operation_gate, drop_gate_floor_tensor)
+            drop_operation_gate = (
+                drop_operation_gate_monotonic.detach()
+                + drop_operation_gate
+                - drop_operation_gate.detach()
+            )
+
+        delete_prior = (
+            0.95 * p_outlier
+            + 0.75 * p_chain
+            + 0.55 * p_sibling
+            + 0.45 * p_parent
+            + 0.20 * p_context
+            + 0.25 * node_score
+            + 0.25 * single_score
+            + 0.15 * lowprob_score
+            + 0.45 * quant_score
+            + 0.25 * sparse_score
+            + 0.35 * local_outlier_score
+            - 0.85 * preserve
+            - 0.75 * shape_score
+        )
+        if full_context_available:
+            delete_prior = delete_prior + 0.05 * full_context_bonus
+        if bool(leaf_actuator_prior.get("enabled", False)):
+            delete_prior = delete_prior + float(
+                getattr(self.args, "leaf_pattern_actuator_drop_weight", 0.75)
+            ) * leaf_drop_prior
+        delete_prior = delete_prior + float(
+            getattr(self.args, "repair_drop_pattern_prior_weight", 1.5)
+        ) * drop_pattern_prior
+        hard_drop_block_reason = "network_mode" if prune_after_prior_network_mode else "oracle_mode"
+        # targetなしAmount学習では、Pruneの実行量をtarget_drop_ratioへ寄せない。
+        # max_drop_ratioだけを0〜30%の探索上限として使う。
+        target_drop_ratio = 0.0
+        max_drop_ratio = min(
+            max(float(getattr(self.args, "max_drop_ratio", 0.30)), 0.0),
+            0.30,
+        ) if prune_enabled else 0.0
+        if not prune_enabled:
+            max_drop_ratio = 0.0
+        # Pruneする割合を特徴から学習し、固定target_drop_ratioだけに依存しない削除数にする。
+        learned_drop_ratio = self._learned_operation_ratio(
+            actuator_features,
+            self.drop_amount_head,
+            max_drop_ratio if prune_enabled else 0.0,
+            "repair_drop_amount_random_mix_start",
+            "repair_drop_amount_random_mix_end",
+        )
+        if network_only_codec_mode:
+            # Base ratio is total*share; the common gate multiplication below
+            # supplies the Binary-Concrete hard-forward/soft-backward action.
+            learned_drop_ratio = (
+                network_only_policy_terms["total_ratio"]
+                * network_only_policy_terms["shares"][:, 0:1]
+            ).to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, float(max_drop_ratio))
+        raw_learned_drop_ratio = learned_drop_ratio
+        learned_drop_ratio_before_floor = learned_drop_ratio
+        drop_ratio_floor = min(
+            max(float(getattr(self.args, "repair_drop_ratio_floor", 0.0)), 0.0),
+            float(max_drop_ratio),
+        )
+        # ============================================================
+        # Prune ratio monotonic floor
+        # ============================================================
+        # 旧設計では前StepのPrune ratioをfloorとして使っていた。
+        # これにより一度5%付近になると、Networkが2%や1%を出しても
+        # hard実行量が5%付近に張り付きやすい。
+        # Hybrid訓練ではAmount学習を確認するため、既定では無効化する。
+        # ============================================================
+        prune_ratio_monotonic_floor = (
+            getattr(self.args, "_sparsepcgc_last_prune_ratio_floor", None)
+            if bool(getattr(self.args, "sparsepcgc_prune_monotonic_floor", False))
+            else None
+        )
+        if self.training and prune_enabled and prune_ratio_monotonic_floor is not None:
+            try:
+                prune_ratio_monotonic_floor = float(prune_ratio_monotonic_floor)
+            except Exception:
+                prune_ratio_monotonic_floor = None
+        else:
+            prune_ratio_monotonic_floor = None
+        monotonic_prune_floor_value = None if prune_ratio_monotonic_floor is None else max(
+            float(prune_ratio_monotonic_floor),
+            float(drop_ratio_floor),
+        )
+        if self.training and prune_enabled and drop_ratio_floor > 0.0:
+            learned_drop_ratio_floored = torch.maximum(
+                learned_drop_ratio,
+                learned_drop_ratio.new_tensor(drop_ratio_floor),
+            )
+            learned_drop_ratio = (
+                learned_drop_ratio_floored.detach()
+                + learned_drop_ratio
+                - learned_drop_ratio.detach()
+            )
+        if self.training and prune_enabled and monotonic_prune_floor_value is not None:
+            monotonic_floor_tensor = learned_drop_ratio.new_tensor(float(monotonic_prune_floor_value))
+            learned_drop_ratio_monotonic = torch.maximum(learned_drop_ratio, monotonic_floor_tensor)
+            learned_drop_ratio = (
+                learned_drop_ratio_monotonic.detach()
+                + learned_drop_ratio
+                - learned_drop_ratio.detach()
+            )
+        learned_drop_ratio_after_floor = learned_drop_ratio
+        network_prune_floor_ratio = self._network_prune_floor_ratio(max_drop_ratio)
+        if self.training and prune_enabled and network_prune_floor_ratio > 0.0:
+            network_floor_tensor = learned_drop_ratio.new_tensor(float(network_prune_floor_ratio))
+            learned_drop_ratio_network_floor = torch.maximum(learned_drop_ratio_after_floor, network_floor_tensor)
+            learned_drop_ratio_after_floor = (
+                learned_drop_ratio_network_floor.detach()
+                + learned_drop_ratio_after_floor
+                - learned_drop_ratio_after_floor.detach()
+            )
+        learned_drop_ratio_before_gate_raw = learned_drop_ratio_after_floor
+        # Phase0 network modeはoperation gateをhard countへ掛けないため、
+        # gate前とgate後の両方に同じHeuristic Amount中心を用意する。
+        learned_drop_ratio_before_gate = self._apply_heuristic_amount_guidance(
+            learned_drop_ratio_before_gate_raw, heuristic_guidance, "Prune", max_drop_ratio
+        )
+        learned_drop_ratio_after_gate_raw = learned_drop_ratio_before_gate_raw * drop_operation_gate
+        learned_drop_ratio_after_gate = self._apply_heuristic_amount_guidance(
+            learned_drop_ratio_after_gate_raw, heuristic_guidance, "Prune", max_drop_ratio
+        )
+        # ============================================================
+        # Network自由Amountモード
+        # ============================================================
+        # warmup中:
+        #   codec priorのPrune量を使って探索・教師行動を作る。
+        #
+        # warmup終了後:
+        #   codec_prior_ratio × alpha で 1.75% 等に固定しない。
+        #   hard countに使うPrune量はNetworkのAmount出力を基本にする。
+        #
+        # ただしWhere / hard action hybrid / prior distillationは残す。
+        # ============================================================
+        amount_mode = str(
+            getattr(self.args, "sparsepcgc_hybrid_amount_mode", "network")
+        ).strip().lower()
+        if amount_mode not in {"network", "blend", "max"}:
+            amount_mode = "network"
+        amount_mode_id = {"network": 1, "blend": 2, "max": 3}.get(amount_mode, 0)
+        amount_mode_network = bool(amount_mode == "network")
+        sparsepcgc_training_mode = str(
+            getattr(self.args, "sparsepcgc_training_mode", "subtree_selector")
+        ).strip().lower()
+        full_cloud_amount_mode = bool(sparsepcgc_training_mode == "full_cloud_amount")
+        full_cloud_amount_terms = full_cloud_amount_terms if isinstance(full_cloud_amount_terms, dict) else {}
+        full_cloud_amount_override_enabled = bool(
+            full_cloud_amount_mode
+            and bool(full_cloud_amount_terms.get("enabled", False))
+            and prune_enabled
+            and codec_prune_prior_enabled
+            # 旧selectorのbinは1.5--5.0%%であり、ana_den6の0.10%% Prune anchorを
+            # 上書きすると比率単位の不一致を再発させる。Heuristic無効時は旧挙動を保つ。
+            and not (
+                heuristic_guidance is not None
+                and bool(
+                    getattr(
+                        self.args,
+                        "heuristic_guidance_disable_full_cloud_amount_override",
+                        True,
+                    )
+                )
+            )
+        )
+        warmup_force_codec_prior_amount = bool(
+            getattr(self.args, "sparsepcgc_warmup_force_codec_prior_amount", True)
+        )
+        legacy_amount_selector_blocked_by_guidance = bool(
+            heuristic_guidance is not None
+            and bool(getattr(self.args, "heuristic_guidance_disable_full_cloud_amount_override", True))
+        )
+        algorithmic_proposal_selector_enabled = bool(
+            not legacy_amount_selector_blocked_by_guidance
+            and (self._algorithmic_proposal_selector_enabled() or full_cloud_amount_override_enabled)
+            and prune_enabled
+            and codec_prune_prior_enabled
+        )
+        algorithmic_proposal_selector_active = bool(
+            algorithmic_proposal_selector_enabled
+            and (float(codec_prune_prior_phase) <= 0.0 or full_cloud_amount_override_enabled)
+        )
+        algorithmic_proposal_where_source_id = 1 if algorithmic_proposal_selector_active else 0
+
+        if legacy_amount_selector_blocked_by_guidance:
+            # den6 anchor中に旧codec priorの5%級binをhard countへ混ぜない。
+            # Networkのresidualは_apply_heuristic_amount_guidanceのSTE経路だけで反映する。
+            codec_prune_prior_count_alpha = 0.0
+        elif amount_mode == "network":
+            # warmup中だけprior量を使う。
+            # Phase0以降はprior量をhard countへ混ぜない。
+            codec_prune_prior_count_alpha = float(codec_prune_prior_phase)
+        else:
+            codec_prune_prior_count_alpha = (
+                codec_prune_prior_hybrid_alpha
+                if bool(getattr(self.args, "sparsepcgc_hybrid_prior_amount_blend", True))
+                else codec_prune_prior_phase
+            )
+
+        codec_prune_prior_active_ratio = min(
+            codec_prune_prior_ratio * float(codec_prune_prior_count_alpha),
+            float(max_drop_ratio),
+        )
+
+        # Phase0以降は learned_drop_ratio_before_gate を使い、
+        # operation gateでAmountがさらに潰れる経路を避ける。
+        # Algorithmic proposal selectorではoperation gateをno-op選択として扱う。
+        network_effective_drop_ratio_for_hard_count = (
+            learned_drop_ratio_after_gate
+            if algorithmic_proposal_selector_active
+            else (learned_drop_ratio_before_gate if phase0_network_prune_mode else learned_drop_ratio_after_gate)
+        )
+        effective_drop_ratio_for_hard_count = network_effective_drop_ratio_for_hard_count
+        hard_drop_target_ratio_source = "network_amount_phase0" if phase0_network_prune_mode else "network_amount"
+        hard_drop_target_ratio_source_id = 2
+
+        codec_prior_amount_blend_applied = False
+        codec_prior_amount_blend_alpha_value = 0.0
+        codec_prior_amount_distill_loss = pts_xyz.new_zeros(())
+        post_warmup_amount_hybrid_applied = False
+        post_warmup_amount_mode_id = 0
+        post_warmup_amount_strategy_id = 0
+        post_warmup_amount_tail_phase_value = 0.0
+        post_warmup_amount_alpha_value = 0.0
+        post_warmup_amount_proposal_ratio_value = 0.0
+        post_warmup_amount_teacher_loss = pts_xyz.new_zeros(())
+        post_warmup_amount_teacher_weight_effective = float(
+            getattr(self.args, "sparsepcgc_post_warmup_amount_teacher_weight", 0.08)
+        )
+        amount_explore_step = False
+        amount_explore_prob_value = 0.0
+        amount_explore_candidate_ratio_value = 0.0
+        amount_explore_candidate_index_value = -1
+        amount_explore_teacher_ratio_value = float("nan")
+        amount_explore_teacher_count_value = 0.0
+        amount_explore_teacher_score_value = float("nan")
+        amount_explore_teacher_alpha_value = 0.0
+        amount_explore_used_teacher = False
+        algorithmic_amount_selector_logits = self.algorithmic_amount_selector_head(
+            actuator_features
+        ).mean(dim=2)
+        full_cloud_amount_logits = full_cloud_amount_terms.get("amount_bin_logits", None)
+        if full_cloud_amount_override_enabled and torch.is_tensor(full_cloud_amount_logits):
+            full_cloud_amount_logits = full_cloud_amount_logits.to(
+                device=actuator_features.device,
+                dtype=actuator_features.dtype,
+            )
+            if full_cloud_amount_logits.ndim == 1:
+                full_cloud_amount_logits = full_cloud_amount_logits.view(1, -1)
+            if int(full_cloud_amount_logits.shape[0]) == 1 and int(actuator_features.shape[0]) > 1:
+                full_cloud_amount_logits = full_cloud_amount_logits.expand(
+                    int(actuator_features.shape[0]),
+                    -1,
+                ).contiguous()
+            if (
+                full_cloud_amount_logits.ndim == 2
+                and int(full_cloud_amount_logits.shape[0]) == int(actuator_features.shape[0])
+            ):
+                algorithmic_amount_selector_logits = full_cloud_amount_logits[
+                    :, : int(algorithmic_amount_selector_logits.shape[1])
+                ]
+        amount_action_debug = self._sample_full_cloud_amount_action(
+            algorithmic_amount_selector_logits
+        )
+        algorithmic_amount_selector_scaled_logits = amount_action_debug["scaled_logits"].to(
+            device=actuator_features.device,
+            dtype=actuator_features.dtype,
+        )
+        algorithmic_amount_selector_prob = torch.softmax(
+            algorithmic_amount_selector_scaled_logits.float(),
+            dim=1,
+        ).to(dtype=actuator_features.dtype)
+        algorithmic_amount_selected_class_t = amount_action_debug["selected_class"].to(
+            device=actuator_features.device,
+            dtype=torch.long,
+        )
+        algorithmic_amount_selected_log_prob_t = amount_action_debug["selected_log_prob"].to(
+            device=actuator_features.device,
+            dtype=actuator_features.dtype,
+        )
+        algorithmic_amount_entropy_t = amount_action_debug["entropy"].to(
+            device=actuator_features.device,
+            dtype=actuator_features.dtype,
+        )
+        algorithmic_amount_temperature_value = float(amount_action_debug["temperature"])
+        algorithmic_amount_action_sample_mode = str(amount_action_debug["sample_mode"])
+        algorithmic_amount_selected_class_value = int(
+            algorithmic_amount_selected_class_t.detach().reshape(-1)[0].item()
+        ) if int(algorithmic_amount_selected_class_t.numel()) > 0 else 0
+        algorithmic_amount_bin_values_t = self._algorithmic_amount_bin_values(
+            max_drop_ratio,
+            actuator_features.device,
+            actuator_features.dtype,
+        )
+        algorithmic_amount_bin_count_value = int(algorithmic_amount_bin_values_t.numel())
+        algorithmic_amount_selected_bin_ratio_value = 0.0
+        if algorithmic_amount_selected_class_value > 0 and algorithmic_amount_bin_count_value > 0:
+            selected_bin_idx = min(
+                max(int(algorithmic_amount_selected_class_value) - 1, 0),
+                algorithmic_amount_bin_count_value - 1,
+            )
+            algorithmic_amount_selected_bin_ratio_value = float(
+                algorithmic_amount_bin_values_t.detach().flatten()[selected_bin_idx].cpu()
+            )
+        if full_cloud_amount_override_enabled:
+            algorithmic_amount_residual_scale = (
+                min(
+                    max(float(getattr(self.args, "sparsepcgc_full_cloud_amount_residual_max", 0.0025)), 0.0),
+                    float(max_drop_ratio),
+                )
+                if bool(getattr(self.args, "sparsepcgc_full_cloud_amount_residual_enable", False))
+                else 0.0
+            )
+        else:
+            algorithmic_amount_residual_scale = min(
+                max(float(getattr(self.args, "sparsepcgc_algorithmic_amount_residual_scale", 0.005)), 0.0),
+                float(max_drop_ratio),
+            )
+        algorithmic_amount_residual_raw = self.algorithmic_amount_residual_head(
+            actuator_features.mean(dim=2, keepdim=True)
+        )
+        full_cloud_amount_residual_raw = full_cloud_amount_terms.get("amount_residual_raw", None)
+        if full_cloud_amount_override_enabled and torch.is_tensor(full_cloud_amount_residual_raw):
+            full_cloud_amount_residual_raw = full_cloud_amount_residual_raw.to(
+                device=actuator_features.device,
+                dtype=actuator_features.dtype,
+            ).reshape(-1, 1, 1)
+            if int(full_cloud_amount_residual_raw.shape[0]) == 1 and int(actuator_features.shape[0]) > 1:
+                full_cloud_amount_residual_raw = full_cloud_amount_residual_raw.expand(
+                    int(actuator_features.shape[0]),
+                    -1,
+                    -1,
+                ).contiguous()
+            if int(full_cloud_amount_residual_raw.shape[0]) == int(actuator_features.shape[0]):
+                algorithmic_amount_residual_raw = full_cloud_amount_residual_raw
+        algorithmic_amount_residual_t = (
+            torch.tanh(algorithmic_amount_residual_raw)
+            * float(algorithmic_amount_residual_scale)
+        )
+        algorithmic_amount_residual_value = float(
+            algorithmic_amount_residual_t.detach().mean().cpu()
+        ) if algorithmic_amount_residual_t.numel() > 0 else 0.0
+        selector_class_clamped = algorithmic_amount_selected_class_t.clamp(
+            0,
+            max(algorithmic_amount_bin_count_value, 0),
+        )
+        selector_bin_idx = (selector_class_clamped - 1).clamp(
+            0,
+            max(algorithmic_amount_bin_count_value - 1, 0),
+        )
+        if algorithmic_amount_bin_count_value > 0:
+            selector_base_ratio = algorithmic_amount_bin_values_t.index_select(
+                0,
+                selector_bin_idx.to(device=algorithmic_amount_bin_values_t.device, dtype=torch.long),
+            ).view(-1, 1, 1)
+        else:
+            selector_base_ratio = learned_drop_ratio.new_zeros(learned_drop_ratio.shape)
+        selector_non_noop = (selector_class_clamped > 0).to(
+            device=learned_drop_ratio.device,
+            dtype=learned_drop_ratio.dtype,
+        ).view(-1, 1, 1)
+        algorithmic_amount_selector_ratio_forward = (
+            selector_non_noop
+            * (selector_base_ratio + algorithmic_amount_residual_t).clamp(0.0, float(max_drop_ratio))
+        )
+        algorithmic_amount_selector_final_ratio_value = float(
+            algorithmic_amount_selector_ratio_forward.detach().mean().cpu()
+        ) if algorithmic_amount_selector_ratio_forward.numel() > 0 else 0.0
+        algorithmic_amount_selector_noop_prob_value = float(
+            algorithmic_amount_selector_prob[:, 0].detach().mean().cpu()
+        ) if algorithmic_amount_selector_prob.numel() > 0 else 0.0
+        algorithmic_amount_selector_selected_prob_value = float(
+            algorithmic_amount_selector_prob.gather(
+                1,
+                selector_class_clamped.view(-1, 1).to(
+                    device=algorithmic_amount_selector_prob.device,
+                    dtype=torch.long,
+                ),
+            ).detach().mean().cpu()
+        ) if algorithmic_amount_selector_prob.numel() > 0 else 0.0
+        algorithmic_amount_selector_selected_log_prob_value = float(
+            algorithmic_amount_selected_log_prob_t.detach().mean().cpu()
+        ) if algorithmic_amount_selected_log_prob_t.numel() > 0 else float("nan")
+        algorithmic_amount_selector_entropy_value = float(
+            algorithmic_amount_entropy_t.detach().mean().cpu()
+        ) if algorithmic_amount_entropy_t.numel() > 0 else float("nan")
+        algorithmic_amount_selector_teacher_class_id = -1
+        algorithmic_amount_selector_teacher_ratio_value = float("nan")
+        algorithmic_amount_selector_teacher_loss = pts_xyz.new_zeros(())
+        algorithmic_amount_residual_teacher_loss = pts_xyz.new_zeros(())
+        full_cloud_amount_predicted_delta_raw = full_cloud_amount_terms.get("predicted_delta", None)
+        full_cloud_amount_predicted_delta_value = float("nan")
+        if torch.is_tensor(full_cloud_amount_predicted_delta_raw) and full_cloud_amount_predicted_delta_raw.numel() > 0:
+            full_cloud_amount_predicted_delta_value = float(
+                full_cloud_amount_predicted_delta_raw.detach().float().mean().cpu()
+            )
+        post_warmup_amount_strategy = self._post_warmup_amount_strategy()
+        if post_warmup_amount_strategy == "fixed_blend":
+            post_warmup_amount_strategy_id = 1
+        elif post_warmup_amount_strategy == "outcome_explore":
+            post_warmup_amount_strategy_id = 2
+        elif post_warmup_amount_strategy == "network":
+            post_warmup_amount_strategy_id = 3
+        if (
+            amount_mode == "network"
+            and warmup_force_codec_prior_amount
+            and self.training
+            and prune_enabled
+            and codec_prune_prior_enabled
+            and codec_prune_prior_active_ratio > 0.0
+            and float(codec_prune_prior_phase) > 0.0
+            and not self._direct_network_prune_mode()
+        ):
+            # warmup中だけforwardのhard count量をcodec priorへ戻し、
+            # backwardは既存のnetwork amount経路へ流す。
+            codec_prior_tensor = learned_drop_ratio.new_tensor(float(codec_prune_prior_active_ratio))
+            effective_drop_ratio_forward = codec_prior_tensor
+            effective_drop_ratio_for_hard_count = (
+                effective_drop_ratio_forward.detach()
+                + network_effective_drop_ratio_for_hard_count
+                - network_effective_drop_ratio_for_hard_count.detach()
+            )
+            hard_drop_target_ratio_source = "codec_prior_active_ratio_warmup"
+            hard_drop_target_ratio_source_id = 1
+        if (
+            amount_mode == "network"
+            and self.training
+            and prune_enabled
+            and codec_prune_prior_enabled
+            and float(codec_prune_prior_phase) <= 0.0
+            and not self._direct_network_prune_mode()
+            and not full_cloud_amount_override_enabled
+            # outcome_exploreは旧来の1.5--5.0%候補をhard countへ直接入れる。
+            # den6 anchorではAmount priorだけを探索中心にし、この別経路を混ぜない。
+            and not legacy_amount_selector_blocked_by_guidance
+        ):
+            post_tail_steps = max(
+                int(getattr(self.args, "sparsepcgc_post_warmup_amount_tail_steps", 5000)),
+                0,
+            )
+            post_tail_step = max(
+                int(current_train_step) - int(codec_prune_prior_warmup_steps),
+                0,
+            )
+
+            if post_tail_steps > 0:
+                post_tail_phase = max(
+                    1.0 - float(post_tail_step) / float(post_tail_steps),
+                    0.0,
+                )
+            else:
+                # tail_steps=0は「減衰なし」の明示指定として扱う。
+                post_tail_phase = 1.0
+
+            start_ratio = min(
+                max(float(getattr(self.args, "sparsepcgc_post_warmup_amount_start_ratio", 0.04)), 0.0),
+                float(max_drop_ratio),
+            )
+            end_ratio = min(
+                max(float(getattr(self.args, "sparsepcgc_post_warmup_amount_end_ratio", 0.006)), 0.0),
+                start_ratio,
+            )
+
+            proposal_ratio = end_ratio + (start_ratio - end_ratio) * float(post_tail_phase)
+            proposal_ratio = min(max(float(proposal_ratio), 0.0), float(max_drop_ratio))
+
+            max_alpha = min(
+                max(float(getattr(self.args, "sparsepcgc_post_warmup_amount_max_alpha", 0.65)), 0.0),
+                1.0,
+            )
+            min_network_keep = min(
+                max(float(getattr(self.args, "sparsepcgc_post_warmup_amount_min_network_keep", 0.30)), 0.0),
+                1.0,
+            )
+            post_amount_alpha = min(
+                float(max_alpha) * float(post_tail_phase),
+                1.0 - float(min_network_keep),
+            )
+            post_amount_alpha = min(max(float(post_amount_alpha), 0.0), 1.0)
+            post_warmup_amount_tail_phase_value = float(post_tail_phase)
+            post_warmup_amount_proposal_ratio_value = float(proposal_ratio)
+
+            if post_warmup_amount_strategy == "fixed_blend" and proposal_ratio > 0.0 and post_amount_alpha > 0.0:
+                proposal_tensor = learned_drop_ratio.new_tensor(float(proposal_ratio))
+                alpha_tensor = learned_drop_ratio.new_tensor(float(post_amount_alpha))
+                post_amount_mode = str(
+                    getattr(self.args, "sparsepcgc_post_warmup_amount_mode", "blend")
+                ).strip().lower()
+                if post_amount_mode not in {"blend", "max"}:
+                    post_amount_mode = "blend"
+
+                if post_amount_mode == "max":
+                    post_warmup_amount_mode_id = 2
+                    post_floor_tensor = proposal_tensor * alpha_tensor
+                    effective_drop_ratio_forward = torch.maximum(
+                        network_effective_drop_ratio_for_hard_count,
+                        post_floor_tensor,
+                    )
+                    hard_drop_target_ratio_source = "post_warmup_amount_max"
+                    hard_drop_target_ratio_source_id = 7
+                else:
+                    post_warmup_amount_mode_id = 1
+                    effective_drop_ratio_forward = (
+                        alpha_tensor * proposal_tensor
+                        + (1.0 - alpha_tensor) * network_effective_drop_ratio_for_hard_count
+                    )
+                    hard_drop_target_ratio_source = "post_warmup_amount_blend"
+                    hard_drop_target_ratio_source_id = 6
+
+                effective_drop_ratio_for_hard_count = (
+                    effective_drop_ratio_forward.detach()
+                    + network_effective_drop_ratio_for_hard_count
+                    - network_effective_drop_ratio_for_hard_count.detach()
+                )
+                post_warmup_amount_teacher_loss = (
+                    raw_learned_drop_ratio - effective_drop_ratio_forward.detach()
+                ).pow(2).mean() * float(post_amount_alpha)
+                post_warmup_amount_hybrid_applied = True
+                post_warmup_amount_alpha_value = float(post_amount_alpha)
+                codec_prior_amount_blend_applied = True
+                codec_prior_amount_blend_alpha_value = float(post_amount_alpha)
+            elif post_warmup_amount_strategy == "outcome_explore":
+                explore_start_prob = min(
+                    max(float(getattr(self.args, "sparsepcgc_amount_explore_start_prob", 0.60)), 0.0),
+                    1.0,
+                )
+                explore_end_prob = min(
+                    max(float(getattr(self.args, "sparsepcgc_amount_explore_end_prob", 0.20)), 0.0),
+                    1.0,
+                )
+                if explore_end_prob > explore_start_prob:
+                    explore_end_prob = explore_start_prob
+                explore_decay_steps = max(
+                    int(getattr(self.args, "sparsepcgc_amount_explore_decay_steps", 5000)),
+                    0,
+                )
+                if explore_decay_steps > 0:
+                    explore_phase = max(
+                        1.0 - float(post_tail_step) / float(explore_decay_steps),
+                        0.0,
+                    )
+                else:
+                    explore_phase = 0.0
+                explore_prob = (
+                    explore_end_prob
+                    + (explore_start_prob - explore_end_prob) * float(explore_phase)
+                )
+                explore_prob = min(max(float(explore_prob), 0.0), 1.0)
+                amount_explore_prob_value = float(explore_prob)
+                post_warmup_amount_alpha_value = float(explore_prob)
+                post_warmup_amount_hybrid_applied = bool(explore_prob > 0.0)
+                post_warmup_amount_mode_id = 3
+
+                memory_key = str(
+                    getattr(
+                        self.args,
+                        "_current_sparsepcgc_amount_memory_key",
+                        getattr(self.args, "_current_sparsepcgc_forward_key", ""),
+                    )
+                    or ""
+                )
+                forward_key = str(
+                    getattr(self.args, "_current_sparsepcgc_forward_key", memory_key)
+                    or memory_key
+                    or getattr(self.args, "_current_subtree_id", "")
+                    or "global"
+                )
+                teacher_ratio = float(
+                    getattr(self.args, "_current_sparsepcgc_amount_outcome_teacher_ratio", float("nan"))
+                )
+                teacher_count = max(
+                    int(getattr(self.args, "_current_sparsepcgc_amount_outcome_teacher_count", 0)),
+                    0,
+                )
+                teacher_score = float(
+                    getattr(self.args, "_current_sparsepcgc_amount_outcome_teacher_score", float("nan"))
+                )
+                if math.isfinite(teacher_ratio):
+                    amount_explore_teacher_ratio_value = float(
+                        min(max(teacher_ratio, 0.0), float(max_drop_ratio))
+                    )
+                    amount_explore_teacher_count_value = float(teacher_count)
+                    amount_explore_teacher_score_value = float(teacher_score)
+
+                ratio_candidates = [
+                    min(max(float(value), 0.0), float(max_drop_ratio))
+                    for value in self._amount_explore_ratio_values()
+                ]
+                ratio_candidates = [value for value in ratio_candidates if value > 0.0]
+                preferred_candidates = list(ratio_candidates)
+                min_success_count = max(
+                    int(getattr(self.args, "sparsepcgc_amount_memory_min_count_for_exploit", 1)),
+                    1,
+                )
+                if (
+                    bool(getattr(self.args, "sparsepcgc_amount_explore_prefer_high_until_success", True))
+                    and teacher_count < min_success_count
+                    and len(preferred_candidates) >= 2
+                ):
+                    preferred_candidates = preferred_candidates[len(preferred_candidates) // 2 :]
+                period = max(int(getattr(self.args, "sparsepcgc_amount_explore_period", 10)), 1)
+                threshold = int(round(float(explore_prob) * float(period)))
+                threshold = min(max(threshold, 0), period)
+                hash_value = self._deterministic_step_hash(
+                    "amount_explore",
+                    int(current_train_step),
+                    forward_key,
+                    memory_key,
+                    int(getattr(self.args, "seed", 0)),
+                )
+                should_explore = bool(threshold > 0 and (hash_value % period) < threshold)
+                amount_explore_step = should_explore and bool(preferred_candidates)
+
+                if amount_explore_step:
+                    candidate_index = hash_value % max(len(preferred_candidates), 1)
+                    candidate_ratio = float(preferred_candidates[candidate_index])
+                    amount_explore_candidate_ratio_value = candidate_ratio
+                    amount_explore_candidate_index_value = int(candidate_index)
+                    candidate_tensor = learned_drop_ratio.new_tensor(candidate_ratio)
+                    effective_drop_ratio_for_hard_count = (
+                        candidate_tensor.detach()
+                        + network_effective_drop_ratio_for_hard_count
+                        - network_effective_drop_ratio_for_hard_count.detach()
+                    )
+                    hard_drop_target_ratio_source = "outcome_explore_candidate"
+                    hard_drop_target_ratio_source_id = 8
+                elif (
+                    math.isfinite(amount_explore_teacher_ratio_value)
+                    and amount_explore_teacher_ratio_value > 0.0
+                    and teacher_count >= min_success_count
+                ):
+                    teacher_alpha = min(
+                        max(float(getattr(self.args, "sparsepcgc_amount_success_teacher_max_alpha", 0.50)), 0.0),
+                        1.0,
+                    )
+                    teacher_alpha = min(
+                        teacher_alpha,
+                        0.15 * float(teacher_count),
+                    )
+                    teacher_alpha = min(max(float(teacher_alpha), 0.0), 1.0)
+                    amount_explore_teacher_alpha_value = float(teacher_alpha)
+                    amount_explore_used_teacher = bool(teacher_alpha > 0.0)
+                    if teacher_alpha > 0.0:
+                        teacher_tensor = learned_drop_ratio.new_tensor(float(amount_explore_teacher_ratio_value))
+                        alpha_tensor = learned_drop_ratio.new_tensor(float(teacher_alpha))
+                        effective_drop_ratio_forward = (
+                            alpha_tensor * teacher_tensor
+                            + (1.0 - alpha_tensor) * network_effective_drop_ratio_for_hard_count
+                        )
+                        effective_drop_ratio_for_hard_count = (
+                            effective_drop_ratio_forward.detach()
+                            + network_effective_drop_ratio_for_hard_count
+                            - network_effective_drop_ratio_for_hard_count.detach()
+                        )
+                        hard_drop_target_ratio_source = "outcome_success_memory_blend"
+                        hard_drop_target_ratio_source_id = 9
+                        post_warmup_amount_teacher_loss = (
+                            raw_learned_drop_ratio - teacher_tensor.detach()
+                        ).pow(2).mean()
+                        post_warmup_amount_teacher_weight_effective = float(
+                            getattr(self.args, "sparsepcgc_amount_success_teacher_weight", 0.08)
+                        )
+                elif math.isfinite(amount_explore_teacher_ratio_value) and amount_explore_teacher_ratio_value > 0.0:
+                    teacher_alpha = min(
+                        max(float(getattr(self.args, "sparsepcgc_amount_success_teacher_max_alpha", 0.50)), 0.0),
+                        1.0,
+                    ) * 0.5
+                    amount_explore_teacher_alpha_value = float(teacher_alpha)
+                    teacher_tensor = learned_drop_ratio.new_tensor(float(amount_explore_teacher_ratio_value))
+                    post_warmup_amount_teacher_loss = (
+                        raw_learned_drop_ratio - teacher_tensor.detach()
+                    ).pow(2).mean()
+                    post_warmup_amount_teacher_weight_effective = float(
+                        getattr(self.args, "sparsepcgc_amount_success_teacher_weight", 0.08)
+                    ) * float(max(teacher_alpha, 0.0))
+            if algorithmic_proposal_selector_active and post_warmup_amount_strategy == "outcome_explore":
+                target_ratio_for_selector = float("nan")
+                if amount_explore_step and amount_explore_candidate_ratio_value > 0.0:
+                    target_ratio_for_selector = float(amount_explore_candidate_ratio_value)
+                elif (
+                    math.isfinite(amount_explore_teacher_ratio_value)
+                    and amount_explore_teacher_ratio_value > 0.0
+                    and amount_explore_teacher_count_value >= float(
+                        max(int(getattr(self.args, "sparsepcgc_amount_memory_min_count_for_exploit", 1)), 1)
+                    )
+                ):
+                    target_ratio_for_selector = float(amount_explore_teacher_ratio_value)
+
+                if math.isfinite(target_ratio_for_selector):
+                    target_class = self._nearest_amount_bin_class(
+                        algorithmic_amount_bin_values_t,
+                        target_ratio_for_selector,
+                    )
+                    algorithmic_amount_selector_teacher_class_id = int(target_class)
+                    algorithmic_amount_selector_teacher_ratio_value = float(target_ratio_for_selector)
+                    target_class_tensor = torch.full(
+                        (int(algorithmic_amount_selector_logits.shape[0]),),
+                        int(target_class),
+                        device=algorithmic_amount_selector_logits.device,
+                        dtype=torch.long,
+                    )
+                    algorithmic_amount_selector_teacher_loss = torch.nn.functional.cross_entropy(
+                        algorithmic_amount_selector_logits.float(),
+                        target_class_tensor,
+                    ).to(dtype=pts_xyz.dtype)
+                    if int(target_class) > 0 and algorithmic_amount_bin_count_value > 0:
+                        target_bin_idx = min(max(int(target_class) - 1, 0), algorithmic_amount_bin_count_value - 1)
+                        target_bin_ratio = float(
+                            algorithmic_amount_bin_values_t.detach().flatten()[target_bin_idx].cpu()
+                        )
+                        target_residual = min(
+                            max(float(target_ratio_for_selector) - float(target_bin_ratio), -float(algorithmic_amount_residual_scale)),
+                            float(algorithmic_amount_residual_scale),
+                        )
+                        target_residual_t = algorithmic_amount_residual_t.new_full(
+                            algorithmic_amount_residual_t.shape,
+                            float(target_residual),
+                        )
+                        algorithmic_amount_residual_teacher_loss = (
+                            algorithmic_amount_residual_t - target_residual_t.detach()
+                        ).pow(2).mean()
+
+                if not amount_explore_step:
+                    effective_drop_ratio_forward = algorithmic_amount_selector_ratio_forward
+                    effective_drop_ratio_for_hard_count = (
+                        effective_drop_ratio_forward.detach()
+                        + algorithmic_amount_selector_ratio_forward
+                        - algorithmic_amount_selector_ratio_forward.detach()
+                    )
+                    if algorithmic_amount_selected_class_value <= 0:
+                        hard_drop_target_ratio_source = "algorithmic_selector_noop"
+                        hard_drop_target_ratio_source_id = 10
+                    else:
+                        hard_drop_target_ratio_source = "algorithmic_selector_bin_residual"
+                        hard_drop_target_ratio_source_id = 11
+                    amount_explore_used_teacher = False
+        if full_cloud_amount_override_enabled:
+            effective_drop_ratio_forward = algorithmic_amount_selector_ratio_forward
+            effective_drop_ratio_for_hard_count = (
+                effective_drop_ratio_forward.detach()
+                + algorithmic_amount_selector_ratio_forward
+                - algorithmic_amount_selector_ratio_forward.detach()
+            )
+            hard_drop_target_ratio_source = (
+                "full_cloud_amount_selector_noop"
+                if algorithmic_amount_selected_class_value <= 0
+                else "full_cloud_amount_selector_bin_residual"
+            )
+            hard_drop_target_ratio_source_id = 12
+            post_warmup_amount_hybrid_applied = False
+        if (
+            self.training
+            and prune_enabled
+            and codec_prune_prior_active_ratio > 0.0
+            and codec_prune_prior_hybrid_alpha > 0.0
+            and amount_mode != "network"
+            and float(getattr(self.args, "sparsepcgc_codec_prior_amount_distill_weight", 0.0)) > 0.0
+            and not self._direct_network_prune_mode()
+        ):
+            # Amountをprior比率へ固定したいablation用。
+            # 通常のNetwork自由Amountでは使わない。
+            codec_prior_amount_target = raw_learned_drop_ratio.detach().new_tensor(
+                float(codec_prune_prior_ratio)
+            )
+            codec_prior_amount_distill_loss = (
+                raw_learned_drop_ratio - codec_prior_amount_target
+            ).pow(2).mean() * float(codec_prune_prior_hybrid_alpha)
+
+        if (
+            codec_prune_prior_active_ratio > 0.0
+            and amount_mode != "network"
+            and not self._direct_network_prune_mode()
+        ):
+            codec_prior_tensor = learned_drop_ratio.new_tensor(float(codec_prune_prior_active_ratio))
+
+            if amount_mode == "blend":
+                min_network_keep = min(
+                    max(float(getattr(self.args, "sparsepcgc_hybrid_amount_min_network_keep", 0.15)), 0.0),
+                    1.0,
+                )
+                amount_alpha = min(
+                    max(float(codec_prune_prior_count_alpha), 0.0),
+                    1.0 - float(min_network_keep),
+                )
+                codec_prior_amount_blend_alpha_value = float(amount_alpha)
+
+                alpha_tensor = learned_drop_ratio.new_tensor(float(amount_alpha))
+                effective_drop_ratio_forward = (
+                    alpha_tensor * codec_prior_tensor
+                    + (1.0 - alpha_tensor) * effective_drop_ratio_for_hard_count
+                )
+                codec_prior_amount_blend_applied = True
+                hard_drop_target_ratio_source = "hybrid_blend"
+                hard_drop_target_ratio_source_id = 3
+            else:
+                # 旧互換: maxで下支えする。
+                effective_drop_ratio_forward = torch.maximum(
+                    effective_drop_ratio_for_hard_count,
+                    codec_prior_tensor,
+                )
+                hard_drop_target_ratio_source = "hybrid_max"
+                hard_drop_target_ratio_source_id = 4
+
+            effective_drop_ratio_for_hard_count = (
+                effective_drop_ratio_forward.detach()
+                + effective_drop_ratio_for_hard_count
+                - effective_drop_ratio_for_hard_count.detach()
+            )
+
+        if network_only_codec_mode:
+            # No legacy amount bandit/prior/floor may replace the ratio emitted
+            # by the one Network forward.
+            effective_drop_ratio_for_hard_count = learned_drop_ratio_after_gate
+            network_effective_drop_ratio_for_hard_count = learned_drop_ratio_after_gate
+            hard_drop_target_ratio_source = "network_only_total_share_gate"
+            hard_drop_target_ratio_source_id = 20
+
+        # network floorは最後の保険だけにする。
+        # HybridではPrune量固定を避けたいので、必要ならCLIで小さくする。
+        if network_prune_floor_ratio > 0.0 and not algorithmic_proposal_selector_active:
+            network_floor_tensor = learned_drop_ratio.new_tensor(float(network_prune_floor_ratio))
+            floor_applied_to_ratio = bool(
+                (
+                    network_floor_tensor
+                    > effective_drop_ratio_for_hard_count.detach().mean()
+                ).item()
+            )
+            effective_drop_ratio_forward = torch.maximum(
+                effective_drop_ratio_for_hard_count,
+                network_floor_tensor,
+            )
+            effective_drop_ratio_for_hard_count = (
+                effective_drop_ratio_forward.detach()
+                + effective_drop_ratio_for_hard_count
+                - effective_drop_ratio_for_hard_count.detach()
+            )
+            if floor_applied_to_ratio:
+                hard_drop_target_ratio_source = "network_floor"
+                hard_drop_target_ratio_source_id = 5
+        # Heuristic無効時は従来どおりgate前Amountをsoft lossへ使い、完全互換を保つ。
+        # Heuristic有効時だけhard countと同じguided Amountをsoft経路へ渡す。
+        learned_drop_ratio = (
+            effective_drop_ratio_for_hard_count
+            if heuristic_guidance is not None or network_only_codec_mode
+            else learned_drop_ratio_before_gate
+        )
+        learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
+            effective_drop_ratio_for_hard_count,
+            op_name="drop",
+        )
+        # Prune量head用のSoft/Hard比較値を初期化する。
+        # PruneはVoxel単位で行うため、量の比較も点数ではなくVoxel数基準で行う。
+        drop_ratio_soft = pts_xyz.new_zeros(())
+        drop_ratio_hard = pts_xyz.new_zeros(())
+        drop_ratio_soft_batch = pts_xyz.new_zeros((B, 1, 1))
+        drop_ratio_hard_batch = pts_xyz.new_zeros((B, 1, 1))
+
+        drop_amount_supervision_loss = pts_xyz.new_zeros(())
+        drop_amount_soft_consistency_loss = pts_xyz.new_zeros(())
+        actual_oracle_drop_amount_loss = pts_xyz.new_zeros(())
+        actual_oracle_add_amount_loss = pts_xyz.new_zeros(())
+        actual_oracle_move_amount_loss = pts_xyz.new_zeros(())
+        actual_oracle_drop_amount_logit_loss = pts_xyz.new_zeros(())
+        actual_oracle_add_amount_logit_loss = pts_xyz.new_zeros(())
+        actual_oracle_move_amount_logit_loss = pts_xyz.new_zeros(())
+
+        soft_drop_budget = pts_xyz.new_zeros((B, 1, 1))
+        valid_delete_voxel_count = pts_xyz.new_ones((B, 1, 1))
+
+        soft_drop_sum = pts_xyz.new_zeros(())
+        hard_drop_sum = pts_xyz.new_zeros(())
+        soft_drop_voxel_sum = pts_xyz.new_zeros(())
+        hard_drop_voxel_sum = pts_xyz.new_zeros(())
+        # hard削除数は整数なので、学習比率の値だけを使ってVoxel選択数へ変換する。
+        learned_drop_ratio_value = (
+            float(effective_drop_ratio_for_hard_count.detach().mean().cpu()) if prune_enabled else 0.0
+        )
+        hard_drop_target_ratio_network_value = (
+            float(network_effective_drop_ratio_for_hard_count.detach().mean().cpu()) if prune_enabled else 0.0
+        )
+        hard_drop_target_ratio_codec_prior_value = float(codec_prune_prior_active_ratio) if prune_enabled else 0.0
+        hard_drop_target_ratio_value = float(learned_drop_ratio_value)
+        if (
+            self.training
+            and prune_enabled
+            and bool(getattr(self.args, "sparsepcgc_prune_monotonic_floor", False))
+        ):
+            try:
+                setattr(
+                    self.args,
+                    "_sparsepcgc_last_prune_ratio_floor",
+                    float(max(learned_drop_ratio_value, float(monotonic_prune_floor_value or 0.0))),
+                )
+            except Exception:
+                pass
+            except Exception:
+                pass
+            if (
+                self.training
+                and prune_enabled
+                and bool(getattr(self.args, "sparsepcgc_prune_gate_monotonic_floor", False))
+            ):
+                try:
+                    setattr(
+                        self.args,
+                        "_sparsepcgc_last_drop_gate_floor",
+                        float(drop_operation_gate.detach().mean().cpu()),
+                    )
+                except Exception:
+                    pass
+        network_prune_min_hard_count = (
+            int(getattr(self.args, "sparsepcgc_network_prune_min_hard_count", 0))
+            if phase0_network_prune_mode
+            else 0
+        )
+        if heuristic_guidance is not None:
+            delete_prior = delete_prior + self._heuristic_where_logit_bias(
+                heuristic_guidance, "Prune", delete_prior
+            )
+        delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
+        if not phase0_network_prune_mode:
+            delete_prior = delete_prior * drop_operation_gate
+        drop_score_noise = max(
+            self._annealed_value("repair_drop_score_noise_start", "repair_drop_score_noise_end"),
+            0.0,
+        )
+        # ============================================================
+        # Prune Where logit の飽和対策
+        # ============================================================
+        # drop_head の raw logit が数十〜数百になると、
+        # sigmoidが完全飽和して drop_prob_proxy から drop_head へ勾配が戻らなくなる。
+        #
+        # そのため、forward値として使うlogitをtanhで有界化する。
+        # _scale_where_downstream_grad はその後に適用し、forward値は有界のまま、
+        # backwardだけ操作別倍率で調整する。
+        # ============================================================
+        raw_drop_logit = self._run_large_head(self.drop_head, actuator_features)
+        raw_drop_logit_for_forward = torch.nan_to_num(
+            raw_drop_logit,
+            nan=0.0,
+            posinf=float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
+            neginf=-float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
+        )
+
+        drop_logit_scale = max(
+            float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
+            1e-6,
+        )
+        learned_drop_logit = drop_logit_scale * torch.tanh(raw_drop_logit_for_forward / drop_logit_scale)
+
+        learned_drop_logit = self._scale_where_downstream_grad(
+            learned_drop_logit,
+            op_name="drop",
+        )
+        if network_only_codec_mode:
+            learned_drop_logit = network_only_policy_terms["where_logits"][:, 0:1].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+        # ============================================================
+        # Codec prior distillation用のNetwork素のlogit
+        # ============================================================
+        # learned_drop_logit に codec prior bias を足す前の値を保存する。
+        # この値を codec_prune_prior_score に近づけることで、
+        # priorが消えてもNetwork単独で近いWhere選択を再現できるようにする。
+        # ============================================================
+        network_drop_logit_for_distill = learned_drop_logit
+        # Exact Poolの再順位付けには、Heuristic biasを混ぜる前のNetwork出力を使う。
+        # drop_probを渡すとHeuristic順位がNetwork residual側へ二重に入り、
+        # 見かけ上Network選択でも実質は同じ順位をなぞってしまう。
+        exact_network_drop_score = learned_drop_logit
+        codec_prior_where_distill_loss = pts_xyz.new_zeros(())
+        codec_prune_prior_logit_weight = max(
+            float(getattr(self.args, "sparsepcgc_codec_prune_prior_logit_weight", 6.0)),
+            0.0,
+        )
+        if codec_prune_prior_hybrid_alpha > 0.0 and codec_prune_prior_logit_weight > 0.0:
+            codec_prior_logit = (
+                2.0 * codec_prune_prior_score - 1.0
+            ) * codec_prune_prior_logit_weight * float(codec_prune_prior_hybrid_alpha)
+
+            # ========================================================
+            # Where distillation
+            # ========================================================
+            # forwardではpriorをlogit biasとして混ぜる。
+            # backwardでは、Network素のdrop logitがprior scoreを再現するようにBCEを入れる。
+            # ========================================================
+            if self.training and prune_enabled:
+                distill_target = codec_prune_prior_score.detach().clamp(0.02, 0.98)
+                distill_mask = selection_bool.unsqueeze(1).to(
+                    device=pts_xyz.device,
+                    dtype=pts_xyz.dtype,
+                )
+
+                where_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    network_drop_logit_for_distill,
+                    distill_target,
+                    reduction="none",
+                )
+
+                codec_prior_where_distill_loss = (
+                    where_bce * distill_mask
+                ).sum() / distill_mask.sum().clamp_min(1.0)
+
+                codec_prior_where_distill_loss = (
+                    codec_prior_where_distill_loss
+                    * float(codec_prune_prior_hybrid_alpha)
+                )
+
+            # priorはforward biasとして使うが、prior側には勾配を返さない。
+            learned_drop_logit = learned_drop_logit + codec_prior_logit.detach()
+
+        if self.training and drop_score_noise > 0.0:
+            learned_drop_logit = learned_drop_logit + torch.randn_like(learned_drop_logit) * drop_score_noise
+            # ノイズ追加後もsigmoid飽和を避けるため、もう一度有界化する。
+            learned_drop_logit = drop_logit_scale * torch.tanh(learned_drop_logit / drop_logit_scale)
+
+        learned_drop = torch.sigmoid(learned_drop_logit)
+        learned_drop_prob = learned_drop.mean()
+        drop_proxy_tau = max(float(getattr(self.args, "repair_drop_soft_proxy_tau", 8.0)), 1e-6)
+        drop_prob_proxy = torch.sigmoid(learned_drop_logit / drop_proxy_tau)
+        raw_proxy_grad_eps = min(
+            max(
+                float(
+                    getattr(
+                        self.args,
+                        "repair_drop_where_proxy_raw_grad_eps",
+                        0.001,
+                    )
+                ),
+                0.0,
+            ),
+            0.20,
+        )
+        if raw_proxy_grad_eps > 0.0:
+            raw_drop_logit_for_grad = torch.where(
+                torch.isfinite(raw_drop_logit),
+                raw_drop_logit,
+                raw_drop_logit.detach().new_zeros(raw_drop_logit.shape),
+            )
+            drop_prob_proxy = (
+                drop_prob_proxy
+                + raw_proxy_grad_eps
+                * (raw_drop_logit_for_grad - raw_drop_logit_for_grad.detach())
+            )
+        if not phase0_network_prune_mode:
+            drop_prob_proxy = drop_prob_proxy * drop_operation_gate
+        drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
+        if prune_enabled and max_drop_ratio > 0.0:
+            # ============================================================
+            # Prune Amount由来のratio biasを弱める
+            # ============================================================
+            # Amountは「何個削るか」を決める役割であり、
+            # Whereは「どこを削るか」のランキングを決める役割である。
+            #
+            # ここでratio biasを強く足しすぎると、drop_probが一気に1.0へ寄り、
+            # drop_headのWhere勾配が再び消える。
+            # そのためPruneだけbias倍率とclipを別に持たせる。
+            # ============================================================
+            prune_ratio_bias = self._ratio_bias(learned_drop_ratio_for_ops, max_drop_ratio)
+            prune_ratio_bias = prune_ratio_bias * float(
+                getattr(self.args, "repair_prune_ratio_bias_scale", 0.10)
+            )
+            prune_ratio_bias_clip = max(
+                float(getattr(self.args, "repair_prune_ratio_bias_clip", 1.50)),
+                0.0,
+            )
+            if prune_ratio_bias_clip > 0.0:
+                prune_ratio_bias = prune_ratio_bias.clamp(
+                    -prune_ratio_bias_clip,
+                    prune_ratio_bias_clip,
+                )
+
+            drop_prob = torch.sigmoid(self._safe_logit(drop_prob) + prune_ratio_bias)
+
+        if network_single_proposal:
+            # den6固定Where式をbase logit、drop_headをNetwork residualとする。
+            # repair/delete等の旧汎用priorをforward順位へ混ぜない。
+            den6_drop_bias = self._heuristic_where_logit_bias(
+                heuristic_guidance, "Prune", learned_drop_logit
+            )
+            drop_prob = torch.sigmoid(den6_drop_bias + learned_drop_logit)
+            drop_prob = drop_prob * drop_operation_gate
+            drop_prob_direct = drop_prob
+
+        drop_prob_direct = drop_prob
+        drop_random_mix = min(
+            max(self._annealed_value("repair_drop_random_mix_start", "repair_drop_random_mix_end"), 0.0),
+            1.0,
+        )
+        if self.training and prune_enabled and drop_random_mix > 0.0:
+            random_drop = self._random_ratio_mask_like(drop_prob, max_drop_ratio, selection_mask)
+            drop_prob = ((1.0 - drop_random_mix) * drop_prob + drop_random_mix * random_drop).clamp(0.0, 1.0)
+        if not prune_enabled:
+            drop_prob = torch.zeros_like(drop_prob)
+            drop_prob_direct = torch.zeros_like(drop_prob_direct)
+            drop_prob_proxy = torch.zeros_like(drop_prob_proxy)
+        drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
+        if codec_prune_prior_hybrid_alpha > 0.0 and codec_prune_prior_logit_weight > 0.0:
+            codec_prior_prob = torch.sigmoid(codec_prior_logit)
+            hybrid_alpha_tensor = drop_prob.new_tensor(float(codec_prune_prior_hybrid_alpha))
+
+            codec_prior_forward = (
+                hybrid_alpha_tensor * codec_prior_prob
+                + (1.0 - hybrid_alpha_tensor) * drop_prob
+            )
+            drop_prob = codec_prior_forward.detach() + drop_prob - drop_prob.detach()
+
+            codec_prior_direct = (
+                hybrid_alpha_tensor * codec_prior_prob
+                + (1.0 - hybrid_alpha_tensor) * drop_prob_direct
+            )
+            drop_prob_direct = codec_prior_direct.detach() + drop_prob_direct - drop_prob_direct.detach()
+        if actual_oracle_enabled and actual_oracle_apply_teacher_actions and not phase0_network_prune_mode:
+            oracle_drop_forward = leaf_delete_op_mask.to(device=drop_prob.device, dtype=drop_prob.dtype)
+            oracle_grad_eps = min(
+                max(float(getattr(self.args, "sparsepcgc_actual_oracle_where_grad_eps", 0.05)), 0.0),
+                0.20,
+            )
+            drop_prob = (
+                oracle_drop_forward.detach()
+                + oracle_grad_eps * (drop_prob - drop_prob.detach())
+            ).clamp(0.0, 1.0)
+            drop_prob_direct = (
+                oracle_drop_forward.detach()
+                + oracle_grad_eps * (drop_prob_direct - drop_prob_direct.detach())
+            ).clamp(0.0, 1.0)
+            drop_prob_proxy = (
+                oracle_drop_forward.detach()
+                + oracle_grad_eps * (drop_prob_proxy - drop_prob_proxy.detach())
+            )
+        drop_prob_raw_for_amount = drop_prob
+        delete_candidate_mask = selection_bool.clone()
+        if exact_den6_candidate_mode:
+            # den6 pool外を候補から完全に除外する。別のleaf proxyで再選別しない。
+            delete_candidate_mask = delete_candidate_mask & exact_prune_source_mask.squeeze(1)
+        delete_candidate_initial_count = int(delete_candidate_mask.detach().sum().item())
+        delete_max_points = 0 if exact_den6_candidate_mode else int(
+            getattr(self.args, "repair_delete_max_points_per_voxel", 8)
+        )
+        delete_candidate_after_point_cap_count = delete_candidate_initial_count
+        if delete_max_points > 0:
+            delete_candidate_mask = delete_candidate_mask & (
+                voxel_point_counts.squeeze(1) <= float(delete_max_points)
+            )
+            delete_candidate_after_point_cap_count = int(delete_candidate_mask.detach().sum().item())
+
+        # leaf pattern診断がDeleteを推奨したnode/voxelだけをDelete source候補にする。
+        # これにより、圧縮率改善と無関係なDeleteを候補集合から除外する。
+        delete_candidate_after_leaf_mask_count = delete_candidate_after_point_cap_count
+        if hard_leaf_operation_mask_enabled and not phase0_network_prune_mode and not exact_den6_candidate_mode:
+            delete_candidate_mask = delete_candidate_mask & leaf_delete_op_mask.squeeze(1)
+            delete_candidate_after_leaf_mask_count = int(delete_candidate_mask.detach().sum().item())
+        delete_candidate_point_count_value = int(delete_candidate_mask.detach().sum().item())
+        delete_candidate_empty_reason = ""
+        if delete_candidate_point_count_value <= 0:
+            if delete_candidate_initial_count <= 0:
+                delete_candidate_empty_reason = "selection_mask_empty"
+            elif delete_max_points > 0 and delete_candidate_after_point_cap_count <= 0:
+                delete_candidate_empty_reason = "delete_max_points_cap"
+            elif hard_leaf_operation_mask_enabled and not phase0_network_prune_mode and delete_candidate_after_leaf_mask_count <= 0:
+                delete_candidate_empty_reason = "leaf_or_oracle_delete_mask"
+            else:
+                delete_candidate_empty_reason = "candidate_generation_empty"
+        delete_candidate_weight = delete_candidate_mask.unsqueeze(1).to(dtype=drop_prob.dtype)
+
+        # voxel_point_counts は同一Voxel内の全点に同じ点数が入っている。
+        # 1 / voxel_point_counts を掛けてsumすると、点数ではなくVoxel数として数えられる。
+        voxel_count_weight = voxel_point_counts.to(device=drop_prob.device, dtype=drop_prob.dtype).clamp_min(1.0)
+        delete_candidate_voxel_weight = delete_candidate_weight / voxel_count_weight
+
+        # Soft削除score。
+        # drop_prob_raw_for_amount はVoxel平均後なので、同一Voxel内では同じ値になる。
+        soft_drop_prob_raw = drop_prob_raw_for_amount * delete_candidate_weight
+
+        # learned_drop_ratio をTensorのまま使い、削除候補Voxel数に対するSoft削除予算を作る。
+        # ここをdetach / float / itemにしないことが重要である。
+        learned_drop_ratio_for_budget = learned_drop_ratio_for_ops.reshape(B, 1, 1).clamp(
+            0.0,
+            float(max_drop_ratio),
+        )
+
+        # 有効な削除候補Voxel数。
+        # 点数ではなくVoxel数基準で数える。
+        valid_delete_voxel_count = delete_candidate_voxel_weight.sum(dim=2, keepdim=True).clamp_min(1.0)
+
+        # Soft削除予算。
+        # 例：削除候補Voxelが1000個、learned_drop_ratio=0.1なら、100 voxel分を削除するSoft予算になる。
+        soft_drop_budget = learned_drop_ratio_for_budget * valid_delete_voxel_count
+        soft_drop_budget = torch.minimum(soft_drop_budget, valid_delete_voxel_count)
+
+        # raw softのVoxel質量をdetachして正規化係数にする。
+        # 分母をdetachすることで、総量方向の勾配を主に learned_drop_ratio / drop_amount_head に返す。
+        soft_drop_raw_voxel_sum_det = (
+            soft_drop_prob_raw.detach() * delete_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+        soft_drop_budget_scale = self._safe_budget_scale(soft_drop_raw_voxel_sum_det, soft_drop_budget)
+
+        # Soft削除量を learned_drop_ratio が決めるVoxel予算に合わせる。
+        # これにより「どのくらい削除するか」がVoxel数基準で学習対象になる。
+        soft_drop_prob = torch.nan_to_num(
+            soft_drop_prob_raw * soft_drop_budget_scale,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        soft_drop_prob_clamped = soft_drop_prob.clamp(0.0, 1.0)
+
+        saturated_grad_eps = max(
+            float(getattr(self.args, "repair_drop_where_saturated_grad_eps", 0.05)),
+            0.0,
+        )
+        saturated_grad_eps = min(saturated_grad_eps, 0.20)
+
+        # ============================================================
+        # Prune guard用のsoft値
+        # ============================================================
+        # forward値は0〜1にclampした値を使う。
+        # backwardではsoft_drop_prob側へ微小勾配を残す。
+        # ============================================================
+        soft_drop_prob_for_guard = (
+            soft_drop_prob_clamped
+            + saturated_grad_eps * (soft_drop_prob - soft_drop_prob.detach())
+        )
+
+        # ============================================================
+        # Prune Where用のSTE勾配経路
+        # ============================================================
+        # soft_drop_prob_for_guard はforward安全性のため0〜1へclampした値を使う。
+        # ただしclamp飽和時にdrop_head勾配が消えないよう、
+        # backwardだけ drop_prob_proxy 側へ戻す。
+        # ============================================================
+        prune_where_ste_grad_scale = max(
+            float(getattr(self.args, "repair_prune_where_ste_grad_scale", 1.0)),
+            0.0,
+        )
+
+        # ============================================================
+        # Prune Where用のSTE勾配経路
+        # ============================================================
+        # forwardの削除候補制限は delete_candidate_weight に従う。
+        # ただし backward では、delete_candidate_weight によって
+        # drop_head 勾配が完全に0化されるのを避ける。
+        #
+        # soft_drop_where_grad_masked
+        #   実際の削除候補制限を反映した従来のproxy
+        #
+        # soft_drop_where_grad_direct
+        #   drop_headへ直接戻すための保険proxy
+        #   forward値はmasked側に合わせ、backwardだけdrop_prob_proxyへ流す。
+        # ============================================================
+
+        soft_drop_where_grad_masked = (
+            drop_prob_proxy * delete_candidate_weight
+        ).clamp(0.0, 1.0)
+
+        soft_drop_where_direct_grad_scale = max(
+            float(getattr(self.args, "repair_prune_where_direct_grad_scale", 0.10)),
+            0.0,
+        )
+
+        # ============================================================
+        # 重要：
+        # direct経路では clamp をかけない。
+        # forward値は masked 側に合わせるが、backwardだけ drop_prob_proxy へ直接返す。
+        # ここで clamp すると、forward が 0/1 境界にいる場合に再び勾配が消える。
+        # ============================================================
+        soft_drop_where_grad_direct = (
+            soft_drop_where_grad_masked.detach()
+            + soft_drop_where_direct_grad_scale
+            * (drop_prob_proxy - drop_prob_proxy.detach())
+        )
+
+        # forward値は soft_drop_where_grad_masked と同じ。
+        # backwardでは masked 経路と direct 経路の両方を使う。
+        soft_drop_where_grad_base = (
+            soft_drop_where_grad_masked.detach()
+            + (soft_drop_where_grad_masked - soft_drop_where_grad_masked.detach())
+            + (soft_drop_where_grad_direct - soft_drop_where_grad_direct.detach())
+        )
+
+        soft_drop_prob_for_ste = (
+            soft_drop_prob_for_guard.detach()
+            + prune_where_ste_grad_scale
+            * (soft_drop_where_grad_base - soft_drop_where_grad_base.detach())
+        )
+        # ============================================================
+        # Direct Network Prune:
+        # Phase0以降だけでなく、訓練中はNetworkのPruneを直接通す。
+        # actual oracle / hard gate による全停止をここで切り離す。
+        # ============================================================
+        direct_network_prune_mode = self._direct_network_prune_mode()
+        if direct_network_prune_mode:
+            hard_prune_actual_allowed = True
+            actual_oracle_apply_teacher_actions = False
+            require_actual_gate_prune = False
+        hard_delete_selection_mask = delete_candidate_mask.unsqueeze(1)
+        if (
+            require_actual_gate_prune
+            and actual_oracle_enabled
+            and not (codec_prune_prior_phase > 0.0)
+            and not prune_after_prior_network_mode
+        ):
+            hard_delete_selection_mask = (
+                hard_delete_selection_mask
+                & leaf_delete_op_mask.to(device=pts_xyz.device, dtype=torch.bool)
+            )
+
+        hard_delete_selection_count_value = int(hard_delete_selection_mask.detach().sum().item())
+        if not bool(hard_delete_selection_mask.any().item()):
+            hard_drop_block_reason = "hard_delete_selection_mask_empty"
+
+        if not hard_prune_actual_allowed:
+            hard_drop_block_reason = "hard_prune_gate_blocked"
+            hard_drop_mask = torch.zeros_like(drop_prob, dtype=torch.bool)
+        elif actual_oracle_enabled and actual_oracle_apply_teacher_actions and actual_oracle_has_drop and not phase0_network_prune_mode:
+            # The full-cloud teacher may intersect one selected subtree almost
+            # completely. Cap the local hard application so a useful global
+            # teacher cannot erase 90-100% of the shadow geometry.
+            hard_drop_block_reason = "oracle_teacher_drop"
+            oracle_local_cap = min(
+                float(max_drop_ratio),
+                max(
+                    float(
+                        getattr(
+                            self.args,
+                            "sparsepcgc_actual_oracle_local_max_drop_ratio",
+                            0.05,
+                        )
+                    ),
+                    0.0,
+                ),
+            )
+            hard_drop_mask = self._hard_voxel_drop_mask(
+                voxel_coords,
+                drop_prob,
+                target_drop_ratio=oracle_local_cap,
+                max_drop_ratio=oracle_local_cap,
+                selection_mask=(
+                    leaf_delete_op_mask.to(device=pts_xyz.device, dtype=torch.bool)
+                    & delete_candidate_mask.unsqueeze(1)
+                ),
+                hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
+                voxel_cache=voxel_cache,
+                force_min_count=False,
+                max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                min_hard_count=0,
+                allow_single_candidate=False,
+                skip_hard_selection=external_plan_authority,
+            )
+        elif codec_prune_prior_phase > 0.0 and not direct_network_prune_mode:
+            hard_drop_block_reason = "codec_prior_phase_hard_drop"
+            if amount_mode_network and warmup_force_codec_prior_amount:
+                hard_drop_target_ratio_value = float(codec_prune_prior_active_ratio)
+                hard_drop_target_ratio_source = "codec_prior_active_ratio_warmup"
+                hard_drop_target_ratio_source_id = 1
+            else:
+                hard_drop_target_ratio_value = float(learned_drop_ratio_value)
+            full_cloud_where_mode = str(
+                getattr(self.args, "sparsepcgc_where_mode", "block_only")
+            ).strip().lower()
+            if full_cloud_amount_mode and full_cloud_where_mode in {
+                "macro_micro_heuristic",
+                "macro_micro_hybrid",
+            }:
+                hard_drop_block_reason = (
+                    "codec_prior_phase_macro_micro_hybrid_fallback"
+                    if full_cloud_where_mode == "macro_micro_hybrid"
+                    else "codec_prior_phase_macro_micro_heuristic"
+                )
+                try:
+                    hard_drop_mask, _macro_micro_trace = self.build_macro_micro_where_mask(
+                        voxel_coords,
+                        hard_drop_target_ratio_value,
+                        codec_prune_prior_score,
+                        delete_prior=delete_prior,
+                        selection_mask=hard_delete_selection_mask,
+                        block_size=codec_prune_prior_block_size,
+                        args=self.args,
+                        max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                        min_hard_count=int(
+                            getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
+                        ),
+                    )
+                except Exception:
+                    hard_drop_block_reason = "codec_prior_phase_macro_micro_fallback_codec_block"
+                    hard_drop_mask = self._hard_codec_block_drop_mask(
+                        voxel_coords,
+                        drop_prob,
+                        block_size=codec_prune_prior_block_size,
+                        target_drop_ratio=hard_drop_target_ratio_value,
+                        selection_mask=hard_delete_selection_mask,
+                        max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                        min_hard_count=int(
+                            getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
+                        ),
+                    )
+            else:
+                hard_drop_mask = self._hard_codec_block_drop_mask(
+                    voxel_coords,
+                    drop_prob,
+                    block_size=codec_prune_prior_block_size,
+                    target_drop_ratio=hard_drop_target_ratio_value,
+                    selection_mask=hard_delete_selection_mask,
+                    max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=int(
+                        getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
+                    ),
+                )
+        elif algorithmic_proposal_selector_active:
+            hard_drop_target_ratio_value = float(learned_drop_ratio_value)
+            full_cloud_where_mode = str(
+                getattr(self.args, "sparsepcgc_where_mode", "block_only")
+            ).strip().lower()
+            if full_cloud_amount_mode and full_cloud_where_mode in {
+                "macro_micro_heuristic",
+                "macro_micro_hybrid",
+            }:
+                hard_drop_block_reason = (
+                    "algorithmic_proposal_macro_micro_hybrid_fallback"
+                    if full_cloud_where_mode == "macro_micro_hybrid"
+                    else "algorithmic_proposal_macro_micro_heuristic"
+                )
+                try:
+                    hard_drop_mask, _macro_micro_trace = self.build_macro_micro_where_mask(
+                        voxel_coords,
+                        hard_drop_target_ratio_value,
+                        codec_prune_prior_score,
+                        delete_prior=delete_prior,
+                        selection_mask=hard_delete_selection_mask,
+                        block_size=codec_prune_prior_block_size,
+                        args=self.args,
+                        max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                        min_hard_count=0,
+                    )
+                except Exception:
+                    hard_drop_block_reason = "algorithmic_proposal_macro_micro_fallback_codec_block"
+                    hard_drop_mask = self._hard_codec_block_drop_mask(
+                        voxel_coords,
+                        codec_prune_prior_score,
+                        block_size=codec_prune_prior_block_size,
+                        target_drop_ratio=hard_drop_target_ratio_value,
+                        selection_mask=hard_delete_selection_mask,
+                        max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                        min_hard_count=0,
+                    )
+            else:
+                hard_drop_block_reason = "algorithmic_proposal_codec_block_drop"
+                hard_drop_mask = self._hard_codec_block_drop_mask(
+                    voxel_coords,
+                    codec_prune_prior_score,
+                    block_size=codec_prune_prior_block_size,
+                    target_drop_ratio=hard_drop_target_ratio_value,
+                    selection_mask=hard_delete_selection_mask,
+                    max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=0,
+                )
+        elif (
+            self.training
+            and prune_enabled
+            and not direct_network_prune_mode
+            and bool(getattr(self.args, "sparsepcgc_hybrid_hard_action", True))
+            and codec_prune_prior_hard_action_alpha > 0.0
+        ):
+            # ============================================================
+            # Hybrid hard action
+            # ============================================================
+            # Phase0以降も、いきなりNetwork top-kへ完全移行しない。
+            # 一定割合で、warmup中に良かったcodec block hard actionを継続する。
+            # ただし、Where蒸留lossによりNetworkもprior行動を学習する。
+            # ============================================================
+            hard_action_period = max(
+                int(getattr(self.args, "sparsepcgc_hybrid_hard_action_period", 20)),
+                1,
+            )
+            hard_action_slot = int(current_train_step % hard_action_period)
+            hard_action_threshold = int(
+                round(float(codec_prune_prior_hard_action_alpha) * float(hard_action_period))
+            )
+            use_codec_block_action = hard_action_slot < hard_action_threshold
+
+            if use_codec_block_action:
+                hard_drop_block_reason = "hybrid_codec_block_hard_drop"
+                hard_drop_target_ratio_value = float(learned_drop_ratio_value)
+                hard_drop_mask = self._hard_codec_block_drop_mask(
+                    voxel_coords,
+                    drop_prob,
+                    block_size=codec_prune_prior_block_size,
+                    target_drop_ratio=hard_drop_target_ratio_value,
+                    selection_mask=hard_delete_selection_mask,
+                    max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=0,
+                )
+            else:
+                hard_drop_block_reason = "hybrid_network_voxel_hard_drop"
+                hard_drop_target_ratio_value = float(learned_drop_ratio_value)
+                hard_drop_mask = self._hard_voxel_drop_mask(
+                    voxel_coords,
+                    drop_prob,
+                    target_drop_ratio=hard_drop_target_ratio_value,
+                    max_drop_ratio=hard_drop_target_ratio_value,
+                    selection_mask=hard_delete_selection_mask,
+                    hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
+                    voxel_cache=voxel_cache,
+                    force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
+                    max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=network_prune_min_hard_count,
+                    allow_single_candidate=False,
+                    skip_hard_selection=external_plan_authority,
+                )
+        else:
+            hard_drop_block_reason = "network_learned_hard_drop"
+            hard_drop_target_ratio_value = float(learned_drop_ratio_value)
+            hard_drop_mask = self._hard_voxel_drop_mask(
+                voxel_coords,
+                drop_prob,
+                target_drop_ratio=hard_drop_target_ratio_value,
+                max_drop_ratio=hard_drop_target_ratio_value,
+                selection_mask=hard_delete_selection_mask,
+                hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
+                voxel_cache=voxel_cache,
+                force_min_count=bool(
+                    getattr(self.args, "repair_force_min_drop_voxels", False)
+                    or direct_network_prune_mode
+                ),
+                max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                min_hard_count=(
+                    max(
+                        int(network_prune_min_hard_count),
+                        int(getattr(self.args, "direct_prune_min_hard_count", 1)),
+                    )
+                    if direct_network_prune_mode
+                    else network_prune_min_hard_count
+                ),
+                allow_single_candidate=bool(direct_network_prune_mode),
+                skip_hard_selection=external_plan_authority,
+            )
+        if network_single_proposal:
+            hard_drop_mask = hard_drop_mask & operation_gate_hard[:, 0:1].to(
+                device=hard_drop_mask.device, dtype=torch.bool
+            )
+        hard_drop_trace_debug = dict(getattr(self, "_last_hard_drop_count_trace", {}) or {})
+        hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
+        # Phase3: Pruneは点削除ではなく、対象点が属するoccupied voxelの削除候補として記録する。
+        voxel_edit_drop_mask = hard_drop_mask.detach().squeeze(1).to(dtype=torch.bool)
+
+
+        # Hard forward + Soft backward のSTE。
+        # forwardではVoxel単位のhard_drop、backwardではPrune Where専用proxyを使う。
+        drop_prob_st = hard_drop - soft_drop_prob_for_ste.detach() + soft_drop_prob_for_ste
+
+        # ============================================================
+        # keep_prob も hard forward + soft backward にする。
+        # forward値は 1 - hard_drop のまま。
+        # backwardだけ Prune Where proxy へ戻す。
+        #
+        # ここで clamp(0, 1) を直接かけると、
+        # keep_prob が 0 または 1 の境界に張り付き、Prune Where 勾配が消えやすい。
+        # ============================================================
+        keep_prob_hard = (1.0 - hard_drop).clamp(0.0, 1.0)
+        keep_prob_soft_for_grad = 1.0 - soft_drop_where_grad_base
+
+        keep_prob = (
+            keep_prob_hard.detach()
+            + (keep_prob_soft_for_grad - keep_prob_soft_for_grad.detach())
+        )
+
+        # Soft/Hard削除量の監視値。
+        # point sum は実際に何点消えるかの確認用。
+        soft_drop_sum = soft_drop_prob_for_guard.detach().sum()
+        hard_drop_sum = hard_drop.detach().sum()
+
+        # voxel sum は、何Voxel分を削除するかの確認用。
+        # Hardは0/1なので、比較対象のSoftも0〜1に収めた値を使う。
+        # soft_drop_prob本体は予算正規化で1を超える場合があり、
+        # そのまま使うとdrop_ratio_softだけが過大になる。
+        soft_drop_voxel_mass_per_batch = (
+            soft_drop_prob_for_guard * delete_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+
+        hard_drop_voxel_mass_per_batch = (
+            hard_drop.detach() * delete_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+
+        soft_drop_voxel_sum = soft_drop_voxel_mass_per_batch.detach().sum()
+        hard_drop_voxel_sum = hard_drop_voxel_mass_per_batch.detach().sum()
+
+        # learned_drop_ratio は「削除候補Voxelのうち何割を削除するか」を表すため、
+        # drop_ratio_soft / drop_ratio_hard もVoxel数基準で計算する。
+        drop_ratio_soft_batch = soft_drop_voxel_mass_per_batch / valid_delete_voxel_count
+        drop_ratio_hard_batch = hard_drop_voxel_mass_per_batch / valid_delete_voxel_count
+
+        drop_ratio_soft = drop_ratio_soft_batch.mean()
+        drop_ratio_hard = drop_ratio_hard_batch.mean()
+
+        # drop_amount_head 専用の量一致損失。
+        # Hard削除量は教師値としてdetachし、learned_drop_ratio側だけに勾配を流す。
+        drop_amount_supervision_loss = (
+            drop_ratio_hard_batch.detach() - effective_drop_ratio_for_hard_count
+        ).pow(2).mean()
+        if (actual_oracle_has_drop or actual_oracle_has_bad_drop) and max_drop_ratio > 0.0:
+            drop_oracle_target_ratio = (
+                drop_ratio_hard_batch.detach()
+                if actual_oracle_has_drop
+                else torch.zeros_like(drop_ratio_hard_batch)
+            )
+            actual_oracle_drop_amount_loss = self._actual_oracle_amount_bce_loss(
+                raw_learned_drop_ratio,
+                drop_oracle_target_ratio,
+                max_drop_ratio,
+            )
+            drop_amount_logit_for_oracle = self._operation_amount_logit(
+                actuator_features,
+                self.drop_amount_head,
+            ).mean()
+            drop_amount_target_logit_for_oracle = self._target_ratio_logit(
+                drop_oracle_target_ratio.mean(),
+                max_drop_ratio,
+                raw_learned_drop_ratio,
+            ).detach()
+            actual_oracle_drop_amount_logit_loss = (
+                drop_amount_logit_for_oracle - drop_amount_target_logit_for_oracle
+            ).pow(2)
+            actual_oracle_drop_amount_loss = (
+                actual_oracle_drop_amount_loss
+                + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25))
+                * actual_oracle_drop_amount_logit_loss
+            )
+
+        # Soft削除量と learned_drop_ratio の整合性も補助的に見る。
+        drop_amount_soft_consistency_loss = (
+            drop_ratio_soft_batch.detach() - learned_drop_ratio_before_gate
+        ).pow(2).mean()
+
+        if timing_enabled:
+            _mark_runtime("delete")
+
+        move_score = (repair_gate * (1.0 - hard_drop)).clamp(0.0, 1.0)
+        subtree_move_source_logit = self._run_large_head(self.subtree_move_source_head, actuator_features)
+        subtree_move_source_logit = self._scale_where_downstream_grad(
+            subtree_move_source_logit,
+            op_name="move",
+        )
+        subtree_move_source_logit = self._voxel_mean_logits(
+            subtree_move_source_logit,
+            voxel_coords,
+            voxel_cache=voxel_cache,
+        )
+        if network_only_codec_mode:
+            subtree_move_source_logit = network_only_policy_terms["where_logits"][:, 2:3].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+        subtree_move_source_prob = torch.sigmoid(subtree_move_source_logit).clamp(0.0, 1.0)
+        exact_network_move_score = subtree_move_source_logit
+        move_source_prior = torch.sigmoid(
+            (
+                0.70 * p_comp
+                + 0.55 * quant_score
+                + 0.45 * sparse_score
+                + 0.35 * p_chain
+                + 0.25 * p_sibling
+                + 0.20 * local_outlier_score
+                - 0.45 * preserve
+                - 0.65 * shape_score
+            ).clamp(-8.0, 8.0)
+        )
+        if full_context_available:
+            move_source_prior = (move_source_prior + 0.05 * full_context_bonus).clamp(0.0, 1.0)
+        if bool(leaf_actuator_prior.get("enabled", False)):
+            move_source_prior = torch.maximum(
+                move_source_prior,
+                float(getattr(self.args, "leaf_pattern_actuator_move_weight", 0.75)) * leaf_move_prior,
+            ).clamp(0.0, 1.0)
+        prior_weight = float(getattr(self.args, "repair_move_source_prior_weight", 0.35))
+        if sparsepcgc_context:
+            prior_weight = max(
+                prior_weight,
+                float(getattr(self.args, "sparsepcgc_move_source_prior_weight", 0.55)),
+            )
+        if prior_weight > 0.0:
+            source_prior = (move_source_prior * prior_weight).clamp(0.0, 1.0)
+            if selection_mask is not None:
+                source_prior = source_prior * selection_mask.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            move_score = torch.maximum(move_score, source_prior * (1.0 - hard_drop))
+        move_pattern_source_prior = (
+            move_pattern_prior.masked_fill(~empty_target_mask, -1.0)
+            .amax(dim=2)
+            .clamp_min(0.0)
+            .unsqueeze(1)
+        )
+        move_score = torch.maximum(
+            move_score,
+            (
+                float(getattr(self.args, "repair_move_pattern_prior_weight", 1.25))
+                * move_pattern_source_prior
+            ).clamp(0.0, 1.0) * (1.0 - hard_drop),
+        )
+        subtree_move_source_weight = max(
+            float(getattr(self.args, "repair_subtree_move_source_prior_weight", 1.0)),
+            0.0,
+        )
+        if subtree_move_source_weight > 0.0:
+            move_score = torch.maximum(
+                move_score,
+                (
+                    subtree_move_source_weight
+                    * subtree_move_source_prob
+                    * (1.0 - hard_drop)
+                ).clamp(0.0, 1.0),
+            )
+        # targetなしAmount学習では、Moveの実行量をtarget_move_ratioへ寄せない。
+        # max_move_ratioだけを0〜30%の探索上限として使う。
+        target_move_ratio = 0.0
+        raw_max_move_ratio = min(
+            max(float(getattr(self.args, "max_move_ratio", 0.30)), 0.0),
+            0.30,
+        ) if disp_enabled else 0.0
+        move_warmup = self._repair_move_warmup()
+        max_move_ratio = raw_max_move_ratio * move_warmup if disp_enabled else 0.0
+        # Adjustする割合を特徴から学習し、固定target_ratioだけに依存しないsource数にする。
+        learned_move_ratio = self._learned_operation_ratio(
+            actuator_features,
+            self.move_amount_head,
+            max_move_ratio,
+            "repair_move_amount_random_mix_start",
+            "repair_move_amount_random_mix_end",
+        )
+        if network_only_codec_mode:
+            learned_move_ratio = (
+                network_only_policy_terms["total_ratio"]
+                * network_only_policy_terms["shares"][:, 2:3]
+            ).to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, float(max_move_ratio))
+        raw_learned_move_ratio = learned_move_ratio
+        # AdjustがHard実行0%に潰れるのを防ぐ。
+        # forward値だけ下限を持たせ、backwardは元のlearned_move_ratioへ流す。
+        move_ratio_floor = min(
+            max(float(getattr(self.args, "repair_move_ratio_floor", 0.03)), 0.0),
+            float(max_move_ratio),
+        )
+        if self.training and disp_enabled and move_ratio_floor > 0.0:
+            learned_move_ratio_floored = torch.maximum(
+                learned_move_ratio,
+                learned_move_ratio.new_tensor(move_ratio_floor),
+            )
+            learned_move_ratio = (
+                learned_move_ratio_floored.detach()
+                + learned_move_ratio
+                - learned_move_ratio.detach()
+            )
+        learned_move_ratio = learned_move_ratio * move_operation_gate
+        # 最終Action gate後のAmountをana_den6初期値の近傍へ置く。
+        learned_move_ratio = self._apply_heuristic_amount_guidance(
+            learned_move_ratio, heuristic_guidance, "Adjust", max_move_ratio
+        )
+        move_score = move_score * move_operation_gate
+        if heuristic_guidance is not None:
+            move_score = torch.sigmoid(
+                self._safe_logit(move_score.clamp(1e-6, 1.0 - 1e-6))
+                + self._heuristic_where_logit_bias(heuristic_guidance, "Adjust", move_score)
+            )
+        if network_single_proposal:
+            # subtree_move_source_headは0-weight初期化済みのNetwork residual。
+            den6_move_bias = self._heuristic_where_logit_bias(
+                heuristic_guidance, "Adjust", subtree_move_source_logit
+            )
+            move_score = torch.sigmoid(den6_move_bias + subtree_move_source_logit)
+            move_score = move_score * move_operation_gate * (1.0 - hard_drop)
+        learned_move_ratio_for_ops = self._scale_amount_downstream_grad(
+            learned_move_ratio,
+            op_name="move",
+        )
+        # Adjust量head用のSoft/Hard比較値を初期化する。
+        # Adjustはsource voxel単位で行うため、量の比較もVoxel数基準で行う。
+        move_ratio_soft = pts_xyz.new_zeros(())
+        move_ratio_hard = pts_xyz.new_zeros(())
+        move_ratio_soft_batch = pts_xyz.new_zeros((B, 1, 1))
+        move_ratio_hard_batch = pts_xyz.new_zeros((B, 1, 1))
+
+        move_amount_supervision_loss = pts_xyz.new_zeros(())
+        move_amount_soft_consistency_loss = pts_xyz.new_zeros(())
+
+        soft_move_budget = pts_xyz.new_zeros((B, 1, 1))
+        valid_move_source_voxel_count = pts_xyz.new_ones((B, 1, 1))
+
+        soft_move_score = pts_xyz.new_zeros((B, 1, N))
+        soft_move_score_for_guard = pts_xyz.new_zeros((B, 1, N))
+        move_candidate_voxel_weight = pts_xyz.new_zeros((B, 1, N))
+
+        soft_move_sum = pts_xyz.new_zeros(())
+        hard_move_sum = pts_xyz.new_zeros(())
+        soft_move_voxel_sum = pts_xyz.new_zeros(())
+        hard_move_voxel_sum = pts_xyz.new_zeros(())
+        # hard選択個数は整数なので、学習比率の値だけを使って選択数へ変換する。
+        move_target_ratio = (
+            float(learned_move_ratio.detach().mean().cpu())
+            if disp_enabled and hard_move_actual_allowed
+            else 0.0
+        )
+        require_empty_move = bool(getattr(self.args, "repair_move_require_empty_target", True))
+        prefer_occupied_move = bool(getattr(self.args, "repair_move_prefer_occupied_target", False)) and not require_empty_move
+        sparse_empty_guard = bool(
+            sparsepcgc_context and getattr(self.args, "enable_sparsepcgc_empty_target_guard", False)
+        )
+        # Legacy SparsePCGC tuning could prefer occupied targets for merge-like
+        # behavior, but the empty-target guard is the stronger operation
+        # invariant when enabled.
+        if sparsepcgc_context and bool(getattr(self.args, "sparsepcgc_move_existing_target_only", True)) and not sparse_empty_guard:
+            require_empty_move = False
+            prefer_occupied_move = True
+        elif sparse_empty_guard:
+            # The SparsePCGC empty-target guard is the stronger invariant: if it is
+            # enabled, Adjust is only allowed to move an occupied source voxel into
+            # an empty target voxel, avoiding the old occupied-target preference.
+            require_empty_move = True
+            prefer_occupied_move = False
+        dropped_target_mask = self._neighbor_target_membership_mask(
+            voxel_coords,
+            hard_drop_mask,
+            voxel_cache=voxel_cache,
+        )
+        move_target_valid = torch.ones_like(move_score)
+        if not disp_enabled:
+            move_score = torch.zeros_like(move_score)
+        elif max_move_ratio > 0.0:
+            # 学習したAdjust量をsource scoreへ反映し、量と位置を同じlogit上で調整する。
+            move_score = torch.sigmoid(self._safe_logit(move_score) + self._ratio_bias(learned_move_ratio_for_ops, max_move_ratio))
+        move_score_noise = max(
+            self._annealed_value("repair_move_score_noise_start", "repair_move_score_noise_end"),
+            0.0,
+        )
+        if self.training and disp_enabled and move_score_noise > 0.0:
+            # 学習初期のsource探索を広げるため、Adjust scoreへannealされるノイズを入れる。
+            move_score = torch.sigmoid(self._safe_logit(move_score) + torch.randn_like(move_score) * move_score_noise)
+        move_score = self._voxel_mean_logits(move_score, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
+        exact_move_target_bias = self._fit_heuristic_target_direction_prior(
+            heuristic_guidance, "Adjust", preserve
+        ) if exact_den6_candidate_mode else preserve.new_zeros(
+            (B, int(self.neighbor_offsets.shape[0]), N)
+        )
+        fixed_move_target_bias = torch.zeros_like(exact_move_target_bias)
+        if require_empty_move:
+            valid_move_points = empty_target_mask & (~dropped_target_mask)
+        elif prefer_occupied_move:
+            valid_move_points = (~empty_target_mask) & (~dropped_target_mask)
+        else:
+            valid_move_points = torch.ones_like(empty_target_mask, dtype=torch.bool) & (~dropped_target_mask)
+
+        if teacher_guided_single_proposal:
+            fixed_move_target_bias = self._fit_heuristic_target_direction_prior(
+                heuristic_guidance, "Adjust", preserve
+            )
+            exact_move_target_bias = self._den6_first_empty_direction_bias(
+                valid_move_points, preserve
+            ) + 2.0 * fixed_move_target_bias
+
+        if exact_den6_candidate_mode:
+            # Adjust targetはden6 candidateが指定したsource→targetだけを許す。
+            valid_move_points = valid_move_points & (
+                exact_move_target_bias.permute(0, 2, 1) > 0
+            )
+        elif (
+            bool(getattr(self.args, "leaf_pattern_target_direction_mask", False))
+            and bool(leaf_target_direction_prior.get("enabled", False))
+        ):
+            move_target_allowed = leaf_move_target_bias > 0
+            valid_move_points = valid_move_points & move_target_allowed
+
+        has_valid_move_target = valid_move_points.any(dim=2).unsqueeze(1).to(dtype=move_score.dtype)
+        if require_empty_move:
+            move_target_valid = has_valid_move_target
+            move_score = move_score * has_valid_move_target
+        elif prefer_occupied_move:
+            move_target_valid = has_valid_move_target
+            move_score = move_score * has_valid_move_target
+        base_move_candidate_mask = selection_bool & (~hard_drop_mask.squeeze(1))
+        base_move_candidate_mask = base_move_candidate_mask & has_valid_move_target.squeeze(1).to(dtype=torch.bool)
+        if exact_den6_candidate_mode:
+            base_move_candidate_mask = base_move_candidate_mask & exact_move_source_mask.squeeze(1)
+
+        # exact den6 modeでは別proxyのleaf maskでcandidate poolを壊さない。
+        if hard_leaf_operation_mask_enabled and not exact_den6_candidate_mode:
+            base_move_candidate_mask = base_move_candidate_mask & leaf_move_op_mask.squeeze(1)
+
+        move_candidate_mask = base_move_candidate_mask
+        move_max_points = 0 if exact_den6_candidate_mode else int(
+            getattr(self.args, "repair_move_max_points_per_voxel", 8)
+        )
+
+        if move_max_points > 0:
+            limited_move_candidate_mask = base_move_candidate_mask & (
+                voxel_point_counts.squeeze(1) <= float(move_max_points)
+            )
+
+            # 候補が少なすぎる場合だけ、Voxel内点数制限を緩める。
+            # bool maskの切替なのでHard/Soft近似の勾配経路は壊さない。
+            if self.training and bool(getattr(self.args, "repair_move_relax_voxel_count_when_starved", False)):
+                min_ratio = min(
+                    max(float(getattr(self.args, "repair_move_candidate_min_ratio", 0.05)), 0.0),
+                    1.0,
+                )
+                base_count = base_move_candidate_mask.sum(dim=1)
+                limited_count = limited_move_candidate_mask.sum(dim=1)
+                min_count = torch.ceil(base_count.to(dtype=pts_xyz.dtype) * min_ratio).to(dtype=torch.long)
+
+                starved = (base_count > 0) & (limited_count < min_count)
+                move_candidate_mask = torch.where(
+                    starved.view(B, 1),
+                    base_move_candidate_mask,
+                    limited_move_candidate_mask,
+                )
+            else:
+                move_candidate_mask = limited_move_candidate_mask
+        # Soft移動候補をHard移動候補と同じ候補集合に制限する。
+        # Adjustはsource voxel単位で行うため、Soft側もVoxel単位の量として正規化する。
+        move_candidate_weight = move_candidate_mask.unsqueeze(1).to(dtype=move_score.dtype)
+
+        # voxel_point_counts は同一Voxel内の全点に同じ点数が入っている。
+        # 1 / voxel_point_counts を掛けてsumすると、点数ではなくVoxel数として数えられる。
+        move_voxel_count_weight = voxel_point_counts.to(
+            device=move_score.device,
+            dtype=move_score.dtype,
+        ).clamp_min(1.0)
+
+        move_candidate_voxel_weight = move_candidate_weight / move_voxel_count_weight
+
+        # Soft移動score。
+        # move_score はVoxel平均後なので、同一Voxel内では同じ値になる。
+        soft_move_score_raw = move_score * move_candidate_weight
+
+        # learned_move_ratio をTensorのまま使い、移動候補Voxel数に対するSoft移動予算を作る。
+        # ここをdetach / float / itemにしないことが重要である。
+        learned_move_ratio_for_budget = learned_move_ratio_for_ops.reshape(B, 1, 1).clamp(
+            0.0,
+            float(max_move_ratio),
+        )
+
+        # 有効な移動候補source voxel数。
+        valid_move_source_voxel_count = move_candidate_voxel_weight.sum(
+            dim=2,
+            keepdim=True,
+        ).clamp_min(1.0)
+
+        # Soft移動予算。
+        # 例：移動候補Voxelが1000個、learned_move_ratio=0.1なら、100 voxel分をMoveするSoft予算になる。
+        soft_move_budget = learned_move_ratio_for_budget * valid_move_source_voxel_count
+        soft_move_budget = torch.minimum(soft_move_budget, valid_move_source_voxel_count)
+
+        # raw softのVoxel質量をdetachして正規化係数にする。
+        # 分母をdetachすることで、総量方向の勾配を主に learned_move_ratio / move_amount_head に返す。
+        soft_move_raw_voxel_sum_det = (
+            soft_move_score_raw.detach() * move_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+        soft_move_budget_scale = self._safe_budget_scale(soft_move_raw_voxel_sum_det, soft_move_budget)
+
+        # Soft移動量を learned_move_ratio が決めるVoxel予算に合わせる。
+        # これにより「どのくらいAdjustするか」がVoxel数基準で学習対象になる。
+        soft_move_score = torch.nan_to_num(
+            soft_move_score_raw * soft_move_budget_scale,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        # ============================================================
+        # Hard Moveは、方向guardを計算した後で作る。
+        # ここでは一旦ゼロで初期化する。
+        # guard前候補でHardを作ると、Soft側のguard後予算とズレる。
+        # ============================================================
+        hard_move_mask = torch.zeros((B, 1, N), device=pts_xyz.device, dtype=torch.bool)
+        hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
+
+
+        raw_hard_move_bool = torch.zeros((B, N), device=pts_xyz.device, dtype=torch.bool)
+
+        move_mask = hard_move
+        move_mask_for_guard = move_mask
+
+        move_logits = self._run_large_head(self.move_voxel_head, actuator_features)
+        move_logits = self._scale_where_downstream_grad(
+            move_logits,
+            op_name="move",
+        )
+        move_logits = self._voxel_mean_logits(move_logits, voxel_coords, voxel_cache=voxel_cache)
+        if network_only_codec_mode:
+            move_logits = network_only_policy_terms["direction_logits"][:, 1].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+        learned_move_direction_logits = move_logits
+        exact_network_move_logits = learned_move_direction_logits
+
+        # Section5:
+        # best_move_target_child_slotと一致するtarget方向を強める。
+        # 方向そのものは上流の valid_move_points でmask済みである。
+        if (
+            bool(leaf_target_direction_prior.get("enabled", False))
+            and not exact_den6_candidate_mode
+            and not network_only_codec_mode
+        ):
+            move_logits = move_logits + float(
+                getattr(self.args, "leaf_pattern_move_target_direction_weight", 1.25)
+            ) * leaf_move_target_bias.permute(0, 2, 1).to(
+                device=move_logits.device,
+                dtype=move_logits.dtype,
+            )
+        if exact_den6_candidate_mode:
+            move_logits = move_logits + float(
+                getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
+            ) * exact_move_target_bias.to(
+                device=move_logits.device,
+                dtype=move_logits.dtype,
+            )
+        elif teacher_guided_single_proposal:
+            move_logits = move_logits + float(
+                getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
+            ) * exact_move_target_bias.to(
+                device=move_logits.device,
+                dtype=move_logits.dtype,
+            )
+
+        move_valid_target = valid_move_points.transpose(1, 2)
+
+        no_valid_move = ~move_valid_target.any(dim=1, keepdim=True)
+        safe_valid_move = torch.where(no_valid_move, torch.ones_like(move_valid_target), move_valid_target)
+        # float16でもoverflowしない負値を使う
+        mask_value = torch.finfo(move_logits.dtype).min
+        move_logits = move_logits.masked_fill(~safe_valid_move, mask_value)
+
+        move_probs = torch.softmax(move_logits, dim=1)
+        offset_norm = torch.linalg.norm(neighbor_offsets, dim=1).to(device=pts_xyz.device, dtype=move_logits.dtype)
+        move_dir_target_logits = (-offset_norm.view(1, -1, 1)).expand_as(move_logits)
+        move_dir_target_logits = move_dir_target_logits.masked_fill(~safe_valid_move, mask_value)
+        move_dir_target = torch.softmax(move_dir_target_logits, dim=1).detach()
+        move_direction_ce_per_point = -(
+            move_dir_target * torch.log_softmax(move_logits, dim=1)
+        ).sum(dim=1, keepdim=True)
+        move_direction_ce = (
+            move_direction_ce_per_point * has_valid_move_target.to(dtype=move_direction_ce_per_point.dtype)
+        ).sum() / has_valid_move_target.sum().clamp_min(1.0)
+        move_idx = move_probs.detach().argmax(dim=1, keepdim=True)
+        hard_move_dir = torch.zeros_like(move_probs)
+        hard_move_dir.scatter_(1, move_idx, 1.0)
+        move_dir = hard_move_dir - move_probs.detach() + move_probs
+        move_selected_valid = (
+            move_dir * move_valid_target.to(dtype=move_dir.dtype)
+        ).sum(dim=1, keepdim=True)
+        # conflict系のguardは0〜1に収めたMove強度で計算する。
+        quant_move_conflict_loss = self._masked_mean(
+            move_mask_for_guard * (1.0 - move_selected_valid).clamp(0.0, 1.0),
+            selection_mask,
+        )
+        selected_offsets = torch.einsum("bkn,kc->bcn", move_dir, neighbor_offsets)
+
+        # soft方向用の連続target voxel座標
+        target_voxels_soft = voxel_coords.to(dtype=pts_xyz.dtype) + selected_offsets
+
+        # 点座標へ戻すときも、初期Octree/Voxelのglobal offset/global qsを使う。
+        target_centers = self._voxel_centers_from_global_coords(
+            target_voxels_soft,
+            voxel_step,
+            voxel_offset,
+            dtype=pts_xyz.dtype,
+        )
+        move_idx_flat = move_idx.squeeze(1)
+        selected_offsets_long = neighbor_offsets_long.index_select(0, move_idx_flat.reshape(-1))
+        selected_offsets_long = selected_offsets_long.view(B, N, 3).transpose(1, 2).contiguous()
+        source_sparsepcgc_coords = voxel_coords
+        target_sparsepcgc_coords = voxel_coords + selected_offsets_long
+        target_existing_occupied_mask = self._coords_membership_mask(
+            target_sparsepcgc_coords,
+            source_sparsepcgc_coords,
+        )
+        # ============================================================
+        # Adjust Hard/Softを同じguard後候補集合で作る
+        # ============================================================
+
+        # まず、guard前Hardをデバッグ用に作る。
+        # これは実行には使わず、raw_hard_move_countのログ専用である。
+        raw_hard_move_mask = self._hard_voxel_drop_mask(
+            voxel_coords,
+            move_score,
+            target_drop_ratio=move_target_ratio,
+            max_drop_ratio=move_target_ratio,
+            selection_mask=move_candidate_mask.unsqueeze(1),
+            hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
+            voxel_cache=voxel_cache,
+            force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
+            max_hard_count=int(getattr(self.args, "repair_max_hard_move_voxels", 0)),
+            skip_hard_selection=external_plan_authority,
+        )
+        raw_hard_move_bool = raw_hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
+
+        # target重複の確認用。
+        target_first_unique_raw_mask = self._first_unique_selected_mask(
+            target_sparsepcgc_coords,
+            raw_hard_move_bool,
+        )
+        target_duplicate_reject_mask = raw_hard_move_bool & (~target_first_unique_raw_mask)
+
+        # penalty計算用には、guard前Softを使う。
+        raw_move_mask_for_penalty = soft_move_score_for_guard
+
+        empty_target_violation_loss = self._masked_mean(
+            raw_move_mask_for_penalty
+            * target_existing_occupied_mask.unsqueeze(1).to(dtype=pts_xyz.dtype),
+            selection_mask,
+        )
+        target_duplicate_voxel_loss = self._masked_mean(
+            raw_move_mask_for_penalty
+            * target_duplicate_reject_mask.unsqueeze(1).to(dtype=pts_xyz.dtype),
+            selection_mask,
+        )
+
+        empty_target_guard_enabled = bool(
+            sparsepcgc_context and getattr(self.args, "enable_sparsepcgc_empty_target_guard", False)
+        )
+        target_duplicate_guard_enabled = bool(
+            sparsepcgc_context and getattr(self.args, "enable_sparsepcgc_target_duplicate_guard", False)
+        )
+
+        # ------------------------------------------------------------
+        # ここでHard/Soft共通のguard後候補集合を作る。
+        # ------------------------------------------------------------
+        guarded_move_candidate_mask = move_candidate_mask.clone()
+
+        empty_guard_reject_bool = torch.zeros_like(raw_hard_move_bool, dtype=torch.bool)
+        duplicate_guard_reject_bool = torch.zeros_like(raw_hard_move_bool, dtype=torch.bool)
+
+        if empty_target_guard_enabled:
+            empty_guard_reject_bool = guarded_move_candidate_mask & target_existing_occupied_mask
+            guarded_move_candidate_mask = guarded_move_candidate_mask & (~target_existing_occupied_mask)
+
+        # duplicate guardをかける前の候補を保存する。
+        # empty target guardは維持したまま、duplicate guardだけ緩和できるようにする。
+        guarded_move_candidate_mask_before_duplicate = guarded_move_candidate_mask.clone()
+
+        if target_duplicate_guard_enabled:
+            # Soft/Hard共通で、同じtarget voxelへ向かう候補は1つに絞る。
+            target_first_unique_candidate_mask = self._first_unique_selected_mask(
+                target_sparsepcgc_coords,
+                guarded_move_candidate_mask,
+            )
+            duplicate_guard_reject_bool = guarded_move_candidate_mask & (~target_first_unique_candidate_mask)
+            guarded_move_candidate_mask = guarded_move_candidate_mask & target_first_unique_candidate_mask
+
+        # duplicate guardでAdjust候補がほぼ消える場合だけ、duplicate guardを緩める。
+        # empty target guard後の候補へ戻すため、既存occupied targetへの移動は許可しない。
+        if (
+            self.training
+            and target_duplicate_guard_enabled
+            and bool(getattr(self.args, "repair_move_relax_duplicate_guard_when_starved", False))
+        ):
+            min_ratio = min(
+                max(float(getattr(self.args, "repair_move_candidate_min_ratio", 0.05)), 0.0),
+                1.0,
+            )
+            before_dup_count = guarded_move_candidate_mask_before_duplicate.sum(dim=1)
+            after_dup_count = guarded_move_candidate_mask.sum(dim=1)
+            min_count = torch.ceil(before_dup_count.to(dtype=pts_xyz.dtype) * min_ratio).to(dtype=torch.long)
+
+            starved = (before_dup_count > 0) & (after_dup_count < min_count)
+            guarded_move_candidate_mask = torch.where(
+                starved.view(B, 1),
+                guarded_move_candidate_mask_before_duplicate,
+                guarded_move_candidate_mask,
+            )
+
+        # guardで落ちた候補のログ用。
+        guard_rejected_bool = move_candidate_mask & (~guarded_move_candidate_mask)
+
+        # ------------------------------------------------------------
+        # Hard Moveをguard後候補から作り直す。
+        # これが最重要である。
+        # ------------------------------------------------------------
+        valid_move_source_voxel_count_effective = (
+            move_candidate_voxel_weight
+            * guarded_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
+        ).sum(dim=2, keepdim=True).clamp_min(1.0)
+        # guard後にMove候補が完全に消えると、move_amount_head への下流勾配も消える。
+        # その場合だけ、forward値はほぼ変えず、backward用に極小の候補重みを残す。
+        if self.training and disp_enabled:
+            guarded_candidate_count = guarded_move_candidate_mask.sum(dim=1, keepdim=True)
+            no_guarded_candidate = guarded_candidate_count <= 0
+
+            if bool(no_guarded_candidate.any().detach().cpu().item()):
+                # Phase1:
+                # SparsePCGCではMove候補が消えた場合にbase候補へ戻さない。
+                # 候補復活はoccupancy pattern破壊を再発させるため、
+                # forward/backwardともguard後候補だけを使う。
+                move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(
+                    dtype=move_candidate_voxel_weight.dtype
+                )
+            else:
+                move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(
+                    dtype=move_candidate_voxel_weight.dtype
+                )
+        else:
+            move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
+
+        move_target_ratio_for_hard = move_target_ratio
+        if (heuristic_guidance is not None or network_only_codec_mode) and move_target_ratio > 0.0:
+            # den6 profileのAdjust比率は入力全体のoccupied voxel基準である。
+            # 既存実装はguard後candidate数を分母にしたため、候補が少ないframeでは
+            # 0.05%が過小なhard countへ縮んでいた。hard選択の分母だけを候補数へ
+            # 換算し、要求するglobal voxel数は変えない。
+            global_voxel_count = max(
+                int(sum(int(item.get("voxel_count", 0)) for item in voxel_cache)),
+                1,
+            )
+            candidate_voxel_count = max(
+                float(valid_move_source_voxel_count_effective.detach().sum().item()),
+                1.0,
+            )
+            requested_global_count = float(move_target_ratio) * float(global_voxel_count)
+            move_target_ratio_for_hard = min(
+                max(requested_global_count / candidate_voxel_count, 0.0),
+                1.0,
+            )
+        min_move_expected_voxels = max(
+            float(getattr(self.args, "repair_move_min_hard_expected_voxels", 1.0)),
+            0.0,
+        )
+        if min_move_expected_voxels > 0.0 and disp_enabled:
+            expected_move_voxels = (
+                learned_move_ratio.detach().reshape(B, 1, 1)
+                * (
+                    learned_move_ratio.new_tensor(float(global_voxel_count)).reshape(1, 1, 1)
+                    if network_only_codec_mode
+                    else valid_move_source_voxel_count_effective.detach()
+                )
+            ).mean()
+            if float(expected_move_voxels.cpu()) < min_move_expected_voxels:
+                move_target_ratio_for_hard = 0.0
+
+        hard_move_mask = self._hard_voxel_drop_mask(
+            voxel_coords,
+            move_score,
+            target_drop_ratio=move_target_ratio_for_hard,
+            max_drop_ratio=move_target_ratio_for_hard,
+            selection_mask=guarded_move_candidate_mask.unsqueeze(1),
+            hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
+            voxel_cache=voxel_cache,
+            force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
+            max_hard_count=int(getattr(self.args, "repair_max_hard_move_voxels", 0)),
+            skip_hard_selection=external_plan_authority,
+        )
+        if network_single_proposal:
+            hard_move_mask = hard_move_mask & operation_gate_hard[:, 2:3].to(
+                device=hard_move_mask.device, dtype=torch.bool
+            )
+        hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
+        # Phase3: guard後に確定したHard Move sourceをVoxel編集状態用に保存する。
+        voxel_edit_move_source_mask = hard_move_mask.detach().squeeze(1).to(dtype=torch.bool)
+
+        # ------------------------------------------------------------
+        # Soft Moveも同じguard後候補から作る。
+        # ------------------------------------------------------------
+        soft_move_score_effective_raw = soft_move_score * move_allowed_weight
+
+        soft_move_budget_effective = learned_move_ratio_for_budget * valid_move_source_voxel_count_effective
+        soft_move_budget_effective = torch.minimum(
+            soft_move_budget_effective,
+            valid_move_source_voxel_count_effective,
+        )
+
+        soft_move_effective_voxel_sum_det = (
+            soft_move_score_effective_raw.detach() * move_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+        soft_move_effective_budget_scale = self._safe_budget_scale(
+            soft_move_effective_voxel_sum_det,
+            soft_move_budget_effective,
+        )
+
+        soft_move_score_effective = torch.nan_to_num(
+            soft_move_score_effective_raw * soft_move_effective_budget_scale,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        # ------------------------------------------------------------
+        # Adjust = source Soft Prune + target Soft Add
+        # ------------------------------------------------------------
+        move_source_soft_delete = soft_move_score_effective.clamp(0.0, 1.0)
+        move_source_soft_keep = (1.0 - move_source_soft_delete).clamp(0.0, 1.0)
+        move_target_soft_add = move_source_soft_delete
+
+        # ------------------------------------------------------------
+        # Hard forward + Soft backward
+        # forwardはguard後Hard、backwardはguard後Soft。
+        # ------------------------------------------------------------
+        move_mask = hard_move - soft_move_score_effective.detach() + soft_move_score_effective
+
+        # Pruneで削除された点はAdjustしない。
+        move_mask = move_mask * keep_prob
+
+        soft_move_score_for_guard = soft_move_score_effective.clamp(0.0, 1.0)
+        move_mask_for_guard = move_mask.clamp(0.0, 1.0)
+
+        # ------------------------------------------------------------
+        # Soft/Hard量の統計をguard後基準で再計算する。
+        # ------------------------------------------------------------
+        soft_move_sum = soft_move_score_for_guard.detach().sum()
+        hard_move_sum = hard_move.detach().sum()
+
+        soft_move_voxel_mass_per_batch = (
+            soft_move_score_effective * move_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+
+        hard_move_voxel_mass_per_batch = (
+            hard_move.detach() * move_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+
+        soft_move_voxel_sum = soft_move_voxel_mass_per_batch.detach().sum()
+        hard_move_voxel_sum = hard_move_voxel_mass_per_batch.detach().sum()
+
+        move_ratio_soft_batch = soft_move_voxel_mass_per_batch / valid_move_source_voxel_count_effective
+        move_ratio_hard_batch = hard_move_voxel_mass_per_batch / valid_move_source_voxel_count_effective
+
+        move_ratio_soft = move_ratio_soft_batch.mean()
+        move_ratio_hard = move_ratio_hard_batch.mean()
+
+        move_amount_supervision_loss = (
+            move_ratio_hard_batch.detach() - learned_move_ratio
+        ).pow(2).mean()
+
+        move_amount_soft_consistency_loss = (
+            move_ratio_soft_batch.detach() - learned_move_ratio
+        ).pow(2).mean()
+
+        primitive_delta = target_centers - pts_xyz
+        delta = move_mask * primitive_delta
+        pts_out = pts_xyz + delta
+        move_target_voxel_coords = voxel_coords + selected_offsets_long
+        # Phase3: Moveを source voxel削除 + target voxel追加 として扱うためのtarget制約。
+        voxel_edit_same_move_mask = (move_target_voxel_coords == voxel_coords).all(dim=1)
+
+        voxel_edit_move_target_existing_mask = self._coords_membership_mask(
+            move_target_voxel_coords,
+            voxel_coords,
+        )
+
+        voxel_edit_move_target_empty_mask = torch.gather(
+            empty_target_mask,
+            2,
+            move_idx_flat.unsqueeze(-1),
+        ).squeeze(-1)
+
+        if child_slot_mask is not None and not online_den6_single_proposal:
+            voxel_edit_move_child_slot_mask = torch.gather(
+                child_slot_mask,
+                2,
+                move_idx_flat.unsqueeze(-1),
+            ).squeeze(-1)
+        else:
+            voxel_edit_move_child_slot_mask = torch.ones_like(voxel_edit_move_target_empty_mask, dtype=torch.bool)
+
+        voxel_edit_move_valid_mask = voxel_edit_move_source_mask
+        voxel_edit_move_valid_mask = voxel_edit_move_valid_mask & (~voxel_edit_same_move_mask)
+
+        if bool(getattr(self.args, "repair_voxel_edit_require_empty_move_target", True)):
+            voxel_edit_move_valid_mask = voxel_edit_move_valid_mask & voxel_edit_move_target_empty_mask
+            voxel_edit_move_valid_mask = voxel_edit_move_valid_mask & (~voxel_edit_move_target_existing_mask)
+
+        voxel_edit_move_valid_mask = voxel_edit_move_valid_mask & voxel_edit_move_child_slot_mask
+
+        final_voxel_coords = torch.where(
+            hard_move_mask.to(device=voxel_coords.device, dtype=torch.bool).expand_as(voxel_coords),
+            move_target_voxel_coords,
+            voxel_coords,
+        )
+        same_voxel_move_mask = (
+            hard_move_mask.squeeze(1)
+            & (move_target_voxel_coords == voxel_coords).all(dim=1)
+        )
+        moved_different_voxel_mask = hard_move_mask.squeeze(1) & (~same_voxel_move_mask)
+        # Actuator内部のVoxel状態を更新する。
+        # pts_outから再Voxel化せず、初期Voxelに対するMove結果として保持する。
+        final_voxel_coords_state = torch.where(
+            hard_move_mask.to(device=voxel_coords.device, dtype=torch.bool).expand_as(voxel_coords),
+            move_target_voxel_coords,
+            voxel_coords,
+        )
+        if timing_enabled:
+            _mark_runtime("adjust_move")
+
+        # BCE系損失へ渡る可能性があるため、final_wを確率範囲へ安全に収める。
+        # NaN/Infもここで除去する。
+        # forward値は keep_prob_hard によって 0/1 範囲内にある。
+        # ここで clamp すると backward が再び境界で潰れるため、nan_to_num のみにする。
+        final_w = torch.nan_to_num(
+            keep_prob,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        max_add_ratio_value = self._max_add_ratio()
+        # Addする割合を特徴から学習し、固定10%のような張り付きから外す。
+        learned_add_ratio = self._learned_operation_ratio(
+            actuator_features,
+            self.add_amount_head,
+            max_add_ratio_value if add_enabled else 0.0,
+            "repair_add_amount_random_mix_start",
+            "repair_add_amount_random_mix_end",
+        )
+        if network_only_codec_mode:
+            learned_add_ratio = (
+                network_only_policy_terms["total_ratio"]
+                * network_only_policy_terms["shares"][:, 1:2]
+            ).to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, float(max_add_ratio_value))
+        raw_learned_add_ratio = learned_add_ratio
+        add_ratio_floor_applied = False
+        add_ratio_floor = min(max(float(getattr(self.args, "repair_add_ratio_floor", 0.0)), 0.0), max_add_ratio_value)
+        if self.training and add_enabled and add_ratio_floor > 0.0:
+            learned_add_ratio_before_floor = learned_add_ratio
+
+            learned_add_ratio_floored = torch.maximum(
+                learned_add_ratio,
+                learned_add_ratio.new_tensor(add_ratio_floor),
+            ).clamp(0.0, max_add_ratio_value)
+
+            # forward値だけfloorを効かせ、backwardは元のlearned_add_ratioへ流す
+            learned_add_ratio = (
+                learned_add_ratio_floored.detach()
+                + learned_add_ratio
+                - learned_add_ratio.detach()
+            )
+
+            add_ratio_floor_applied = bool(
+                (learned_add_ratio_floored > learned_add_ratio_before_floor + 1e-12)
+                .detach()
+                .any()
+                .cpu()
+                .item()
+            )
+        learned_add_ratio = learned_add_ratio * add_operation_gate
+        # 最終Action gate後のAmountをana_den6初期値の近傍へ置く。
+        learned_add_ratio = self._apply_heuristic_amount_guidance(
+            learned_add_ratio, heuristic_guidance, "Add", max_add_ratio_value
+        )
+        learned_add_ratio_for_ops = self._scale_amount_downstream_grad(
+            learned_add_ratio,
+            op_name="add",
+        )
+        # hardなtop-k個数は整数なので、学習比率の値だけを候補数計算へ渡す。
+        learned_add_ratio_value = float(learned_add_ratio.detach().mean().cpu()) if add_enabled else 0.0
+        add_k, add_candidate_ratio = self._target_add_count(
+            N,
+            candidate_ratio_override=(learned_add_ratio_value if hard_add_actual_allowed else 0.0),
+            force_min_count=(
+                bool(getattr(self.args, "repair_force_min_add_voxels", False) and hard_add_actual_allowed)
+                or bool(
+                    actual_oracle_enabled
+                    and actual_oracle_apply_teacher_actions
+                    and actual_oracle_has_add
+                )
+            ),
+        )
+        if external_plan_authority:
+            add_k = 0
+            add_candidate_ratio = 0.0
+        add_ratio = pts_xyz.new_zeros(())
+        add_ratio_loss = pts_xyz.new_zeros(())
+        add_shape_guard = pts_xyz.new_zeros(())
+        add_offset_reg = pts_xyz.new_zeros(())
+        add_drop_conflict_loss = pts_xyz.new_zeros(())
+        added_keep_loss = pts_xyz.new_zeros(())
+        add_min_offset_loss = pts_xyz.new_zeros(())
+        quant_add_guard = pts_xyz.new_zeros(())
+        add_direction_ce = pts_xyz.new_zeros(())
+        add_prob = pts_xyz.new_zeros((B, 1, N))
+        add_priority = add_prob
+        K_add = int(neighbor_offsets.shape[0])
+
+        add_ratio_soft = pts_xyz.new_zeros(())
+        add_ratio_hard = pts_xyz.new_zeros(())
+        add_amount_supervision_loss = pts_xyz.new_zeros(())
+        add_amount_soft_consistency_loss = pts_xyz.new_zeros(())
+
+        soft_add_budget = pts_xyz.new_zeros((B, 1))
+        soft_add_pair = pts_xyz.new_zeros((B, N * K_add))
+        hard_add_pair = pts_xyz.new_zeros((B, N * K_add))
+        add_count_value = 0
+        add_effective_count_value = 0
+        add_target_voxel_count_value = 0
+        # ============================================================
+        # Addをtarget voxel単位で扱うためのSoft/Hard状態。
+        # 既存のadd_probはsource点単位に畳まれるため、Add量の主指標には使わない。
+        # ============================================================
+        add_target_soft_add = pts_xyz.new_zeros((B, 1, 0))
+        add_target_hard_add = pts_xyz.new_zeros((B, 1, 0))
+        add_target_add_st = pts_xyz.new_zeros((B, 1, 0))
+        add_target_voxel_coords = voxel_coords.new_empty((B, 3, 0))
+        fixed_add_direction_pair_count = 0
+        fixed_add_valid_before_unique_count = 0
+        fixed_add_valid_after_unique_count = 0
+        selected_fixed_add_pair_count = 0
+        exact_add_pair_logits = None
+        exact_network_add_pair_logits = None
+        learned_add_logit = None
+        learned_add_direction_logits = None
+        exact_add_target_bias = None
+        # Phase3: Addが実行されない場合でも、Voxel編集状態構築で参照できる空のAdd候補を用意する。
+        voxel_edit_add_target_coords = add_target_voxel_coords.detach()
+        voxel_edit_add_target_mask = torch.zeros((B, 0), device=pts_xyz.device, dtype=torch.bool)
+
+        add_score_noise = max(
+            self._annealed_value("repair_add_score_noise_start", "repair_add_score_noise_end"),
+            0.0,
+        )
+        add_weight_random_mix = min(
+            max(self._annealed_value("repair_add_weight_random_mix_start", "repair_add_weight_random_mix_end"), 0.0),
+            1.0,
+        )
+        if add_k > 0:
+            learned_add_logit = self._run_large_head(self.add_head, actuator_features)
+            learned_add_logit = self._scale_where_downstream_grad(
+                learned_add_logit,
+                op_name="add",
+            )
+            if network_only_codec_mode:
+                learned_add_logit = network_only_policy_terms["where_logits"][:, 1:2].to(
+                    device=pts_xyz.device, dtype=pts_xyz.dtype
+                )
+            add_prior = (
+                0.25 * p_sibling
+                + 0.20 * p_parent
+                + 0.35 * p_context
+                + 1.00 * p_comp
+                + 0.15 * lowprob_score
+                - 0.90 * preserve
+                - 0.75 * p_outlier
+                - 0.85 * quant_score
+                - 0.55 * sparse_score
+                - 0.45 * local_outlier_score
+                - 0.65 * shape_score
+            )
+            if full_context_available:
+                add_prior = add_prior + 0.05 * full_context_bonus
+            if bool(leaf_actuator_prior.get("enabled", False)):
+                add_prior = add_prior + float(
+                    getattr(self.args, "leaf_pattern_actuator_add_weight", 0.50)
+                ) * leaf_add_prior
+            add_prior = add_prior + float(
+                getattr(self.args, "repair_add_pattern_prior_weight", 1.25)
+            ) * add_pattern_prior.clamp_min(0.0).amax(dim=2, keepdim=True).transpose(1, 2)
+            if network_single_proposal:
+                # add_head/add_voxel_headをNetwork residualとし、固定den6式以外の
+                # hand-crafted priorがfallback順位を上書きしないようにする。
+                add_prior = torch.zeros_like(add_prior)
+            if sparsepcgc_add_experiment_active and not bool(getattr(self.args, "sparsepcgc_add_use_candidate_score", True)):
+                add_prior = torch.zeros_like(add_prior)
+            # Add量の学習結果を位置logitに足し、どのVoxelへ追加するかの勾配も残す。
+            add_logit = learned_add_logit + add_prior + self._ratio_bias(learned_add_ratio_for_ops, max_add_ratio_value)
+            if heuristic_guidance is not None:
+                add_logit = add_logit + self._heuristic_where_logit_bias(
+                    heuristic_guidance, "Add", add_logit
+                )
+            if self.training and add_score_noise > 0.0:
+                add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
+            exact_add_target_bias = self._fit_heuristic_target_direction_prior(
+                heuristic_guidance, "Add", preserve
+            ) if exact_den6_candidate_mode else preserve.new_zeros(
+                (B, int(self.neighbor_offsets.shape[0]), N)
+            )
+            fixed_add_target_bias = torch.zeros_like(exact_add_target_bias)
+            if teacher_guided_single_proposal:
+                fixed_add_target_bias = self._fit_heuristic_target_direction_prior(
+                    heuristic_guidance, "Add", preserve
+                )
+                fixed_add_direction_pair_count = int(
+                    (fixed_add_target_bias.detach() > 0.0).sum().item()
+                )
+                exact_add_target_bias = self._den6_first_empty_direction_bias(
+                    empty_target_mask, preserve
+                ) + 2.0 * fixed_add_target_bias
+            add_voxel_logits = self._run_large_head(self.add_voxel_head, actuator_features)
+            add_voxel_logits = self._scale_where_downstream_grad(
+                add_voxel_logits,
+                op_name="add",
+            )
+            add_logit = self._voxel_mean_logits(add_logit, voxel_coords, voxel_cache=voxel_cache)
+            exact_network_add_source_logit = self._voxel_mean_logits(
+                learned_add_logit, voxel_coords, voxel_cache=voxel_cache
+            )
+            add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords, voxel_cache=voxel_cache)
+            if network_only_codec_mode:
+                add_voxel_logits = network_only_policy_terms["direction_logits"][:, 0].to(
+                    device=pts_xyz.device, dtype=pts_xyz.dtype
+                )
+            # source/directionともTeacher方向biasを足す前のNetwork値だけを
+            # candidate utilityへ変換する。Heuristicは下流の明示prior項だけに残す。
+            exact_network_add_pair_logits = (
+                add_voxel_logits + exact_network_add_source_logit
+            ).permute(0, 2, 1).contiguous()
+            learned_add_direction_logits = add_voxel_logits
+
+            if (
+                bool(leaf_target_direction_prior.get("enabled", False))
+                and not exact_den6_candidate_mode
+                and not network_only_codec_mode
+            ):
+                add_voxel_logits = add_voxel_logits + float(
+                    getattr(self.args, "leaf_pattern_add_target_direction_weight", 1.25)
+                ) * leaf_add_target_bias.permute(0, 2, 1).to(
+                    device=add_voxel_logits.device,
+                    dtype=add_voxel_logits.dtype,
+                )
+            if exact_den6_candidate_mode:
+                add_voxel_logits = add_voxel_logits + float(
+                    getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
+                ) * exact_add_target_bias.to(
+                    device=add_voxel_logits.device,
+                    dtype=add_voxel_logits.dtype,
+                )
+            elif teacher_guided_single_proposal:
+                add_voxel_logits = add_voxel_logits + float(
+                    getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
+                ) * exact_add_target_bias.to(
+                    device=add_voxel_logits.device,
+                    dtype=add_voxel_logits.dtype,
+                )
+
+            pair_logits = (add_voxel_logits + add_logit).permute(0, 2, 1).contiguous()
+
+            if not network_single_proposal:
+                pair_logits = pair_logits + float(
+                    getattr(self.args, "repair_add_pair_pattern_prior_weight", 2.0)
+                ) * add_pattern_prior
+            exact_add_pair_logits = pair_logits
+            if selection_mask is None:
+                base_valid = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
+            else:
+                base_valid = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+                base_valid = base_valid.to(device=pts_xyz.device, dtype=torch.bool)
+            keep_threshold = float(getattr(self.args, "add_noop_keep_threshold", 0.5))
+            base_valid = base_valid & (~hard_drop_mask.squeeze(1))
+            if keep_threshold > 0.0 and not exact_den6_candidate_mode:
+                base_valid = base_valid & (keep_prob.detach().squeeze(1) >= keep_threshold)
+            if exact_den6_candidate_mode:
+                base_valid = base_valid & exact_add_source_mask.squeeze(1)
+
+            # exact den6 modeでは、den6候補のsource/target pair以外を許さない。
+            if hard_leaf_operation_mask_enabled and not exact_den6_candidate_mode:
+                base_valid = base_valid & leaf_add_op_mask.squeeze(1)
+            valid_pair = empty_target_mask & base_valid.unsqueeze(2)
+            if network_single_proposal:
+                fixed_pair_mask_nk = fixed_add_target_bias.permute(0, 2, 1) > 0.0
+                fixed_add_valid_before_unique_count = int(
+                    (fixed_pair_mask_nk & valid_pair).detach().sum().item()
+                )
+            if exact_den6_candidate_mode:
+                valid_pair = valid_pair & (
+                    exact_add_target_bias.permute(0, 2, 1) > 0
+                )
+            elif (
+                bool(getattr(self.args, "leaf_pattern_target_direction_mask", False))
+                and bool(leaf_target_direction_prior.get("enabled", False))
+            ):
+                add_target_allowed = leaf_add_target_bias > 0
+                valid_pair = valid_pair & add_target_allowed
+
+            # exact den6 onlineでは、このgeneric Add状態は後段の唯一の
+            # exact planで必ず上書きされる。Networkのpair_logitsは残すが、
+            # 使用されない全N×26 target座標・重複排除・occupancy照合は作らない。
+            if not exact_den6_candidate_mode and not network_only_codec_mode:
+                candidate_base_voxels_long = voxel_coords.transpose(1, 2).contiguous().unsqueeze(2)
+                candidate_offsets_long = neighbor_offsets_long.view(1, 1, -1, 3)
+                candidate_target_voxels_long = candidate_base_voxels_long + candidate_offsets_long
+
+                candidate_target_voxels_flat = (
+                    candidate_target_voxels_long
+                    .reshape(B, -1, 3)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+                unique_target_pair_mask = (
+                    self._first_unique_coord_mask(
+                        candidate_target_voxels_flat,
+                        eligible_mask=valid_pair.reshape(B, -1),
+                    )
+                    .view(B, N, -1)
+                )
+                valid_pair = valid_pair & unique_target_pair_mask
+                if network_single_proposal:
+                    fixed_add_valid_after_unique_count = int(
+                        (fixed_pair_mask_nk & valid_pair).detach().sum().item()
+                    )
+
+                add_hardening_threshold = float(
+                    getattr(
+                        self.args,
+                        "operation_count_drop_threshold",
+                        getattr(self.args, "test_drop_threshold", 0.5),
+                    )
+                )
+                current_keep_for_add = final_w.detach().squeeze(1) >= add_hardening_threshold
+                current_empty_target_pair_mask = torch.zeros_like(valid_pair, dtype=torch.bool)
+                for b in range(B):
+                    current_occ_coords = final_voxel_coords_state[b].transpose(0, 1).contiguous()
+                    current_occ_coords = current_occ_coords[current_keep_for_add[b]]
+                    candidate_targets_b = candidate_target_voxels_long[b].reshape(-1, 3).contiguous()
+                    if current_occ_coords.numel() == 0:
+                        current_empty_target_pair_mask[b] = True
+                    else:
+                        occupied_now = self._coords_membership(
+                            candidate_targets_b,
+                            current_occ_coords,
+                        ).view(N, K_add)
+                        current_empty_target_pair_mask[b] = ~occupied_now
+                valid_pair = valid_pair & current_empty_target_pair_mask
+
+            # AMP/float16環境では、float32の最小値をhalf Tensorへ入れない。
+            add_dir_logits_all = add_voxel_logits.permute(0, 2, 1).contiguous()
+            add_dir_mask_value = torch.finfo(add_dir_logits_all.dtype).min
+            if exact_den6_candidate_mode:
+                # Exact候補外のsourceはvalid方向が1つもなく、旧式でもCEへ
+                # 最後に0を掛ける。候補source行だけを取り出して同じ26方向CEを
+                # 計算し、N×26のmasked logits/softmaxを作らない。
+                valid_source = valid_pair.any(dim=2)
+                flat_source = valid_source.reshape(-1).nonzero(
+                    as_tuple=False
+                ).reshape(-1)
+                if int(flat_source.numel()) > 0:
+                    flat_logits = add_dir_logits_all.reshape(-1, K_add).index_select(
+                        0, flat_source
+                    )
+                    flat_valid = valid_pair.reshape(-1, K_add).index_select(
+                        0, flat_source
+                    )
+                    sparse_logits = flat_logits.masked_fill(
+                        ~flat_valid, add_dir_mask_value
+                    )
+                    sparse_target_logits = (
+                        -offset_norm.to(dtype=sparse_logits.dtype).view(1, -1)
+                    ).expand_as(sparse_logits).masked_fill(
+                        ~flat_valid, add_dir_mask_value
+                    )
+                    sparse_target = torch.softmax(
+                        sparse_target_logits, dim=1
+                    ).detach()
+                    add_direction_ce = -(
+                        sparse_target * torch.log_softmax(sparse_logits, dim=1)
+                    ).sum(dim=1).mean()
+                else:
+                    add_direction_ce = add_dir_logits_all.new_zeros(())
+            else:
+                add_dir_logits = add_dir_logits_all.masked_fill(
+                    ~valid_pair, add_dir_mask_value
+                )
+                add_dir_target_logits = (
+                    -offset_norm.to(dtype=add_dir_logits.dtype).view(1, 1, -1)
+                ).expand_as(add_dir_logits)
+                add_dir_target_logits = add_dir_target_logits.masked_fill(
+                    ~valid_pair, add_dir_mask_value
+                )
+                add_dir_target = torch.softmax(
+                    add_dir_target_logits, dim=2
+                ).detach()
+                add_direction_ce_per_point = -(
+                    add_dir_target * torch.log_softmax(add_dir_logits, dim=2)
+                ).sum(dim=2, keepdim=True)
+                add_valid_point = valid_pair.any(
+                    dim=2, keepdim=True
+                ).to(dtype=add_direction_ce_per_point.dtype)
+                add_direction_ce = (
+                    add_direction_ce_per_point * add_valid_point
+                ).sum() / add_valid_point.sum().clamp_min(1.0)
+            valid_counts = valid_pair.reshape(B, -1).sum(dim=1)
+            requested_add_k = (
+                0
+                if exact_den6_candidate_mode
+                else min(int(add_k), int(valid_counts.min().detach().cpu().item()))
+            )
+            if network_only_codec_mode and requested_add_k > 0:
+                # Keep dense scores/masks, but never materialise N*26*3 target
+                # coordinates.  Only a small score-ordered top window needs
+                # coordinates for duplicate/collision resolution.
+                effective_add_k = min(
+                    int(valid_counts.min().detach().cpu().item()),
+                    max(int(requested_add_k) * 4, int(requested_add_k) + 64),
+                )
+            else:
+                effective_add_k = requested_add_k
+            if effective_add_k > 0:
+                pair_mask_value = torch.finfo(pair_logits.dtype).min
+                pair_scores = pair_logits.masked_fill(~valid_pair, pair_mask_value).reshape(B, -1)
+                top_pair_values, top_pair_idx = torch.topk(
+                    pair_scores.detach(),
+                    k=effective_add_k,
+                    dim=1,
+                    largest=True,
+                    sorted=bool(network_only_codec_mode),
+                )
+                if network_single_proposal:
+                    fixed_pair_flat = fixed_add_target_bias.permute(0, 2, 1).reshape(B, -1)
+                    selected_fixed_add_pair_count = int(
+                        (torch.gather(fixed_pair_flat, 1, top_pair_idx).detach() > 0.0)
+                        .sum().item()
+                    )
+                selected_pair_logits = torch.gather(pair_scores, 1, top_pair_idx)
+                add_strength_tau = max(float(getattr(self.args, "repair_add_strength_tau", 1.0)), 1e-6)
+                threshold_index = min(
+                    max(int(requested_add_k) - 1, 0),
+                    int(top_pair_values.shape[1]) - 1,
+                )
+                top_threshold = top_pair_values[:, threshold_index:threshold_index + 1].detach()
+                selected_pair_strength = torch.sigmoid((selected_pair_logits - top_threshold) / add_strength_tau)
+                selected_pair_strength = torch.nan_to_num(
+                    selected_pair_strength,
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                )
+                add_base_idx = torch.div(top_pair_idx, neighbor_offsets.shape[0], rounding_mode="floor")
+                add_dir_idx = top_pair_idx.remainder(neighbor_offsets.shape[0])
+                idx_expand_xyz = add_base_idx.unsqueeze(1).expand(-1, 3, -1)
+                selected_base_voxels_long = torch.gather(voxel_coords, 2, idx_expand_xyz)
+                selected_offsets_add_long = neighbor_offsets_long.index_select(0, add_dir_idx.reshape(-1))
+                selected_offsets_add_long = selected_offsets_add_long.view(B, effective_add_k, 3).transpose(1, 2)
+                selected_add_voxels_long = selected_base_voxels_long + selected_offsets_add_long
+                unique_add_target_mask = self._first_unique_coord_mask(selected_add_voxels_long).to(
+                    dtype=pair_scores.dtype
+                )
+                if network_only_codec_mode:
+                    current_keep_for_add = final_w.detach().squeeze(1) >= float(
+                        getattr(
+                            self.args,
+                            "operation_count_drop_threshold",
+                            getattr(self.args, "test_drop_threshold", 0.5),
+                        )
+                    )
+                    collision_free = torch.zeros_like(
+                        unique_add_target_mask, dtype=torch.bool
+                    )
+                    for b in range(B):
+                        occupied_now = final_voxel_coords_state[b].transpose(0, 1).contiguous()
+                        occupied_now = occupied_now[current_keep_for_add[b]]
+                        selected_targets_b = selected_add_voxels_long[b].transpose(0, 1).contiguous()
+                        collision_free[b] = ~self._coords_membership(
+                            selected_targets_b, occupied_now
+                        )
+                    eligible_selected = (
+                        unique_add_target_mask.to(dtype=torch.bool) & collision_free
+                    )
+                    score_rank = eligible_selected.to(torch.long).cumsum(dim=1)
+                    unique_add_target_mask = (
+                        eligible_selected & (score_rank <= int(requested_add_k))
+                    ).to(dtype=pair_scores.dtype)
+                if threshold_cap_mode:
+                    hard_top_add = (
+                        selected_pair_strength >= float(getattr(self.args, "repair_add_hard_threshold", 0.5))
+                    ).to(dtype=pair_scores.dtype)
+                else:
+                    hard_top_add = torch.ones_like(selected_pair_strength)
+                hard_top_add = hard_top_add * unique_add_target_mask
+                if self.training and add_weight_random_mix > 0.0:
+                    random_hard_add = (
+                        torch.rand_like(hard_top_add) < float(add_weight_random_mix)
+                    ).to(dtype=hard_top_add.dtype)
+                    hard_top_add = torch.maximum(hard_top_add, random_hard_add * unique_add_target_mask)
+                hard_add_pair = torch.zeros_like(pair_scores)
+                hard_add_pair.scatter_(1, top_pair_idx, hard_top_add)
+
+                tau = max(float(getattr(self.args, "add_soft_match_tau", 0.05)), 1e-6)
+                threshold = top_threshold
+
+                valid_pair_flat = valid_pair.reshape(B, -1).to(dtype=pair_scores.dtype)
+
+                # pairごとのSoft追加確率。
+                # これは「どのVoxelへ追加するか」のSoft表現であり、add_head / add_voxel_headへ勾配を返す。
+                soft_add_pair_raw = torch.sigmoid((pair_scores - threshold) / tau)
+                soft_add_pair_raw = soft_add_pair_raw * valid_pair_flat
+
+                # add_amount_head が出した learned_add_ratio をTensorのまま使い、
+                # このStepで全体のうち何割をAddするかのSoft予算にする。
+                learned_add_ratio_for_budget = learned_add_ratio_for_ops.reshape(B, 1).clamp(
+                    0.0,
+                    float(max_add_ratio_value),
+                )
+
+                # N点に対する追加数のSoft予算。
+                # 例：N=29066, learned_add_ratio=0.0115 なら約334点分のSoft予算。
+                soft_add_budget = learned_add_ratio_for_budget * float(N)
+
+                # 有効候補数を超えないようにする。
+                valid_pair_count = valid_pair_flat.sum(dim=1, keepdim=True).clamp_min(1.0)
+                soft_add_budget = torch.minimum(soft_add_budget, valid_pair_count)
+
+                # raw Soft値の合計をdetachして正規化係数にする。
+                # 分母をdetachすることで、Soft総量の主な勾配を learned_add_ratio に返す。
+                soft_add_raw_sum_det = soft_add_pair_raw.detach().sum(dim=1, keepdim=True)
+                soft_add_budget_scale = self._safe_budget_scale(soft_add_raw_sum_det, soft_add_budget)
+
+                # Soft追加量を learned_add_ratio が決める予算に合わせる。
+                # これにより add_amount_head が「どのくらい追加するか」を学習対象にできる。
+                soft_add_pair = torch.nan_to_num(
+                    soft_add_pair_raw * soft_add_budget_scale,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                soft_add_pair = soft_add_pair.clamp(0.0, 1.0)
+
+                # ============================================================
+                # pair全体のSTEは補助的なsource側可視化にだけ使う。
+                # Addの実操作量は、後でtop-k selected target voxel単位で作る。
+                # ============================================================
+                if network_single_proposal:
+                    hard_add_pair = hard_add_pair * operation_gate_hard[:, 1:2, 0].to(
+                        device=hard_add_pair.device, dtype=hard_add_pair.dtype
+                    )
+                add_pair_st = hard_add_pair - soft_add_pair.detach() + soft_add_pair
+                add_pair_st_view = add_pair_st.view(B, N, -1)
+
+                # add_probはsource点単位に畳まれるため、Add量の主指標にはしない。
+                # shape guard / quant guard用の補助信号としてだけ使う。
+                add_prob = add_pair_st_view.sum(dim=2, keepdim=True).transpose(1, 2).clamp(0.0, 1.0)
+
+                pair_priority = torch.sigmoid(pair_logits.clamp(-8.0, 8.0))
+                add_priority = pair_priority.max(dim=2, keepdim=True).values.transpose(1, 2)
+
+                selected_base_voxels = selected_base_voxels_long.to(dtype=pts_xyz.dtype)
+                selected_offsets_add = selected_offsets_add_long.to(dtype=pts_xyz.dtype)
+                # 追加先Voxelを、初期Octree/Voxelのglobal座標系から点座標へ戻す。
+                added_pts = self._voxel_centers_from_global_coords(
+                    selected_add_voxels_long,
+                    voxel_step,
+                    voxel_offset,
+                    dtype=pts_xyz.dtype,
+                )
+                added_base = torch.gather(pts_out, 2, idx_expand_xyz)
+                added_delta = added_pts - added_base
+                selected_add_strength = torch.gather(
+                    pair_priority.reshape(B, -1),
+                    1,
+                    top_pair_idx,
+                ).unsqueeze(1)
+
+                selected_hard_add = torch.gather(
+                    hard_add_pair,
+                    1,
+                    top_pair_idx,
+                ).unsqueeze(1)
+
+                # Soft追加量をtop-kで選ばれたtarget voxel候補に対応させる。
+                # ここには learned_add_ratio / add_head / add_voxel_head への勾配が含まれる。
+                selected_soft_add = torch.gather(
+                    soft_add_pair,
+                    1,
+                    top_pair_idx,
+                ).unsqueeze(1)
+
+                # ============================================================
+                # Addをtarget voxel単位のHard/Soft近似として定義する。
+                # forwardではHardなtarget voxel追加、
+                # backwardではSoftなtarget voxel追加量を使う。
+                # ============================================================
+                add_target_soft_add = selected_soft_add.clamp(0.0, 1.0)
+                add_target_hard_add = selected_hard_add.to(dtype=add_target_soft_add.dtype)
+
+                add_target_add_st = (
+                    add_target_hard_add
+                    - add_target_soft_add.detach()
+                    + add_target_soft_add
+                )
+
+                # 追加先target voxel座標もtarget単位で保持する。
+                add_target_voxel_coords = selected_add_voxels_long
+
+                # Phase3: Addは点追加ではなく、target occupied voxel追加候補として記録する。
+                voxel_edit_add_target_coords = add_target_voxel_coords.detach()
+                voxel_edit_add_target_mask = (
+                    add_target_hard_add.detach().squeeze(1).to(dtype=torch.bool)
+                )
+
+                # final_wへ入れる追加点の重みはtarget voxel単位STEを使う。
+                added_w = add_target_add_st
+
+                pts_out = torch.cat([pts_out, added_pts], dim=2)
+                final_w = torch.cat([final_w, added_w], dim=2)
+                final_voxel_coords_state = torch.cat(
+                    [final_voxel_coords_state, selected_add_voxels_long],
+                    dim=2,
+                )
+                final_voxel_coords = torch.cat([final_voxel_coords, selected_add_voxels_long], dim=2)
+
+                # Soft上の追加率。
+                # Addはtarget voxel単位で扱うため、selected target voxelのSoft量を使う。
+                add_ratio_soft = add_target_soft_add.sum() / max(float(B * N), 1.0)
+
+                # Hard上の実追加率。
+                # 実際に追加したtarget voxel数を使う。
+                add_ratio_hard = add_target_hard_add.detach().sum() / max(float(B * N), 1.0)
+
+                max_add_ratio_t = pts_xyz.new_tensor(float(max_add_ratio_value))
+
+                # Addの学習用実行率はtarget voxel単位のsoft量を使う。
+                # add_ratio_hardはhard mask由来なので、学習用lossには直接使わない。
+                add_ratio_loss = torch.relu(add_ratio_soft - max_add_ratio_t).pow(2)
+
+                # add_amount_head 専用の量一致損失。
+                # Hard実行量は教師値としてdetachし、learned_add_ratio側だけに勾配を流す。
+                add_amount_supervision_loss = (
+                    add_ratio_hard.detach() - learned_add_ratio.mean()
+                ).pow(2)
+
+                # Soft追加量と learned_add_ratio の整合性も見る。
+                # soft_add_pair は learned_add_ratio から作られるため、この項は補助的に小さく使う。
+                add_amount_soft_consistency_loss = (
+                    add_ratio_soft.detach() - learned_add_ratio.mean()
+                ).pow(2)
+                add_shape_guard = self._masked_mean(add_prob * shape_score, selection_mask)
+                quant_add_guard = self._masked_mean(
+                    add_prob * (quant_score + sparse_score).clamp(0.0, 1.0),
+                    selection_mask,
+                )
+                add_drop_conflict_loss = add_prob.new_zeros(())
+                selected_hard_add_det = selected_hard_add.detach()
+                added_keep_loss = (
+                    (1.0 - selected_add_strength).pow(2) * selected_hard_add_det
+                ).sum() / selected_hard_add_det.sum().clamp_min(1.0)
+                voxel_norm_safe = voxel_norm.clamp_min(self._numeric_floor(voxel_norm, default=1e-6))
+                added_delta_norm = torch.linalg.norm(added_delta, dim=1, keepdim=True) / voxel_norm_safe
+                add_offset_reg = (
+                    added_delta_norm.pow(2) * add_target_add_st.detach()
+                ).sum() / add_target_add_st.detach().sum().clamp_min(1.0)
+                add_min_offset_loss = add_prob.new_zeros(())
+                add_count_value = int(add_target_hard_add.detach().sum().item())
+                hardening_threshold = float(
+                    getattr(
+                        self.args,
+                        "operation_count_drop_threshold",
+                        getattr(self.args, "test_drop_threshold", 0.5),
+                    )
+                )
+                add_effective_count_value = int(
+                    (add_target_add_st.detach() >= hardening_threshold).sum().item()
+                )
+                add_target_voxel_count_value = self._unique_voxel_count(
+                    add_target_voxel_coords,
+                    (add_target_hard_add.detach() >= hardening_threshold),
+                )
+        # 後段互換用の add_ratio は、古いゼロ初期値ではなく学習用のsoft実行率にする。
+        # hard実行率は add_ratio_hard として別keyで保持する。
+        add_ratio = add_ratio_soft
+        if actual_oracle_enabled and actual_oracle_apply_teacher_actions and actual_oracle_has_add:
+            leaf_diag_for_oracle_add = structure.get("leaf_pattern_diag", {}) if isinstance(structure, dict) else {}
+            oracle_add_slots = self._fit_leaf_pattern_long_map(
+                leaf_diag_for_oracle_add.get("best_add_child_slot", None),
+                batch_size=B,
+                point_count=N,
+                device=pts_xyz.device,
+            )
+            oracle_add_source_mask = leaf_add_op_mask.squeeze(1).to(device=pts_xyz.device, dtype=torch.bool)
+            oracle_add_source_mask = oracle_add_source_mask & oracle_add_slots.ge(0) & oracle_add_slots.le(7)
+            if bool(oracle_add_source_mask.detach().any().item()):
+                max_oracle_add = max(
+                    int(getattr(self.args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)),
+                    1,
+                )
+                oracle_target_lists = []
+                oracle_mask_lists = []
+                for b in range(B):
+                    source_idx_b = oracle_add_source_mask[b].nonzero(as_tuple=False).reshape(-1)
+                    if source_idx_b.numel() <= 0:
+                        oracle_target_lists.append(voxel_coords.new_empty((3, 0)))
+                        oracle_mask_lists.append(torch.zeros((0,), device=pts_xyz.device, dtype=torch.bool))
+                        continue
+                    source_idx_b = source_idx_b[:max_oracle_add]
+                    source_voxels_b = voxel_coords[b].index_select(1, source_idx_b).transpose(0, 1).contiguous()
+                    slots_b = oracle_add_slots[b].index_select(0, source_idx_b).to(dtype=torch.long)
+                    slot_bits_b = torch.stack(
+                        [
+                            slots_b & 1,
+                            (slots_b >> 1) & 1,
+                            (slots_b >> 2) & 1,
+                        ],
+                        dim=1,
+                    ).to(device=voxel_coords.device, dtype=torch.long)
+                    target_b = torch.div(source_voxels_b, 2, rounding_mode="floor") * 2 + slot_bits_b
+                    target_b = torch.unique(target_b, dim=0, sorted=True)
+                    if int(target_b.shape[0]) > max_oracle_add:
+                        target_b = target_b[:max_oracle_add]
+                    oracle_target_lists.append(target_b.transpose(0, 1).contiguous())
+                    oracle_mask_lists.append(torch.ones((target_b.shape[0],), device=pts_xyz.device, dtype=torch.bool))
+
+                max_targets = max((int(item.shape[1]) for item in oracle_target_lists), default=0)
+                if max_targets > 0:
+                    oracle_coords = voxel_coords.new_zeros((B, 3, max_targets))
+                    oracle_mask = torch.zeros((B, max_targets), device=pts_xyz.device, dtype=torch.bool)
+                    for b, coords_b in enumerate(oracle_target_lists):
+                        count_b = int(coords_b.shape[1])
+                        if count_b <= 0:
+                            continue
+                        oracle_coords[b, :, :count_b] = coords_b
+                        oracle_mask[b, :count_b] = True
+                    if voxel_edit_add_target_coords.shape[2] > 0:
+                        voxel_edit_add_target_coords = torch.cat(
+                            [voxel_edit_add_target_coords, oracle_coords.detach()],
+                            dim=2,
+                        )
+                        voxel_edit_add_target_mask = torch.cat(
+                            [voxel_edit_add_target_mask, oracle_mask.detach()],
+                            dim=1,
+                        )
+                    else:
+                        voxel_edit_add_target_coords = oracle_coords.detach()
+                        voxel_edit_add_target_mask = oracle_mask.detach()
+                    oracle_add_count = int(oracle_mask.detach().sum().item())
+                    add_count_value = max(add_count_value, oracle_add_count)
+                    add_effective_count_value = max(add_effective_count_value, oracle_add_count)
+                    add_target_voxel_count_value = max(add_target_voxel_count_value, oracle_add_count)
+                    add_ratio_hard = pts_xyz.new_tensor(
+                        float(oracle_add_count) / max(float(B * N), 1.0)
+                    )
+                    add_ratio_soft = torch.maximum(add_ratio_soft, add_ratio_hard.detach())
+                    add_ratio = add_ratio_soft
+        if (actual_oracle_has_add or actual_oracle_has_bad_add) and max_add_ratio_value > 0.0:
+            add_oracle_target_ratio = (
+                add_ratio_hard.detach()
+                if actual_oracle_has_add
+                else torch.zeros_like(add_ratio_hard)
+            )
+            actual_oracle_add_amount_loss = self._actual_oracle_amount_bce_loss(
+                raw_learned_add_ratio,
+                add_oracle_target_ratio,
+                max_add_ratio_value,
+            )
+            add_amount_logit_for_oracle = self._operation_amount_logit(
+                actuator_features,
+                self.add_amount_head,
+            ).mean()
+            add_amount_target_logit_for_oracle = self._target_ratio_logit(
+                add_oracle_target_ratio,
+                max_add_ratio_value,
+                raw_learned_add_ratio,
+            ).detach()
+            actual_oracle_add_amount_logit_loss = (
+                add_amount_logit_for_oracle - add_amount_target_logit_for_oracle
+            ).pow(2)
+            actual_oracle_add_amount_loss = (
+                actual_oracle_add_amount_loss
+                + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25))
+                * actual_oracle_add_amount_logit_loss
+            )
+        if (actual_oracle_has_move or actual_oracle_has_bad_move) and raw_max_move_ratio > 0.0:
+            move_oracle_target_ratio = (
+                leaf_move_op_mask.to(dtype=pts_xyz.dtype).mean()
+                if actual_oracle_has_move
+                else pts_xyz.new_zeros(())
+            ).clamp(0.0, raw_max_move_ratio)
+            actual_oracle_move_amount_loss = self._actual_oracle_amount_bce_loss(
+                raw_learned_move_ratio,
+                move_oracle_target_ratio,
+                raw_max_move_ratio,
+            )
+            move_amount_logit_for_oracle = self._operation_amount_logit(
+                actuator_features,
+                self.move_amount_head,
+            ).mean()
+            move_amount_target_logit_for_oracle = self._target_ratio_logit(
+                move_oracle_target_ratio,
+                raw_max_move_ratio,
+                raw_learned_move_ratio,
+            ).detach()
+            actual_oracle_move_amount_logit_loss = (
+                move_amount_logit_for_oracle - move_amount_target_logit_for_oracle
+            ).pow(2)
+            actual_oracle_move_amount_loss = (
+                actual_oracle_move_amount_loss
+                + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25))
+                * actual_oracle_move_amount_logit_loss
+            )
+        if timing_enabled:
+            _mark_runtime("add")
+
+        # exact den6 onlineの唯一planをgeneric voxel-edit stateより先に確定する。
+        # 旧経路は全点のPrune/Add/Move状態を構築した後でこのplanに上書きしていた。
+        exact_residual_plan_applied = False
+        exact_residual_plan_debug = {}
+        external_executable_plan_applied = False
+        external_executable_plan_hash = ""
+        if external_executable_plan is not None:
+            if not network_only_codec_mode:
+                raise RuntimeError("external executable planはNetwork-only K経路専用である")
+            if int(external_executable_plan.operation_order.shape[1]) != 1:
+                raise RuntimeError("Actuatorへ渡すexternal executable planはK=1でなければならない")
+            external_coords, external_valid = self._apply_external_executable_plan(
+                voxel_coords, external_executable_plan
+            )
+            voxel_edit_final_coords = external_coords
+            voxel_edit_valid_mask = external_valid
+            voxel_edit_final_weights = external_valid.unsqueeze(1).to(dtype=pts_xyz.dtype)
+            counts = external_executable_plan.accepted_count[:, 0]
+            voxel_edit_debug_list = []
+            for batch_index in range(B):
+                voxel_edit_debug_list.append({
+                    "initial_count": int(torch.unique(
+                        voxel_coords[batch_index].transpose(0, 1), dim=0
+                    ).shape[0]),
+                    "drop_count": int(counts[batch_index, 0].item()),
+                    "add_count": int(counts[batch_index, 1].item()),
+                    "move_count": int(counts[batch_index, 2].item()),
+                    "same_voxel_move_rejected": 0,
+                    "existing_target_rejected": int(
+                        external_executable_plan.reject_reason_count[
+                            batch_index, 0, :, 2
+                        ].sum().item()
+                    ),
+                    "duplicate_target_rejected": int(
+                        external_executable_plan.reject_reason_count[
+                            batch_index, 0, :, 3
+                        ].sum().item()
+                    ),
+                    "final_count": int(external_valid[batch_index].sum().item()),
+                    "subtree_prune_count": 0,
+                })
+            if bool(getattr(self.args, "network_k_debug_plan_hash", False)) or bool(
+                getattr(self.args, "single_plan_debug_hash", False)
+            ):
+                external_executable_plan_hash = executable_plan_hashes(
+                    external_executable_plan
+                )[0][0]
+            external_executable_plan_applied = True
+            # [B,K=1,operation,slot,xyz] -> [B,xyz,slot].  Keep the
+            # accepted mask so padded/rejected Add proposals never enter Fit.
+            voxel_edit_add_target_coords = (
+                external_executable_plan.target_coord[:, 0, 1]
+                .transpose(1, 2)
+                .contiguous()
+                .detach()
+            )
+            voxel_edit_add_target_mask = (
+                external_executable_plan.accepted_mask[:, 0, 1]
+                .to(device=pts_xyz.device, dtype=torch.bool)
+                .detach()
+            )
+        exact_den6_online = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        if (
+            not external_executable_plan_applied
+            and
+            exact_den6_candidate_mode
+            and (
+                exact_den6_online
+                or str(structure.get("octree_input_mode", "")).strip().lower() == "full_cloud"
+            )
+        ):
+            exact_plan_result = self._build_exact_den6_residual_plan(
+                heuristic_guidance,
+                voxel_coords,
+                learned_add_ratio,
+                learned_drop_ratio,
+                learned_move_ratio,
+                exact_network_drop_score,
+                exact_network_move_score,
+                exact_network_move_logits,
+                exact_network_add_pair_logits,
+                algorithmic_amount_selector_logits,
+                operation_gate_logit,
+            )
+            if exact_plan_result is not None:
+                exact_plan_coords, exact_residual_plan_debug = exact_plan_result
+                exact_counts = exact_residual_plan_debug.get("selected_counts", {})
+                exact_add_targets = exact_residual_plan_debug.get(
+                    "selected_add_target_coords", None
+                )
+                if torch.is_tensor(exact_add_targets):
+                    voxel_edit_add_target_coords = exact_add_targets.detach().to(
+                        device=pts_xyz.device, dtype=torch.long
+                    )
+                    voxel_edit_add_target_mask = torch.ones(
+                        (B, int(voxel_edit_add_target_coords.shape[-1])),
+                        device=pts_xyz.device,
+                        dtype=torch.bool,
+                    )
+                voxel_edit_final_coords = exact_plan_coords
+                voxel_edit_final_weights = pts_xyz.new_ones((B, 1, int(exact_plan_coords.shape[-1])))
+                voxel_edit_valid_mask = torch.ones(
+                    (B, int(exact_plan_coords.shape[-1])),
+                    device=pts_xyz.device,
+                    dtype=torch.bool,
+                )
+                voxel_edit_debug_list = [{
+                    "initial_count": int(voxel_coords.shape[-1]),
+                    "drop_count": int(exact_counts.get("Prune", 0)),
+                    "add_count": int(exact_counts.get("Add", 0)),
+                    "move_count": int(exact_counts.get("Adjust", 0)),
+                    "same_voxel_move_rejected": 0,
+                    "existing_target_rejected": 0,
+                    "duplicate_target_rejected": 0,
+                    "final_count": int(exact_plan_coords.shape[-1]),
+                    "subtree_prune_count": 0,
+                }]
+                exact_residual_plan_applied = True
+
+        hardening_threshold = float(
+            getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
+        )
+        hard_keep_mask = final_w.detach() >= hardening_threshold
+        point_aligned_after_occupied_voxels = (
+            int(voxel_edit_valid_mask.sum().item())
+            if external_executable_plan_applied
+            else (
+                int(exact_plan_coords.shape[-1])
+                if exact_residual_plan_applied
+                else self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
+            )
+        )
+        # Phase3: Prune/Add/Moveをoccupied voxel集合へ反映した最終Voxel状態を作る。
+        # 既存のpts_out/final_wは変更しない。
+        if not exact_residual_plan_applied and not external_executable_plan_applied:
+            voxel_edit_debug_list = []
+        voxel_edit_coords_list = []
+        voxel_edit_weights_list = []
+
+        if exact_residual_plan_applied or external_executable_plan_applied:
+            pass
+        elif voxel_edit_state_enabled:
+            for b in range(B):
+                coords_b, weights_b, debug_b = self._build_voxel_edit_state_single(
+                    voxel_coords_b=voxel_coords[b],
+                    hard_drop_mask_b=voxel_edit_drop_mask[b],
+                    add_target_coords_b=voxel_edit_add_target_coords[b] if voxel_edit_add_target_coords.shape[2] > 0 else None,
+                    add_target_mask_b=voxel_edit_add_target_mask[b] if voxel_edit_add_target_mask.numel() > 0 else None,
+                    move_source_mask_b=voxel_edit_move_source_mask[b],
+                    move_target_coords_b=move_target_voxel_coords[b],
+                    move_valid_mask_b=voxel_edit_move_valid_mask[b],
+                )
+                voxel_edit_coords_list.append(coords_b)
+                voxel_edit_weights_list.append(weights_b.to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                voxel_edit_debug_list.append(debug_b)
+
+            voxel_edit_final_coords, voxel_edit_final_weights, voxel_edit_valid_mask = self._pad_voxel_edit_state(
+                voxel_edit_coords_list,
+                voxel_edit_weights_list,
+                device=pts_xyz.device,
+                dtype=pts_xyz.dtype,
+            )
+        else:
+            voxel_edit_final_coords = final_voxel_coords.detach().to(dtype=torch.long)
+            voxel_edit_final_weights = final_w.detach()
+            voxel_edit_valid_mask = torch.ones(
+                (B, int(voxel_edit_final_coords.shape[-1])),
+                device=pts_xyz.device,
+                dtype=torch.bool,
+            )
+            voxel_edit_debug_list = [
+                {
+                    "initial_count": int(voxel_edit_final_coords.shape[-1]),
+                    "drop_count": 0,
+                    "add_count": 0,
+                    "move_count": 0,
+                    "same_voxel_move_rejected": 0,
+                    "existing_target_rejected": 0,
+                    "duplicate_target_rejected": 0,
+                    "final_count": int(voxel_edit_final_coords.shape[-1]),
+                }
+                for _ in range(B)
+            ]
+
+        actual_oracle_override_move_count_value = 0
+        actual_oracle_override_drop_count_value = 0
+        actual_oracle_override_add_count_value = 0
+        actual_oracle_override_subtree_prune_count_value = 0
+        leaf_diag_for_override = structure.get("leaf_pattern_diag", {}) if isinstance(structure, dict) else {}
+        actual_oracle_edit_record_bits_value = 0.0
+        actual_oracle_raw_percent_value = 0.0
+        if isinstance(leaf_diag_for_override, dict):
+            actual_oracle_edit_record_bits_value = max(
+                float(leaf_diag_for_override.get("actual_oracle_edit_record_bits", 0.0) or 0.0),
+                0.0,
+            )
+            actual_oracle_raw_percent_value = float(
+                leaf_diag_for_override.get("actual_oracle_raw_percent", 0.0) or 0.0
+            )
+        if (
+            not exact_residual_plan_applied
+            and
+            exact_den6_candidate_mode
+            and (
+                exact_den6_online
+                or str(structure.get("octree_input_mode", "")).strip().lower() == "full_cloud"
+            )
+        ):
+            exact_plan_result = self._build_exact_den6_residual_plan(
+                heuristic_guidance,
+                voxel_coords,
+                learned_add_ratio,
+                learned_drop_ratio,
+                learned_move_ratio,
+                exact_network_drop_score,
+                exact_network_move_score,
+                exact_network_move_logits,
+                exact_network_add_pair_logits,
+                algorithmic_amount_selector_logits,
+                operation_gate_logit,
+            )
+            if exact_plan_result is not None:
+                exact_plan_coords, exact_residual_plan_debug = exact_plan_result
+                exact_counts = exact_residual_plan_debug.get("selected_counts", {})
+                exact_add_targets = exact_residual_plan_debug.get(
+                    "selected_add_target_coords", None
+                )
+                if torch.is_tensor(exact_add_targets):
+                    voxel_edit_add_target_coords = exact_add_targets.detach().to(
+                        device=pts_xyz.device, dtype=torch.long
+                    )
+                    voxel_edit_add_target_mask = torch.ones(
+                        (B, int(voxel_edit_add_target_coords.shape[-1])),
+                        device=pts_xyz.device,
+                        dtype=torch.bool,
+                    )
+                voxel_edit_final_coords = exact_plan_coords
+                voxel_edit_final_weights = pts_xyz.new_ones(
+                    (B, 1, int(exact_plan_coords.shape[-1]))
+                )
+                voxel_edit_valid_mask = torch.ones(
+                    (B, int(exact_plan_coords.shape[-1])),
+                    device=pts_xyz.device,
+                    dtype=torch.bool,
+                )
+                voxel_edit_debug_list = [{
+                    "initial_count": int(voxel_coords.shape[-1]),
+                    "drop_count": int(exact_counts.get("Prune", 0)),
+                    "add_count": int(exact_counts.get("Add", 0)),
+                    "move_count": int(exact_counts.get("Adjust", 0)),
+                    "same_voxel_move_rejected": 0,
+                    "existing_target_rejected": 0,
+                    "duplicate_target_rejected": 0,
+                    "final_count": int(exact_plan_coords.shape[-1]),
+                    "subtree_prune_count": 0,
+                }]
+                exact_residual_plan_applied = True
+
+        # den6 residual学習の開始時は、forward hard集合を厳密den6 anchorへ一致させる。
+        # Networkのsoft Where/Amount/Action経路は上で計算済みなのでbackwardは維持される。
+        exact_anchor_applied = False
+        exact_guidance = (
+            heuristic_guidance.get("exact_candidate_guidance", {})
+            if isinstance(heuristic_guidance, dict)
+            else {}
+        )
+        exact_anchor_steps = max(
+            int(getattr(self.args, "heuristic_guidance_exact_anchor_steps", 0)),
+            0,
+        )
+        exact_anchor_coords = (
+            exact_guidance.get("anchor_final_voxel_coords", None)
+            if isinstance(exact_guidance, dict)
+            else None
+        )
+        if (
+            exact_den6_candidate_mode
+            and (not exact_residual_plan_applied)
+            and str(structure.get("octree_input_mode", "")).strip().lower() == "full_cloud"
+            and int(getattr(self.args, "_global_train_step", 0)) < exact_anchor_steps
+            and torch.is_tensor(exact_anchor_coords)
+        ):
+            anchor_coords = exact_anchor_coords.detach().to(
+                device=pts_xyz.device, dtype=torch.long
+            )
+            if anchor_coords.ndim == 2:
+                anchor_coords = (
+                    anchor_coords.unsqueeze(0)
+                    if anchor_coords.shape[0] == 3
+                    else anchor_coords.transpose(0, 1).contiguous().unsqueeze(0)
+                )
+            elif anchor_coords.ndim == 3 and anchor_coords.shape[1] != 3 and anchor_coords.shape[-1] == 3:
+                anchor_coords = anchor_coords.permute(0, 2, 1).contiguous()
+            if anchor_coords.ndim != 3 or anchor_coords.shape[0] != 1 or anchor_coords.shape[1] != 3:
+                raise RuntimeError("ana_den6 exact anchorの座標shapeが不正である")
+            if B != 1:
+                raise RuntimeError("ana_den6 exact anchorはbatch=1 full-cloud学習だけを受け付ける")
+            anchor_counts = dict(exact_guidance.get("anchor_operation_counts") or {})
+            voxel_edit_final_coords = anchor_coords
+            voxel_edit_final_weights = pts_xyz.new_ones((1, 1, int(anchor_coords.shape[-1])))
+            voxel_edit_valid_mask = torch.ones(
+                (1, int(anchor_coords.shape[-1])), device=pts_xyz.device, dtype=torch.bool
+            )
+            voxel_edit_debug_list = [{
+                "initial_count": int(voxel_coords.shape[-1]),
+                "drop_count": int(anchor_counts.get("Prune", 0)),
+                "add_count": int(anchor_counts.get("Add", 0)),
+                "move_count": int(anchor_counts.get("Adjust", 0)),
+                "same_voxel_move_rejected": 0,
+                "existing_target_rejected": 0,
+                "duplicate_target_rejected": 0,
+                "final_count": int(anchor_coords.shape[-1]),
+                "subtree_prune_count": 0,
+            }]
+            exact_anchor_applied = True
+
+        override_final_voxel_coords = (
+            leaf_diag_for_override.get("actual_oracle_override_final_voxel_coords", None)
+            if isinstance(leaf_diag_for_override, dict)
+            else None
+        )
+        if (
+            (not exact_anchor_applied)
+            and actual_oracle_enabled
+            and actual_oracle_apply_teacher_actions
+            and torch.is_tensor(override_final_voxel_coords)
+        ):
+            override_coords = override_final_voxel_coords.detach().to(device=pts_xyz.device, dtype=torch.long)
+            if override_coords.ndim == 2:
+                override_coords = (
+                    override_coords.transpose(0, 1).contiguous().unsqueeze(0)
+                    if override_coords.shape[-1] == 3
+                    else override_coords.unsqueeze(0)
+                )
+            elif override_coords.ndim == 3 and override_coords.shape[1] != 3 and override_coords.shape[-1] == 3:
+                override_coords = override_coords.permute(0, 2, 1).contiguous()
+            if override_coords.ndim == 3 and override_coords.shape[1] == 3 and override_coords.shape[-1] > 0:
+                if override_coords.shape[0] == 1 and B > 1:
+                    override_coords = override_coords.expand(B, -1, -1).contiguous()
+                if override_coords.shape[0] == B:
+                    actual_oracle_override_move_count_value = max(
+                        int(leaf_diag_for_override.get("actual_oracle_override_move_count", 0) or 0),
+                        0,
+                    )
+                    actual_oracle_override_drop_count_value = max(
+                        int(leaf_diag_for_override.get("actual_oracle_override_drop_count", 0) or 0),
+                        0,
+                    )
+                    actual_oracle_override_add_count_value = max(
+                        int(leaf_diag_for_override.get("actual_oracle_override_add_count", 0) or 0),
+                        0,
+                    )
+                    actual_oracle_override_subtree_prune_count_value = max(
+                        int(
+                            leaf_diag_for_override.get(
+                                "actual_oracle_override_subtree_prune_count",
+                                0,
+                            )
+                            or 0
+                        ),
+                        0,
+                    )
+                    voxel_edit_final_coords = override_coords
+                    voxel_edit_final_weights = pts_xyz.new_ones((B, 1, int(override_coords.shape[-1])))
+                    voxel_edit_valid_mask = torch.ones(
+                        (B, int(override_coords.shape[-1])),
+                        device=pts_xyz.device,
+                        dtype=torch.bool,
+                    )
+                    voxel_edit_debug_list = [
+                        {
+                            "initial_count": int(voxel_coords.shape[-1]),
+                            "drop_count": int(actual_oracle_override_drop_count_value),
+                            "add_count": int(actual_oracle_override_add_count_value),
+                            "move_count": int(actual_oracle_override_move_count_value),
+                            "same_voxel_move_rejected": 0,
+                            "existing_target_rejected": 0,
+                            "duplicate_target_rejected": 0,
+                            "final_count": int(override_coords.shape[-1]),
+                            "subtree_prune_count": int(
+                                actual_oracle_override_subtree_prune_count_value
+                            ),
+                        }
+                        for _ in range(B)
+                    ]
+
+        voxel_edit_initial_count_value = int(sum(item.get("initial_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_final_count_value = int(sum(item.get("final_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_drop_count_value = int(sum(item.get("drop_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_add_count_value = int(sum(item.get("add_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_move_count_value = int(sum(item.get("move_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_same_voxel_move_rejected_value = int(sum(item.get("same_voxel_move_rejected", 0) for item in voxel_edit_debug_list))
+        voxel_edit_existing_target_rejected_value = int(sum(item.get("existing_target_rejected", 0) for item in voxel_edit_debug_list))
+        voxel_edit_duplicate_target_rejected_value = int(sum(item.get("duplicate_target_rejected", 0) for item in voxel_edit_debug_list))
+
+        voxel_edit_child_slot_rejected_value = int(
+            (voxel_edit_move_source_mask & (~voxel_edit_move_child_slot_mask)).detach().sum().item()
+        )
+        voxel_edit_empty_target_rejected_value = int(
+            (voxel_edit_move_source_mask & (~voxel_edit_move_target_empty_mask)).detach().sum().item()
+        )
+
+        delete_target_voxel_count_value = self._unique_voxel_count_from_cache(voxel_cache, hard_drop_mask)
+        delete_removed_point_count_value = int(hard_drop_mask.detach().sum().item())
+        delete_emptied_voxel_count_value = self._selected_voxels_absent_count(
+            voxel_coords,
+            hard_drop_mask,
+            final_voxel_coords,
+            hard_keep_mask,
+        )
+        move_source_voxel_count_value = self._unique_voxel_count_from_cache(voxel_cache, hard_move_mask)
+        move_target_voxel_count_value = self._unique_voxel_count(move_target_voxel_coords, hard_move_mask)
+        move_source_emptied_voxel_count_value = self._selected_voxels_absent_count(
+            voxel_coords,
+            hard_move_mask,
+            final_voxel_coords,
+            hard_keep_mask,
+        )
+        move_target_new_voxel_count_value = self._selected_voxels_absent_count(
+            move_target_voxel_coords,
+            hard_move_mask,
+            voxel_coords,
+            selection_bool,
+        )
+        move_source_not_emptied_count_value = max(
+            int(move_source_voxel_count_value) - int(move_source_emptied_voxel_count_value),
+            0,
+        )
+        same_voxel_adjust_count_value = int(same_voxel_move_mask.detach().sum().item())
+        moved_different_voxel_count_value = int(moved_different_voxel_mask.detach().sum().item())
+        if actual_oracle_override_move_count_value > 0:
+            move_source_voxel_count_value = max(
+                int(move_source_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+            move_target_voxel_count_value = max(
+                int(move_target_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+            move_source_emptied_voxel_count_value = max(
+                int(move_source_emptied_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+            move_target_new_voxel_count_value = max(
+                int(move_target_new_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+            moved_different_voxel_count_value = max(
+                int(moved_different_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+        delete_candidate_voxel_count_value = self._unique_voxel_count_from_cache(voxel_cache, delete_candidate_mask)
+        hard_delete_selection_voxel_count_value = self._unique_voxel_count_from_cache(
+            voxel_cache,
+            hard_delete_selection_mask.squeeze(1),
+        )
+        actual_oracle_force_no_edit_used = bool(
+            getattr(self.args, "sparsepcgc_actual_oracle_force_no_edit", False)
+            and float(leaf_operation_masks.get("actual_oracle_noop_label_weight", 0.0) or 0.0) > 0.0
+            and int(leaf_operation_masks.get("actual_oracle_noop_label_count", 0) or 0) > 0
+            and not actual_oracle_has_drop
+        )
+        hard_drop_count_value = int(hard_drop.detach().sum().item())
+        if hard_drop_count_value <= 0 and hard_drop_block_reason == "network_learned_hard_drop":
+            hard_drop_block_reason = "network_learned_hard_drop_zero"
+        algorithmic_proposal_noop_selected = bool(
+            algorithmic_proposal_selector_active
+            and hard_drop_count_value <= 0
+            and hard_drop_target_ratio_value <= 0.0
+        )
+        last_hard_drop_trace = hard_drop_trace_debug if isinstance(hard_drop_trace_debug, dict) else {}
+        pre_round_target_count_value = float(last_hard_drop_trace.get("pre_round_target_count", 0.0))
+        post_round_target_count_value = float(last_hard_drop_trace.get("post_round_target_count", 0.0))
+        hard_mask_count_value = float(last_hard_drop_trace.get("hard_mask_count", 0.0))
+        min_hard_drop_count_floor_applied = bool(last_hard_drop_trace.get("min_count_floor_applied", False))
+        phase0_network_mode_but_hard_drop_zero = bool(
+            phase0_network_prune_mode
+            and delete_candidate_voxel_count_value > 0
+            and hard_drop_count_value <= 0
+        )
+        phase0_collapse_reason = ""
+        if phase0_network_mode_but_hard_drop_zero:
+            if delete_candidate_voxel_count_value <= 0:
+                phase0_collapse_reason = f"candidate_empty:{delete_candidate_empty_reason or 'unknown'}"
+            elif not hard_prune_actual_allowed:
+                phase0_collapse_reason = "hard_prune_gate_blocked"
+            elif learned_drop_ratio_value <= 0.0:
+                phase0_collapse_reason = "effective_ratio_zero"
+            elif post_round_target_count_value <= 0.0:
+                phase0_collapse_reason = "target_count_zero"
+            elif hard_mask_count_value <= 0.0:
+                phase0_collapse_reason = "hard_threshold_or_score_zero"
+            elif actual_oracle_force_no_edit_used:
+                phase0_collapse_reason = "force_no_edit"
+            else:
+                phase0_collapse_reason = "unknown"
+        phase0_noop_only_collapse_detected = bool(
+            phase0_network_mode_but_hard_drop_zero or (phase0_network_prune_mode and learned_drop_ratio_value <= 0.0)
+        )
+        hard_drop_count_trace = ""
+        if self._should_collect_runtime_debug():
+            hard_drop_count_trace = (
+            "codec_prune_prior_phase="
+            f"{float(codec_prune_prior_phase):.6g}, "
+            f"codec_prune_prior_base_ratio={float(codec_prune_prior_ratio):.6g}, "
+            f"codec_prune_prior_active_ratio={float(codec_prune_prior_active_ratio):.6g}, "
+            f"codec_prune_prior_count_alpha={float(codec_prune_prior_count_alpha):.6g}, "
+            f"raw_learned_drop_ratio={float(raw_learned_drop_ratio.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_before_floor={float(learned_drop_ratio_before_floor.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_after_floor={float(learned_drop_ratio_after_floor.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_before_gate={float(learned_drop_ratio_before_gate.detach().mean().item()):.6g}, "
+            f"drop_operation_gate={float(drop_operation_gate.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_after_gate={float(learned_drop_ratio_after_gate.detach().mean().item()):.6g}, "
+            f"effective_drop_ratio_for_hard_count={float(effective_drop_ratio_for_hard_count.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_value={float(learned_drop_ratio_value):.6g}, "
+            f"hard_drop_target_ratio_source={hard_drop_target_ratio_source}, "
+            f"hard_drop_target_ratio_source_id={int(hard_drop_target_ratio_source_id)}, "
+            f"hard_drop_target_ratio_value={float(hard_drop_target_ratio_value):.6g}, "
+            f"hard_drop_target_ratio_network_value={float(hard_drop_target_ratio_network_value):.6g}, "
+            f"hard_drop_target_ratio_codec_prior_value={float(hard_drop_target_ratio_codec_prior_value):.6g}, "
+            f"voxel_count={float(last_hard_drop_trace.get('voxel_count', 0.0)):.6g}, "
+            f"pre_round_target_count={pre_round_target_count_value:.6g}, "
+            f"post_round_target_count={post_round_target_count_value:.6g}, "
+            f"min_count_floor_applied={min_hard_drop_count_floor_applied}, "
+            f"delete_candidate_count={float(delete_candidate_voxel_count_value):.6g}, "
+            f"hard_delete_selection_count={float(hard_delete_selection_voxel_count_value):.6g}, "
+            f"delete_candidate_empty_reason={delete_candidate_empty_reason}, "
+            f"codec_block_valid_point_count={float(last_hard_drop_trace.get('codec_block_valid_point_count', 0.0)):.6g}, "
+            f"codec_block_budget_points={float(last_hard_drop_trace.get('codec_block_budget_points', 0.0)):.6g}, "
+            f"codec_block_count={float(last_hard_drop_trace.get('codec_block_count', 0.0)):.6g}, "
+            f"codec_block_selected_block_count={float(last_hard_drop_trace.get('codec_block_selected_block_count', 0.0)):.6g}, "
+            f"codec_block_selected_point_count={float(last_hard_drop_trace.get('codec_block_selected_point_count', 0.0)):.6g}, "
+            f"codec_block_budget_zero={bool(last_hard_drop_trace.get('codec_block_budget_zero', False))}, "
+            f"codec_block_target_drop_ratio={float(last_hard_drop_trace.get('codec_block_target_drop_ratio', 0.0)):.6g}, "
+            f"codec_block_under_selected={bool(last_hard_drop_trace.get('codec_block_under_selected', False))}, "
+            f"hard_mask_count={hard_mask_count_value:.6g}, "
+            f"final_hard_drop_count={float(last_hard_drop_trace.get('final_hard_drop_count', float(hard_drop_count_value))):.6g}, "
+            f"selected_drop_count_hard={float(hard_drop_count_value):.6g}, "
+            f"drop_ratio_hard={float(drop_ratio_hard.detach().mean().item()):.6g}"
+            )
+        hard_move_count_value = int(hard_move.detach().sum().item())
+        raw_hard_move_count_value = int(raw_hard_move_bool.detach().sum().item())
+        adjusted_point_rate_value = float(hard_move_count_value) / max(float(B * N), 1.0)
+        sparsepcgc_source_unique_voxel_count_value = self._unique_voxel_count(
+            source_sparsepcgc_coords,
+            hard_move_mask,
+        )
+        sparsepcgc_target_unique_voxel_count_value = self._unique_voxel_count(
+            target_sparsepcgc_coords,
+            hard_move_mask,
+        )
+        sparsepcgc_target_duplicate_voxel_count_value = max(
+            int(hard_move_count_value) - int(sparsepcgc_target_unique_voxel_count_value),
+            0,
+        )
+        sparsepcgc_target_duplicate_rate_value = (
+            float(sparsepcgc_target_duplicate_voxel_count_value) / max(float(hard_move_count_value), 1.0)
+        )
+        final_move_bool = hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
+        target_existing_occupied_count_value = int(
+            (final_move_bool & target_existing_occupied_mask).detach().sum().item()
+        )
+        target_empty_voxel_count_value = max(
+            int(hard_move_count_value) - int(target_existing_occupied_count_value),
+            0,
+        )
+        target_existing_occupied_rate_value = (
+            float(target_existing_occupied_count_value) / max(float(hard_move_count_value), 1.0)
+        )
+        target_empty_voxel_rate_value = (
+            float(target_empty_voxel_count_value) / max(float(hard_move_count_value), 1.0)
+        )
+        empty_guard_rejected_count_value = int(empty_guard_reject_bool.detach().sum().item())
+        target_duplicate_guard_rejected_count_value = int(duplicate_guard_reject_bool.detach().sum().item())
+        sparsepcgc_guard_rejected_count_value = int(guard_rejected_bool.detach().sum().item())
+        preserve_hard = (~hard_drop_mask) & (~hard_move_mask)
+        preserve_ratio = preserve_hard.to(dtype=pts_xyz.dtype).mean()
+        after_occupied_voxels = voxel_edit_final_count_value if voxel_edit_state_enabled else point_aligned_after_occupied_voxels
+
+        delta_norm = torch.linalg.norm(delta, dim=1, keepdim=True)
+        voxel_norm_safe = voxel_norm.clamp_min(self._numeric_floor(voxel_norm, default=1e-6))
+        normalized_delta = delta_norm / voxel_norm_safe
+        edit_reg = self._masked_mean(normalized_delta.pow(2) * hard_move, selection_mask)
+        moved_points = hard_move.sum().clamp_min(1.0)
+        moved_delta_mean = (delta_norm * hard_move).sum() / moved_points
+
+        repair_gate_mean = self._masked_mean(repair_gate, selection_mask)
+
+        # targetなしAmount学習では、repair対象率もtargetへ寄せない。
+        # max_repair_ratioを超えた場合だけ罰する。
+        ratio_loss = torch.relu(
+            repair_gate_mean - repair_gate_mean.new_tensor(float(max_repair_ratio))
+        ).pow(2)
+
+        shape_guard = self._masked_mean(repair_gate * shape_score, selection_mask)
+        drop_ratio = drop_ratio_soft
+        if threshold_cap_mode or bool(getattr(self.args, "repair_learn_operation_amounts", True)):
+            # 操作量を学習する場合は固定削除率へ引っ張らず、静的上限だけを守る。
+            drop_ratio_loss = torch.relu(drop_ratio - drop_ratio.new_tensor(float(max_drop_ratio))) ** 2
+        else:
+            drop_ratio_loss = (drop_ratio - target_drop_ratio) ** 2
+        drop_cap_loss = torch.relu(drop_ratio - max_drop_ratio) ** 2
+        # shape guardは0〜1に収めたSoft削除強度で計算する。
+        # STE本体のsoft_drop_probは量勾配用、guardは過大値を避けるためsoft_drop_prob_for_guardを使う。
+        drop_shape_guard = self._masked_mean(soft_drop_prob_for_guard * shape_score, selection_mask)
+        # Prune Where勾配をdrop_headへ戻すため、Prune soft proxyはdrop_prob_proxyを主に使う。
+        # target量ではなく、どの点を削るとrate/structureが変わるかを学習させる。
+        prune_drop_signal = (
+            0.10 * soft_drop_prob_for_guard.detach()
+            + 0.90 * drop_prob_proxy
+        ).clamp(0.0, 1.0)
+        prune_keep_signal = (1.0 - prune_drop_signal).clamp(0.0, 1.0)
+        leaf_delete_gain = (
+            voxel_point_counts <= float(max(delete_max_points, 1))
+        ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        prune_geom_importance = (
+            0.50
+            + 2.00 * shape_score
+            + 0.75 * preserve
+            + 0.25 * (1.0 - local_outlier_score.clamp(0.0, 1.0))
+        ).detach().clamp(0.0, 4.0)
+        prune_rate_importance = (
+            0.50
+            + 1.00 * p_comp
+            + 0.75 * p_chain
+            + 0.50 * p_sibling
+            + 0.50 * node_score
+            + 0.75 * single_score
+            + 0.50 * quant_score
+            + 0.50 * sparse_score
+            + 0.25 * lowprob_score
+            + 0.50 * local_outlier_score
+            + 0.75 * leaf_delete_gain
+        ).detach().clamp(0.0, 6.0)
+        prune_node_importance = (0.50 + 1.50 * node_score + 0.75 * leaf_delete_gain).detach().clamp(0.0, 4.0)
+        prune_single_importance = (0.50 + 2.00 * single_score + 0.75 * p_chain + 0.50 * p_sibling).detach().clamp(0.0, 4.0)
+        prune_bit_importance = (
+            prune_rate_importance + 0.50 * prune_node_importance + 0.25 * prune_single_importance
+        ).detach().clamp(0.0, 8.0)
+        prune_soft_geom = self._masked_mean(prune_drop_signal * prune_geom_importance, selection_mask)
+        prune_soft_rate = self._masked_mean(prune_keep_signal * prune_rate_importance, selection_mask)
+        prune_soft_node = self._masked_mean(prune_keep_signal * prune_node_importance, selection_mask)
+        prune_soft_single = self._masked_mean(prune_keep_signal * prune_single_importance, selection_mask)
+        prune_soft_bit = self._masked_mean(prune_keep_signal * prune_bit_importance, selection_mask)
+        drop_prob_direct_mean = self._masked_mean(drop_prob_direct, selection_mask)
+        drop_prob_proxy_mean = self._masked_mean(drop_prob_proxy, selection_mask)
+        amount_target_mode = str(
+            getattr(self.args, "repair_amount_target_mode", "none")
+        ).strip().lower()
+        if amount_target_mode == "target":
+            drop_direct_target = drop_prob_proxy_mean.new_tensor(float(target_drop_ratio))
+            drop_direct_target_loss = (drop_prob_proxy_mean - drop_direct_target).pow(2)
+        else:
+            drop_direct_target_loss = drop_prob_proxy_mean.new_zeros(())
+        drop_entropy_point = -(
+            drop_prob_proxy.clamp(1e-6, 1.0 - 1e-6) * drop_prob_proxy.clamp(1e-6, 1.0).log()
+            + (1.0 - drop_prob_proxy).clamp(1e-6, 1.0) * (1.0 - drop_prob_proxy).clamp(1e-6, 1.0).log()
+        )
+        drop_entropy = self._masked_mean(drop_entropy_point, selection_mask)
+        soft_drop_mass = drop_prob_proxy.sum()
+        # Local guardは0〜1に収めたSoft削除強度とMove強度を使う。
+        local_edit_guard = self._masked_mean(
+            (soft_drop_prob_for_guard + move_mask_for_guard).clamp(0.0, 1.0) * shape_score,
+            selection_mask,
+        )
+        # ============================================================
+        # targetなしAmount学習
+        # ============================================================
+        # Amount headを固定targetへ寄せると、L_comではなくtarget方向へ学習が進む。
+        # そのため、repair_amount_target_mode='none' では
+        # direct/logit target損失を0にする。
+        #
+        # Amountの学習は以下で行う。
+        #   1. L_comから実操作へ戻る下流勾配
+        #   2. Soft/Hard実行量と learned_*_ratio の整合性
+        #   3. 上限cap超過ペナルティ
+        # ============================================================
+        if amount_target_mode == "target":
+            drop_amount_target = learned_drop_ratio.new_tensor(
+                float(getattr(self.args, "target_drop_ratio", 0.0)) if prune_enabled else 0.0
+            ).clamp(0.0, float(max_drop_ratio))
+
+            move_amount_target = learned_move_ratio.new_tensor(
+                float(getattr(self.args, "target_move_ratio", 0.0)) if disp_enabled else 0.0
+            ).clamp(0.0, float(max_move_ratio))
+
+            add_amount_target = learned_add_ratio.new_tensor(
+                float(getattr(self.args, "target_add_ratio", 0.0)) if add_enabled else 0.0
+            ).clamp(0.0, float(max_add_ratio_value))
+
+            drop_amount_logit = self._operation_amount_logit(
+                actuator_features,
+                self.drop_amount_head,
+            ).mean()
+
+            add_amount_logit = self._operation_amount_logit(
+                actuator_features,
+                self.add_amount_head,
+            ).mean()
+
+            move_amount_logit = self._operation_amount_logit(
+                actuator_features,
+                self.move_amount_head,
+            ).mean()
+
+            drop_amount_target_logit = self._target_ratio_logit(
+                drop_amount_target.detach(),
+                max_drop_ratio,
+                learned_drop_ratio,
+            )
+
+            add_amount_target_logit = self._target_ratio_logit(
+                add_amount_target.detach(),
+                max_add_ratio_value,
+                learned_add_ratio,
+            )
+
+            move_amount_target_logit = self._target_ratio_logit(
+                move_amount_target.detach(),
+                max_move_ratio,
+                learned_move_ratio,
+            )
+
+            operation_amount_logit_loss = (
+                (drop_amount_logit - drop_amount_target_logit.detach()).pow(2)
+                + (add_amount_logit - add_amount_target_logit.detach()).pow(2)
+                + (move_amount_logit - move_amount_target_logit.detach()).pow(2)
+            )
+
+            operation_amount_direct_loss = (
+                (learned_drop_ratio.mean() - drop_amount_target).pow(2)
+                + (learned_move_ratio.mean() - move_amount_target).pow(2)
+                + (learned_add_ratio.mean() - add_amount_target).pow(2)
+            )
+        else:
+            # targetなしAmount学習では、固定targetへ寄せる損失は使わない。
+            # ただし後段のdebug_tensors / returnで参照されるため、
+            # target系Tensorは0として必ず定義しておく。
+            drop_amount_target = learned_drop_ratio.new_zeros(())
+            move_amount_target = learned_move_ratio.new_zeros(())
+            add_amount_target = learned_add_ratio.new_zeros(())
+
+            drop_amount_target_logit = learned_drop_ratio.new_zeros(())
+            move_amount_target_logit = learned_move_ratio.new_zeros(())
+            add_amount_target_logit = learned_add_ratio.new_zeros(())
+
+            drop_amount_logit = learned_drop_ratio.new_zeros(())
+            move_amount_logit = learned_move_ratio.new_zeros(())
+            add_amount_logit = learned_add_ratio.new_zeros(())
+
+            operation_amount_logit_loss = learned_drop_ratio.new_zeros(())
+            operation_amount_direct_loss = learned_drop_ratio.new_zeros(())
+
+
+        # Addは古い add_ratio ではなく、target voxel単位のsoft実行率を使う。
+        # hard-soft consistency は hard側をdetachし、soft側だけを学習対象にする。
+        add_hard_soft_consistency_loss = (
+            add_ratio_soft - add_ratio_hard.detach()
+        ).abs()
+
+        operation_amount_consistency_loss = (
+            (drop_ratio - learned_drop_ratio.mean()).pow(2)
+            + (move_ratio_soft - learned_move_ratio.mean()).pow(2)
+            + (add_ratio_soft - learned_add_ratio.mean()).pow(2)
+            + add_hard_soft_consistency_loss
+        )
+
+        if torch.is_tensor(operation_gate_prob) and operation_gate_prob.ndim >= 3:
+            operation_ratio_vec = operation_gate_prob.float().mean(dim=(0, 2)).clamp_min(0.0)
+        else:
+            operation_ratio_vec = torch.stack(
+                [drop_ratio, move_ratio_soft, add_ratio_soft]
+            ).clamp_min(0.0)
+        operation_ratio_prob = operation_ratio_vec / operation_ratio_vec.sum().clamp_min(1e-6)
+        operation_entropy = -(operation_ratio_prob * operation_ratio_prob.clamp_min(1e-6).log()).sum()
+        operation_entropy_weight_raw = max(
+            float(getattr(self.args, "repair_operation_entropy_weight", 0.0)),
+            0.0,
+        )
+        operation_entropy_warmup_steps = max(
+            int(getattr(self.args, "repair_operation_entropy_warmup_steps", 0)),
+            0,
+        )
+        if operation_entropy_weight_raw > 0.0 and operation_entropy_warmup_steps > 0:
+            train_step_for_entropy = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+            operation_entropy_phase = max(
+                1.0 - float(train_step_for_entropy) / float(operation_entropy_warmup_steps),
+                0.0,
+            )
+        elif operation_entropy_weight_raw > 0.0:
+            operation_entropy_phase = 1.0
+        else:
+            operation_entropy_phase = 0.0
+        operation_entropy_weight_effective = operation_entropy_weight_raw * operation_entropy_phase
+        operation_entropy_loss = -operation_entropy.new_tensor(
+            float(operation_entropy_weight_effective)
+        ) * operation_entropy
+        soft_activity_loss = (
+            drop_prob.mean()
+            + learned_drop_prob
+            + drop_prob_proxy.mean()
+            + move_score.mean()
+            + add_prob.mean()
+            + learned_drop_ratio.mean()
+            + learned_move_ratio.mean()
+            + learned_add_ratio.mean()
+        )
+        exploration_noise = max(float(drop_score_noise), float(move_score_noise), float(add_score_noise))
+        operation_temperature = float(getattr(self.args, "repair_priority_gate_tau", getattr(self.args, "repair_policy_temperature", 1.0)))
+        # ============================================================
+        # Where headへ直接かけるActuator補助損失
+        # ============================================================
+        # 目的
+        # ・圧縮損失ではなく、L_actuator側からWhere headへ勾配を流す
+        # ・Amount headではなく、drop_head / add_head / move source score側を更新する
+        # ・hard選択結果は教師としてdetachし、soft score側だけを学習させる
+        # ============================================================
+
+        eps = torch.finfo(pts_xyz.dtype).eps
+
+        # ------------------------------------------------------------
+        # Prune Where補助損失
+        # ------------------------------------------------------------
+        # hard_dropはdetachして教師にする。
+        # soft_drop_prob_for_guard側だけに勾配を流す。
+        # これにより drop_head にActuator損失由来の勾配が出る。
+        drop_where_actuator_loss = pts_xyz.new_zeros(())
+        if prune_enabled:
+            # ========================================================
+            # Prune Where補助損失は drop_prob_proxy に直接かける。
+            # soft_drop_prob_for_ste は hard/guard/予算/clamp を経由しており、
+            # drop_head への勾配確認用としては遠すぎる。
+            # ========================================================
+            drop_where_pred = torch.nan_to_num(
+                drop_prob_proxy,
+                nan=0.5,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(eps, 1.0 - eps)
+
+            drop_where_target = torch.nan_to_num(
+                hard_drop.detach(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+
+            with torch.cuda.amp.autocast(enabled=False):
+                drop_where_loss_raw = torch.nn.functional.binary_cross_entropy(
+                    drop_where_pred.float(),
+                    drop_where_target.float(),
+                    reduction="none",
+                )
+
+            # selection_mask がある場合だけ対象点に制限する。
+            # ただし delete_candidate_weight では重み付けしない。
+            # それを使うと、候補枯渇時にまた drop_head 勾配が0になる。
+            if selection_mask is not None:
+                where_loss_weight = selection_mask.to(
+                    device=drop_where_loss_raw.device,
+                    dtype=drop_where_loss_raw.dtype,
+                )
+                if where_loss_weight.ndim == 2:
+                    where_loss_weight = where_loss_weight.unsqueeze(1)
+                denom = where_loss_weight.sum().clamp_min(1.0)
+                drop_where_actuator_loss = (drop_where_loss_raw * where_loss_weight.float()).sum() / denom
+            else:
+                drop_where_actuator_loss = drop_where_loss_raw.mean()
+
+        # ------------------------------------------------------------
+        # Move Where補助損失
+        # ------------------------------------------------------------
+        # hard_moveはdetachして教師にする。
+        # soft_move_score_for_guard側だけに勾配を流す。
+        # これによりMove source選択側にActuator損失由来の勾配が出る。
+        move_where_actuator_loss = pts_xyz.new_zeros(())
+        if disp_enabled:
+            move_where_pred = torch.nan_to_num(
+                soft_move_score_for_guard,
+                nan=0.5,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(eps, 1.0 - eps)
+
+            move_where_target = torch.nan_to_num(
+                hard_move.detach(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            with torch.cuda.amp.autocast(enabled=False):
+                move_where_actuator_loss = torch.nn.functional.binary_cross_entropy(
+                    move_where_pred.float(),
+                    move_where_target.float(),
+                )
+
+        # ------------------------------------------------------------
+        # Add Where補助損失
+        # ------------------------------------------------------------
+        # Addはsource点単位ではなく、target voxel pair単位で選んでいる。
+        # そのため soft_add_pair / hard_add_pair を使う。
+        # これにより add_head と add_voxel_head にActuator損失由来の勾配が出る。
+        add_where_actuator_loss = pts_xyz.new_zeros(())
+        if add_enabled and soft_add_pair.numel() > 0 and hard_add_pair.numel() > 0:
+            add_where_pred = torch.nan_to_num(
+                soft_add_pair,
+                nan=0.5,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(eps, 1.0 - eps)
+
+            add_where_target = torch.nan_to_num(
+                hard_add_pair.detach(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            with torch.cuda.amp.autocast(enabled=False):
+                add_where_actuator_loss = torch.nn.functional.binary_cross_entropy(
+                    add_where_pred.float(),
+                    add_where_target.float(),
+                )
+
+        # ------------------------------------------------------------
+        # Actual SparsePCGC oracle candidate supervision
+        # ------------------------------------------------------------
+        # Forward編集は「actualで改善確認済み」の候補だけに限定する。
+        # ただし、実Codecで悪化した候補もwhere/gateの負例として学習へ入れる。
+        # これにより悪化編集を実際に出力してL_comを壊さず、
+        # Actuatorは「選ぶべき候補」と「避けるべき候補」の両方を覚えられる。
+        operation_gate_oracle_loss = pts_xyz.new_zeros(())
+        actual_oracle_drop_bad_count_value = 0
+        actual_oracle_add_bad_count_value = 0
+        actual_oracle_move_bad_count_value = 0
+        actual_oracle_candidate_where_loss = pts_xyz.new_zeros(())
+        actual_oracle_direction_supervision_loss = pts_xyz.new_zeros(())
+        if actual_oracle_enabled:
+            oracle_candidate_weight = max(
+                float(getattr(self.args, "sparsepcgc_actual_oracle_candidate_where_weight", 1.0)),
+                0.0,
+            )
+
+
+            def _oracle_where_bce_logits(logit, good_mask, bad_mask, bad_score):
+                good_mask = good_mask.to(device=logit.device, dtype=torch.bool)
+                bad_mask = bad_mask.to(device=logit.device, dtype=torch.bool) & (~good_mask)
+                valid = good_mask | bad_mask
+                if not bool(valid.detach().any().item()):
+                    return logit.new_zeros(()), 0
+                target = good_mask.to(device=logit.device, dtype=logit.dtype)
+                weight = torch.ones_like(logit, dtype=logit.dtype)
+                if torch.is_tensor(bad_score):
+                    weight = weight + bad_mask.to(dtype=logit.dtype) * bad_score.to(
+                        device=logit.device,
+                        dtype=logit.dtype,
+                    ).clamp(0.0, 5.0)
+                safe_logit = torch.nan_to_num(
+                    logit,
+                    nan=0.0,
+                    posinf=30.0,
+                    neginf=-30.0,
+                )
+                logit_clip = max(
+                    float(getattr(self.args, "sparsepcgc_actual_oracle_candidate_logit_clip", 20.0)),
+                    1.0,
+                )
+                clipped_logit = safe_logit.clamp(-float(logit_clip), float(logit_clip))
+                safe_logit = safe_logit + (clipped_logit - safe_logit).detach()
+                with torch.cuda.amp.autocast(enabled=False):
+                    raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                        safe_logit.float(),
+                        target.float(),
+                        reduction="none",
+                    )
+                valid_f = valid.to(device=raw.device, dtype=raw.dtype)
+                denom = (valid_f * weight.float()).sum().clamp_min(1.0)
+                loss_value = (raw * valid_f * weight.float()).sum() / denom
+                return loss_value.to(dtype=logit.dtype), int(bad_mask.detach().sum().item())
+
+            def _oracle_direction_loss(logits, good_mask, good_index, bad_mask, bad_index):
+                class_count = int(logits.shape[1])
+                good_index = good_index.to(device=logits.device, dtype=torch.long)
+                bad_mask = bad_mask.to(device=logits.device, dtype=torch.bool)
+                good_valid = (
+                    good_mask.to(device=logits.device, dtype=torch.bool)
+                    & (good_index >= 0)
+                    & (good_index < class_count)
+                )
+                bad_valid = bad_mask & (~good_valid)
+                if not bool((good_valid | bad_valid).detach().any().item()):
+                    return logits.new_zeros(())
+                safe_logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+                good_logit = safe_logits.gather(1, good_index.clamp(0, class_count - 1))
+                # A rejected direction suppresses the currently preferred direction,
+                # leaving the remaining empty-neighbor directions available to explore.
+                bad_logit = safe_logits.amax(dim=1, keepdim=True)
+                with torch.cuda.amp.autocast(enabled=False):
+                    good_raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                        good_logit.float(),
+                        torch.ones_like(good_logit, dtype=torch.float32),
+                        reduction="none",
+                    )
+                    bad_raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                        bad_logit.float(),
+                        torch.zeros_like(bad_logit, dtype=torch.float32),
+                        reduction="none",
+                    )
+                valid = good_valid | bad_valid
+                raw = good_raw * good_valid.float() + bad_raw * bad_valid.float()
+                return (raw.sum() / valid.float().sum().clamp_min(1.0)).to(dtype=logits.dtype)
+
+            if prune_enabled and (actual_oracle_has_drop or actual_oracle_has_bad_drop):
+                drop_oracle_loss, actual_oracle_drop_bad_count_value = _oracle_where_bce_logits(
+                    learned_drop_logit / drop_proxy_tau,
+                    leaf_delete_op_mask,
+                    actual_oracle_drop_bad_mask,
+                    actual_oracle_drop_bad_score,
+                )
+                drop_where_actuator_loss = drop_where_actuator_loss + oracle_candidate_weight * drop_oracle_loss
+                actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + drop_oracle_loss
+
+            if add_enabled and (actual_oracle_has_add or actual_oracle_has_bad_add):
+                # Add headは同じ入力に対して上で既に実行済みである。
+                # 補助教師用に再forwardすると全点headとbackward graphを重複して
+                # 作るため、同一Tensorから同じvoxel平均だけを計算する。
+                oracle_add_logit = learned_add_logit
+                oracle_add_logit = self._voxel_mean_logits(
+                    oracle_add_logit,
+                    voxel_coords,
+                    voxel_cache=voxel_cache,
+                )
+                add_oracle_loss, actual_oracle_add_bad_count_value = _oracle_where_bce_logits(
+                    oracle_add_logit,
+                    leaf_add_op_mask,
+                    actual_oracle_add_bad_mask,
+                    actual_oracle_add_bad_score,
+                )
+                add_where_actuator_loss = add_where_actuator_loss + oracle_candidate_weight * add_oracle_loss
+                actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + add_oracle_loss
+                # learned_add_direction_logitsはbias加算前の同じhead出力であり、
+                # oracleが必要とする値と一致するため再利用する。
+                oracle_add_direction_logits = learned_add_direction_logits
+                if actual_oracle_has_bad_add and not actual_oracle_has_add:
+                    bad_direction_mask = actual_oracle_add_bad_mask.to(
+                        device=oracle_add_direction_logits.device,
+                        dtype=oracle_add_direction_logits.dtype,
+                    )
+                    bad_direction_logit = oracle_add_direction_logits.amax(dim=1, keepdim=True)
+                    add_direction_oracle_loss = (
+                        torch.nn.functional.softplus(bad_direction_logit.float())
+                        * bad_direction_mask.float()
+                    ).sum() / bad_direction_mask.float().sum().clamp_min(1.0)
+                    add_direction_oracle_loss = add_direction_oracle_loss.to(
+                        dtype=oracle_add_direction_logits.dtype
+                    )
+                else:
+                    add_direction_oracle_loss = _oracle_direction_loss(
+                        oracle_add_direction_logits,
+                        leaf_add_op_mask,
+                        actual_oracle_add_direction_index,
+                        actual_oracle_add_bad_mask,
+                        actual_oracle_bad_add_direction_index,
+                    )
+                add_direction_oracle_loss = (
+                    float(getattr(self.args, "sparsepcgc_actual_oracle_direction_weight", 1.0))
+                    * add_direction_oracle_loss
+                )
+                add_where_actuator_loss = (
+                    add_where_actuator_loss + oracle_candidate_weight * add_direction_oracle_loss
+                )
+                actual_oracle_candidate_where_loss = (
+                    actual_oracle_candidate_where_loss + add_direction_oracle_loss
+                )
+                actual_oracle_direction_supervision_loss = (
+                    actual_oracle_direction_supervision_loss + add_direction_oracle_loss
+                )
+
+            if disp_enabled and (actual_oracle_has_move or actual_oracle_has_bad_move):
+                subtree_move_oracle_loss, actual_oracle_move_bad_count_value = _oracle_where_bce_logits(
+                    subtree_move_source_logit,
+                    leaf_move_op_mask,
+                    actual_oracle_move_bad_mask,
+                    actual_oracle_move_bad_score,
+                )
+                move_where_actuator_loss = (
+                    move_where_actuator_loss + oracle_candidate_weight * subtree_move_oracle_loss
+                )
+                # Adjust方向headも同じ入力に対して既に計算済みである。
+                oracle_move_direction_logits = learned_move_direction_logits
+                move_direction_oracle_loss = _oracle_direction_loss(
+                    oracle_move_direction_logits,
+                    leaf_move_op_mask,
+                    actual_oracle_move_direction_index,
+                    actual_oracle_move_bad_mask,
+                    actual_oracle_bad_move_direction_index,
+                )
+                move_direction_oracle_loss = (
+                    float(getattr(self.args, "sparsepcgc_actual_oracle_direction_weight", 1.0))
+                    * move_direction_oracle_loss
+                )
+                move_where_actuator_loss = (
+                    move_where_actuator_loss + oracle_candidate_weight * move_direction_oracle_loss
+                )
+                actual_oracle_candidate_where_loss = (
+                    actual_oracle_candidate_where_loss
+                    + subtree_move_oracle_loss
+                    + move_direction_oracle_loss
+                )
+                actual_oracle_direction_supervision_loss = (
+                    actual_oracle_direction_supervision_loss + move_direction_oracle_loss
+                )
+
+            gate_known = operation_gate_prob.new_tensor(
+                [
+                    1.0 if (actual_oracle_has_drop or actual_oracle_has_bad_drop) else 0.0,
+                    1.0 if (actual_oracle_has_add or actual_oracle_has_bad_add) else 0.0,
+                    1.0 if (actual_oracle_has_move or actual_oracle_has_bad_move) else 0.0,
+                ]
+            ).view(1, 3, 1)
+            gate_target = operation_gate_prob.new_tensor(
+                [
+                    1.0 if actual_oracle_has_drop else 0.0,
+                    1.0 if actual_oracle_has_add else 0.0,
+                    1.0 if actual_oracle_has_move else 0.0,
+                ]
+            ).view(1, 3, 1)
+            gate_pred = torch.sigmoid(operation_gate_logit).clamp(eps, 1.0 - eps)
+            with torch.cuda.amp.autocast(enabled=False):
+                gate_loss_raw = torch.nn.functional.binary_cross_entropy(
+                    gate_pred.float(),
+                    gate_target.expand_as(gate_pred).float(),
+                    reduction="none",
+                )
+            gate_known = gate_known.expand_as(gate_loss_raw).float()
+            operation_gate_oracle_loss = (
+                gate_loss_raw * gate_known
+            ).sum() / gate_known.sum().clamp_min(1.0)
+        # ============================================================
+        # L_actuator に入る補助損失の finite 化
+        # ============================================================
+        # 目的:
+        # ・Actuator内部の一部損失が inf / nan になっても L_total 全体を壊さない
+        # ・BCE, CE, 正規化除算, logit補助損失の異常値をここで止める
+        # ============================================================
+        def _finite_actuator_loss(x):
+            if not torch.is_tensor(x):
+                return pts_xyz.new_tensor(float(x))
+            return torch.nan_to_num(
+                x,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+        edit_reg = _finite_actuator_loss(edit_reg)
+        ratio_loss = _finite_actuator_loss(ratio_loss)
+        shape_guard = _finite_actuator_loss(shape_guard)
+
+        drop_ratio_loss = _finite_actuator_loss(drop_ratio_loss)
+        drop_cap_loss = _finite_actuator_loss(drop_cap_loss)
+        drop_shape_guard = _finite_actuator_loss(drop_shape_guard)
+        drop_direct_target_loss = _finite_actuator_loss(drop_direct_target_loss)
+        drop_entropy = _finite_actuator_loss(drop_entropy)
+
+        add_ratio_loss = _finite_actuator_loss(add_ratio_loss)
+        add_shape_guard = _finite_actuator_loss(add_shape_guard)
+        add_offset_reg = _finite_actuator_loss(add_offset_reg)
+        add_drop_conflict_loss = _finite_actuator_loss(add_drop_conflict_loss)
+        added_keep_loss = _finite_actuator_loss(added_keep_loss)
+        add_min_offset_loss = _finite_actuator_loss(add_min_offset_loss)
+
+        quant_move_conflict_loss = _finite_actuator_loss(quant_move_conflict_loss)
+        quant_add_guard = _finite_actuator_loss(quant_add_guard)
+        empty_target_violation_loss = _finite_actuator_loss(empty_target_violation_loss)
+        target_duplicate_voxel_loss = _finite_actuator_loss(target_duplicate_voxel_loss)
+        local_edit_guard = _finite_actuator_loss(local_edit_guard)
+
+        operation_amount_consistency_loss = _finite_actuator_loss(operation_amount_consistency_loss)
+        operation_amount_direct_loss = _finite_actuator_loss(operation_amount_direct_loss)
+        operation_amount_logit_loss = _finite_actuator_loss(operation_amount_logit_loss)
+        operation_entropy_loss = _finite_actuator_loss(operation_entropy_loss)
+        soft_activity_loss = _finite_actuator_loss(soft_activity_loss)
+
+        move_direction_ce = _finite_actuator_loss(move_direction_ce)
+        add_direction_ce = _finite_actuator_loss(add_direction_ce)
+
+        drop_where_actuator_loss = _finite_actuator_loss(drop_where_actuator_loss)
+        add_where_actuator_loss = _finite_actuator_loss(add_where_actuator_loss)
+        move_where_actuator_loss = _finite_actuator_loss(move_where_actuator_loss)
+        operation_gate_oracle_loss = _finite_actuator_loss(operation_gate_oracle_loss)
+        actual_oracle_candidate_where_loss = _finite_actuator_loss(actual_oracle_candidate_where_loss)
+        actual_oracle_direction_supervision_loss = _finite_actuator_loss(
+            actual_oracle_direction_supervision_loss
+        )
+        codec_prior_where_distill_loss = _finite_actuator_loss(codec_prior_where_distill_loss)
+        codec_prior_amount_distill_loss = _finite_actuator_loss(codec_prior_amount_distill_loss)
+        post_warmup_amount_teacher_loss = _finite_actuator_loss(post_warmup_amount_teacher_loss)
+        algorithmic_amount_selector_teacher_loss = _finite_actuator_loss(
+            algorithmic_amount_selector_teacher_loss
+        )
+        algorithmic_amount_residual_teacher_loss = _finite_actuator_loss(
+            algorithmic_amount_residual_teacher_loss
+        )
+        drop_amount_supervision_loss = _finite_actuator_loss(drop_amount_supervision_loss)
+        drop_amount_soft_consistency_loss = _finite_actuator_loss(drop_amount_soft_consistency_loss)
+        move_amount_supervision_loss = _finite_actuator_loss(move_amount_supervision_loss)
+        move_amount_soft_consistency_loss = _finite_actuator_loss(move_amount_soft_consistency_loss)
+        add_amount_supervision_loss = _finite_actuator_loss(add_amount_supervision_loss)
+        add_amount_soft_consistency_loss = _finite_actuator_loss(add_amount_soft_consistency_loss)
+        actual_oracle_drop_amount_loss = _finite_actuator_loss(actual_oracle_drop_amount_loss)
+        actual_oracle_add_amount_loss = _finite_actuator_loss(actual_oracle_add_amount_loss)
+        actual_oracle_move_amount_loss = _finite_actuator_loss(actual_oracle_move_amount_loss)
+        actual_oracle_drop_amount_logit_loss = _finite_actuator_loss(actual_oracle_drop_amount_logit_loss)
+        actual_oracle_add_amount_logit_loss = _finite_actuator_loss(actual_oracle_add_amount_logit_loss)
+        actual_oracle_move_amount_logit_loss = _finite_actuator_loss(actual_oracle_move_amount_logit_loss)
+        actual_oracle_amount_supervision_loss = (
+            actual_oracle_drop_amount_loss
+            + actual_oracle_add_amount_loss
+            + actual_oracle_move_amount_loss
+        )
+
+        # 既存den6の確定済み単一planを使うbootstrapでは、hard forwardを教師へ
+        # 合わせるだけでなく、Poolを外した後もNetwork単独で再現できるよう
+        # Where/Amount/Action/方向headへbehavior-cloning損失を返す。
+        teacher_behavior_clone_loss = pts_xyz.new_zeros(())
+        teacher_behavior_clone_terms = {}
+        if self.training and teacher_guided_single_proposal:
+            def _sampled_where_distill(logits, operation):
+                """Distil the dense den6 rule, never a selected candidate/plan."""
+                if not torch.is_tensor(logits):
+                    return pts_xyz.new_zeros(())
+                target = self._fit_heuristic_where_prior(
+                    heuristic_guidance, operation, logits
+                ).detach()
+                point_count = int(logits.shape[-1])
+                max_points = max(int(getattr(
+                    self.args, "heuristic_guidance_distill_max_points", 65536
+                )), 1)
+                amount_priors = heuristic_guidance.get("amount_prior", {})
+                ratio = max(float(amount_priors.get(operation, 0.0)), 0.0)
+                # A uniform sample can miss almost all of the 0.05--0.10%
+                # high-score region.  Include that region explicitly, then
+                # cover the whole cloud uniformly.  This is ranking a single
+                # dense rule map, not enumerating/editing/evaluating plans.
+                positive_count = min(
+                    max(int(math.ceil(ratio * point_count)), 1),
+                    point_count,
+                    max(max_points // 2, 1),
+                )
+                terms = []
+                for batch_index in range(int(logits.shape[0])):
+                    target_b = target[batch_index, 0]
+                    logits_b = logits[batch_index, 0]
+                    positive_index = torch.topk(
+                        target_b, k=positive_count, largest=True, sorted=False
+                    ).indices
+                    uniform_count = min(max_points - positive_count, point_count)
+                    if uniform_count > 0:
+                        uniform_index = torch.linspace(
+                            0, point_count - 1, steps=uniform_count,
+                            device=logits.device, dtype=torch.float32,
+                        ).round().to(dtype=torch.long)
+                        index = torch.unique(torch.cat([
+                            positive_index, uniform_index
+                        ], dim=0))
+                    else:
+                        index = positive_index
+                    sampled_logits = logits_b.index_select(0, index)
+                    sampled_target = target_b.index_select(0, index).clamp(0.01, 0.99)
+                    score_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                        sampled_logits, sampled_target
+                    )
+                    positive_mask = torch.zeros(
+                        point_count, device=logits.device, dtype=torch.bool
+                    )
+                    positive_mask[positive_index] = True
+                    negative_index = index[~positive_mask.index_select(0, index)]
+                    if int(negative_index.numel()) > 0:
+                        positive_mean = logits_b.index_select(0, positive_index).mean()
+                        negative_mean = logits_b.index_select(0, negative_index).mean()
+                        rank_loss = torch.nn.functional.softplus(
+                            1.0 - positive_mean + negative_mean
+                        )
+                        score_loss = score_loss + 0.25 * rank_loss
+                    terms.append(score_loss)
+                return torch.stack(terms).mean() if terms else logits.new_zeros(())
+
+            teacher_where_prune = _sampled_where_distill(raw_drop_logit, "Prune")
+            teacher_where_add = _sampled_where_distill(learned_add_logit, "Add")
+            teacher_where_adjust = _sampled_where_distill(
+                subtree_move_source_logit, "Adjust"
+            )
+
+            direction_terms = []
+            direction_logits_by_operation = {
+                "Add": learned_add_direction_logits,
+                "Adjust": learned_move_direction_logits,
+            }
+            direction_target_by_operation = {
+                "Add": exact_add_target_bias,
+                "Adjust": exact_move_target_bias,
+            }
+            for operation, logits in direction_logits_by_operation.items():
+                target_value = direction_target_by_operation[operation]
+                if not torch.is_tensor(logits) or not torch.is_tensor(target_value):
+                    continue
+                target = target_value.detach().gt(0).to(
+                    dtype=logits.dtype
+                )
+                valid_source = target.any(dim=1).reshape(-1).nonzero(
+                    as_tuple=False
+                ).reshape(-1)
+                if int(valid_source.numel()) == 0:
+                    continue
+                max_sources = max(int(getattr(
+                    self.args, "heuristic_guidance_distill_max_direction_sources", 4096
+                )), 1)
+                if int(valid_source.numel()) > max_sources:
+                    sample = torch.linspace(
+                        0, int(valid_source.numel()) - 1, steps=max_sources,
+                        device=logits.device, dtype=torch.float32,
+                    ).round().to(dtype=torch.long)
+                    valid_source = valid_source.index_select(0, sample)
+                flat_logits = logits.permute(0, 2, 1).reshape(-1, logits.shape[1])
+                flat_target = target.permute(0, 2, 1).reshape(-1, target.shape[1])
+                direction_terms.append(
+                    torch.nn.functional.binary_cross_entropy_with_logits(
+                        flat_logits.index_select(0, valid_source),
+                        flat_target.index_select(0, valid_source),
+                    )
+                )
+            teacher_direction = (
+                torch.stack(direction_terms).mean()
+                if direction_terms else pts_xyz.new_zeros(())
+            )
+
+            action_target = torch.ones_like(operation_gate_logit)
+            teacher_action = torch.nn.functional.binary_cross_entropy_with_logits(
+                operation_gate_logit, action_target
+            )
+            amount_priors = heuristic_guidance.get("amount_prior", {})
+            teacher_amount_terms = []
+            for operation, learned, maximum in (
+                ("Prune", raw_learned_drop_ratio, max_drop_ratio),
+                ("Add", raw_learned_add_ratio, max_add_ratio_value),
+                ("Adjust", raw_learned_move_ratio, max_move_ratio),
+            ):
+                if float(maximum) <= 0.0:
+                    continue
+                target = learned.new_tensor(
+                    min(max(float(amount_priors.get(operation, 0.0)), 0.0), float(maximum))
+                    / float(maximum)
+                )
+                prediction = (learned / float(maximum)).clamp(0.0, 1.0)
+                teacher_amount_terms.append((prediction - target).pow(2).mean())
+            teacher_amount = (
+                torch.stack(teacher_amount_terms).mean()
+                if teacher_amount_terms else pts_xyz.new_zeros(())
+            )
+            teacher_behavior_clone_terms = {
+                "where_prune": teacher_where_prune,
+                "where_add": teacher_where_add,
+                "where_adjust": teacher_where_adjust,
+                "direction": teacher_direction,
+                "amount": teacher_amount,
+                "action": teacher_action,
+            }
+            teacher_behavior_clone_loss = torch.stack(
+                list(teacher_behavior_clone_terms.values())
+            ).mean()
+            exact_residual_plan_debug["teacher_behavior_clone_loss"] = (
+                teacher_behavior_clone_loss.detach()
+            )
+            exact_residual_plan_debug["network_only_distill_terms"] = {
+                name: value.detach()
+                for name, value in teacher_behavior_clone_terms.items()
+            }
+            exact_residual_plan_debug["network_only_distill_active"] = True
+
+        loss = (
+            edit_reg
+            + float(getattr(self.args, "repair_ratio_weight", 0.1)) * ratio_loss
+            + float(getattr(self.args, "repair_shape_guard_weight", 0.05)) * shape_guard
+            + float(getattr(self.args, "repair_drop_ratio_weight", 1.0)) * (drop_ratio_loss + drop_cap_loss)
+            + float(getattr(self.args, "repair_drop_shape_guard_weight", 0.5)) * drop_shape_guard
+            + float(getattr(self.args, "repair_drop_direct_target_weight", 5.0)) * drop_direct_target_loss
+            + float(getattr(self.args, "repair_drop_entropy_weight", 0.01)) * drop_entropy
+            + float(getattr(self.args, "repair_add_ratio_weight", 4.0)) * add_ratio_loss
+            + float(getattr(self.args, "repair_add_shape_guard_weight", 0.5)) * add_shape_guard
+            + float(getattr(self.args, "repair_add_offset_weight", 0.25)) * add_offset_reg
+            + float(getattr(self.args, "repair_add_drop_conflict_weight", 2.0)) * add_drop_conflict_loss
+            + float(getattr(self.args, "repair_add_keep_weight", 1.0)) * added_keep_loss
+            + float(getattr(self.args, "repair_add_min_offset_weight", 0.5)) * add_min_offset_loss
+            + float(getattr(self.args, "repair_quant_guard_weight", 1.0)) * (quant_move_conflict_loss + quant_add_guard)
+            + float(getattr(self.args, "sparsepcgc_empty_target_penalty_weight", 0.0)) * empty_target_violation_loss
+            + float(getattr(self.args, "sparsepcgc_target_duplicate_penalty_weight", 0.0)) * target_duplicate_voxel_loss
+            + float(getattr(self.args, "repair_local_guard_weight", 0.25)) * local_edit_guard
+            + float(getattr(self.args, "repair_operation_amount_consistency_weight", 0.01)) * operation_amount_consistency_loss
+            + float(getattr(self.args, "repair_operation_amount_direct_weight", 0.01)) * operation_amount_direct_loss
+            + float(getattr(self.args, "repair_operation_amount_logit_weight", 1e-4)) * operation_amount_logit_loss
+            + operation_entropy_loss
+            + float(getattr(self.args, "repair_soft_activity_weight", 1e-3)) * soft_activity_loss
+            + float(getattr(self.args, "repair_move_direction_ce_weight", 1e-3)) * move_direction_ce
+            + float(getattr(self.args, "repair_add_direction_ce_weight", 1e-3)) * add_direction_ce
+            + float(getattr(self.args, "repair_drop_where_actuator_weight", 0.1)) * drop_where_actuator_loss
+            + float(getattr(self.args, "sparsepcgc_codec_prior_distill_weight", 0.05)) * codec_prior_where_distill_loss
+            + float(getattr(self.args, "sparsepcgc_codec_prior_amount_distill_weight", 0.0)) * codec_prior_amount_distill_loss
+            + float(post_warmup_amount_teacher_weight_effective) * post_warmup_amount_teacher_loss
+            + float(getattr(self.args, "sparsepcgc_algorithmic_amount_selector_teacher_weight", 0.08))
+            * (
+                algorithmic_amount_selector_teacher_loss
+                + algorithmic_amount_residual_teacher_loss
+            )
+            + float(getattr(self.args, "repair_add_where_actuator_weight", 0.1)) * add_where_actuator_loss
+            + float(getattr(self.args, "repair_move_where_actuator_weight", 0.1)) * move_where_actuator_loss
+            + float(getattr(self.args, "repair_operation_gate_oracle_weight", 0.1)) * operation_gate_oracle_loss
+            # 量headは補助損失ではなく、主に圧縮損失で操作量を学習させる。
+            # ここは勾配を完全に死なせないための弱い足場に留める。
+            + float(getattr(self.args, "repair_drop_amount_supervision_weight", 0.001)) * drop_amount_supervision_loss
+            + float(getattr(self.args, "repair_drop_amount_soft_consistency_weight", 0.0005)) * drop_amount_soft_consistency_loss
+            + float(getattr(self.args, "repair_move_amount_supervision_weight", 0.001)) * move_amount_supervision_loss
+            + float(getattr(self.args, "repair_move_amount_soft_consistency_weight", 0.0005)) * move_amount_soft_consistency_loss
+            + float(getattr(self.args, "repair_add_amount_supervision_weight", 0.001)) * add_amount_supervision_loss
+            + float(getattr(self.args, "repair_add_amount_soft_consistency_weight", 0.0005)) * add_amount_soft_consistency_loss
+            + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_weight", 0.05))
+            * actual_oracle_amount_supervision_loss
+            + float(getattr(self.args, "sparsepcgc_actual_oracle_direction_loss_weight", 0.01))
+            * actual_oracle_direction_supervision_loss
+            + float(getattr(self.args, "heuristic_guidance_teacher_distill_weight", 0.10))
+            * teacher_behavior_clone_loss
+        )
+        loss = torch.nan_to_num(
+            loss,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        # if not hasattr(self, "_printed_amount_grad_debug_loss"):
+        #     amount_params = [
+        #         self.drop_amount_head.weight,
+        #         self.drop_amount_head.bias,
+        #         self.add_amount_head.weight,
+        #         self.add_amount_head.bias,
+        #         self.move_amount_head.weight,
+        #         self.move_amount_head.bias,
+        #     ]
+
+        #     amount_grads = torch.autograd.grad(
+        #         loss,
+        #         amount_params,
+        #         retain_graph=True,
+        #         create_graph=False,
+        #         allow_unused=True,
+        #     )
+
+        #     def _grad_norm(g):
+        #         if g is None:
+        #             return None
+        #         return float(g.detach().float().norm().cpu())
+
+        #     print(
+        #         "[AmountGradDebug:actuator_loss]",
+        #         "drop_w=", _grad_norm(amount_grads[0]),
+        #         "drop_b=", _grad_norm(amount_grads[1]),
+        #         "add_w=", _grad_norm(amount_grads[2]),
+        #         "add_b=", _grad_norm(amount_grads[3]),
+        #         "move_w=", _grad_norm(amount_grads[4]),
+        #         "move_b=", _grad_norm(amount_grads[5]),
+        #     )
+        #     self._printed_amount_grad_debug_loss = True
+        
+        if timing_enabled:
+            _mark_runtime("postprocess")
+            runtime_timing["total"] = float(time.perf_counter() - runtime_start)
+            self.last_runtime_timing = runtime_timing
+        else:
+            self.last_runtime_timing = {}
+
+        # Actuatorのhard/soft出力の統計を取る比較モード。学習中の挙動確認や、学習比率headの効果確認に。
+        if bool(getattr(self.args, "print_actuator_hard_soft_compare", False)):
+            with torch.no_grad():
+                def _mf(x):
+                    if torch.is_tensor(x):
+                        return float(x.detach().float().mean().cpu())
+                    return float(x)
+
+                def _sf(x):
+                    if torch.is_tensor(x):
+                        return float(x.detach().float().sum().cpu())
+                    return float(x)
+
+                def _corr(a, b):
+                    a = a.detach().float().reshape(-1)
+                    b = b.detach().float().reshape(-1)
+                    if a.numel() <= 1 or b.numel() <= 1:
+                        return 0.0
+                    a = a - a.mean()
+                    b = b - b.mean()
+                    denom = a.norm() * b.norm()
+                    if float(denom.cpu()) <= 1e-12:
+                        return 0.0
+                    return float((a * b).sum().div(denom).cpu())
+
+                drop_hard_mean = _mf(hard_drop)
+
+                # 最終的なSoft削除量はsoft_drop_probだが、表示用平均は0〜1に収めた値を見る。
+                # drop_prob は位置score寄り、soft_drop_prob_for_guard は量headで予算化された削除強度である。
+                drop_soft_mean = _mf(soft_drop_prob_for_guard)
+                drop_score_soft_mean = _mf(drop_prob)
+
+                drop_proxy_mean = _mf(drop_prob_proxy)
+                drop_direct_mean = _mf(drop_prob_direct)
+
+                drop_abs_diff = _mf((hard_drop - soft_drop_prob_for_guard).abs())
+                drop_corr = _corr(hard_drop, soft_drop_prob_for_guard)
+
+                drop_ratio_soft_value = _mf(drop_ratio_soft)
+                drop_ratio_hard_value = _mf(drop_ratio_hard)
+
+                # 点数基準の差。
+                drop_amount_abs_diff = abs(_sf(soft_drop_prob_for_guard) - _sf(hard_drop))
+
+                # Voxel数基準の差。
+                drop_amount_voxel_abs_diff = abs(_sf(soft_drop_voxel_mass_per_batch) - _sf(hard_drop_voxel_mass_per_batch))
+                drop_amount_ratio_abs_diff = abs(drop_ratio_soft_value - drop_ratio_hard_value)
+
+                soft_drop_budget_mean = _mf(soft_drop_budget)
+
+                # 点数基準のsum。
+                soft_drop_sum_value = _sf(soft_drop_prob_for_guard)
+                hard_drop_sum_value = _sf(hard_drop)
+
+                # Voxel数基準のsum。
+                soft_drop_voxel_sum_value = _sf(soft_drop_voxel_mass_per_batch)
+                hard_drop_voxel_sum_value = _sf(hard_drop_voxel_mass_per_batch)
+
+                valid_delete_voxel_count_value = _sf(valid_delete_voxel_count)
+
+                # move_score は位置score寄り、soft_move_score_for_guard は量headで予算化されたMove強度である。
+                move_score_soft_mean = _mf(move_score)
+                move_soft_mean = _mf(soft_move_score_for_guard)
+                move_hard_mean = _mf(hard_move)
+                move_mask_mean = _mf(move_mask_for_guard)
+
+                move_abs_diff = _mf((hard_move - soft_move_score_for_guard).abs())
+                move_corr = _corr(hard_move, soft_move_score_for_guard)
+
+                move_ratio_soft_value = _mf(move_ratio_soft)
+                move_ratio_hard_value = _mf(move_ratio_hard)
+
+                # 点数基準の差。
+                move_amount_abs_diff = abs(_sf(soft_move_score_for_guard) - _sf(hard_move))
+
+                # Voxel数基準の差。
+                move_amount_voxel_abs_diff = abs(
+                    _sf(soft_move_voxel_mass_per_batch) - _sf(hard_move_voxel_mass_per_batch)
+                )
+                move_amount_ratio_abs_diff = abs(move_ratio_soft_value - move_ratio_hard_value)
+
+                soft_move_budget_mean = _mf(soft_move_budget)
+
+                # 点数基準のsum。
+                soft_move_sum_value = _sf(soft_move_score_for_guard)
+                hard_move_sum_value = _sf(hard_move)
+
+                # Voxel数基準のsum。
+                soft_move_voxel_sum_value = _sf(soft_move_voxel_mass_per_batch)
+                hard_move_voxel_sum_value = _sf(hard_move_voxel_mass_per_batch)
+
+                valid_move_source_voxel_count_value = _sf(valid_move_source_voxel_count)
+                valid_move_source_voxel_count_effective_value = _sf(valid_move_source_voxel_count_effective)
+
+                move_dir_conf = _mf(move_probs.max(dim=1, keepdim=True).values)
+                move_dir_entropy = _mf(
+                    -(move_probs.clamp_min(1e-8).log() * move_probs).sum(dim=1, keepdim=True)
+                )
+
+                # add_probはsource点単位に畳んだ補助信号。
+                # Add量の主比較はtarget voxel単位で見る。
+                add_soft_mean = _mf(add_target_soft_add)
+                add_soft_sum = _sf(add_target_soft_add)
+                add_ratio_soft_value = _mf(add_ratio_soft)
+                add_ratio_hard_value = _mf(add_ratio_hard)
+
+                add_amount_abs_diff = abs(
+                    _sf(add_target_soft_add) - _sf(add_target_hard_add)
+                )
+                add_amount_ratio_abs_diff = abs(add_ratio_soft_value - add_ratio_hard_value)
+                add_soft_budget_mean = _mf(soft_add_budget)
+
+                # pair単位は補助ログとして残す。
+                add_soft_pair_sum = _sf(soft_add_pair)
+                add_hard_pair_sum = _sf(hard_add_pair)
+
+                # target voxel単位の主ログ。
+                add_target_soft_add_sum = _sf(add_target_soft_add)
+                add_target_hard_add_sum = _sf(add_target_hard_add)
+                add_target_soft_hard_sum_abs_diff = abs(
+                    add_target_soft_add_sum - add_target_hard_add_sum
+                )
+                final_w_mean = _mf(final_w)
+                final_w_min = float(final_w.detach().float().amin().cpu()) if final_w.numel() > 0 else 0.0
+                final_w_max = float(final_w.detach().float().amax().cpu()) if final_w.numel() > 0 else 0.0
+
+                # ============================================================
+                # Adjustのguard後Soft/Hard比較
+                # ============================================================
+                # 既存のmove_soft_meanはguard前Softを見ている可能性がある。
+                # そのため、Hard実行に対応するguard後Softで比較する。
+                move_soft_effective_mean = _mf(soft_move_score_effective)
+                move_source_soft_keep_mean = _mf(move_source_soft_keep)
+                move_target_soft_add_mean = _mf(move_target_soft_add)
+
+                move_abs_diff_effective = _mf(
+                    (hard_move - soft_move_score_effective).abs()
+                )
+                move_corr_effective = _corr(
+                    hard_move,
+                    soft_move_score_effective,
+                )
+
+                raw_hard_move_mean = _mf(
+                    raw_hard_move_bool.to(dtype=pts_xyz.dtype).unsqueeze(1)
+                )
+
+                move_guard_reject_rate = (
+                    float(raw_hard_move_count_value - hard_move_count_value)
+                    / max(float(raw_hard_move_count_value), 1.0)
+                )
+
+                print(
+                    "[ActuatorHardSoftCompare] "
+                    f"drop_soft_mean={drop_soft_mean:.6f}, "
+                    f"drop_score_soft_mean={drop_score_soft_mean:.6f}, "
+                    f"drop_hard_mean={drop_hard_mean:.6f}, "
+                    f"drop_abs_diff={drop_abs_diff:.6f}, "
+                    f"drop_corr={drop_corr:.6f}, "
+                    f"drop_proxy_mean={drop_proxy_mean:.6f}, "
+                    f"drop_direct_mean={drop_direct_mean:.6f}, "
+                    f"drop_ratio_soft={drop_ratio_soft_value:.6f}, "
+                    f"drop_ratio_hard={drop_ratio_hard_value:.6f}, "
+                    f"drop_amount_abs_diff={drop_amount_abs_diff:.6f}, "
+                    f"drop_amount_voxel_abs_diff={drop_amount_voxel_abs_diff:.6f}, "
+                    f"drop_amount_ratio_abs_diff={drop_amount_ratio_abs_diff:.6f}, "
+                    f"soft_drop_budget_mean={soft_drop_budget_mean:.6f}, "
+                    f"soft_drop_sum={soft_drop_sum_value:.6f}, "
+                    f"hard_drop_sum={hard_drop_sum_value:.6f}, "
+                    f"soft_drop_voxel_sum={soft_drop_voxel_sum_value:.6f}, "
+                    f"hard_drop_voxel_sum={hard_drop_voxel_sum_value:.6f}, "
+                    f"valid_delete_voxel_count={valid_delete_voxel_count_value:.6f}, "
+                    f"hard_drop_count={hard_drop_count_value}, "
+                    f"delete_target_voxel_count={delete_target_voxel_count_value}, "
+                    f"delete_emptied_voxel_count={delete_emptied_voxel_count_value}, "
+                    f"move_soft_mean={move_soft_mean:.6f}, "
+                    f"move_score_soft_mean={move_score_soft_mean:.6f}, "
+                    f"move_hard_mean={move_hard_mean:.6f}, "
+                    f"move_mask_mean={move_mask_mean:.6f}, "
+                    f"move_abs_diff={move_abs_diff:.6f}, "
+                    f"move_corr={move_corr:.6f}, "
+                    f"move_soft_effective_mean={move_soft_effective_mean:.6f}, "
+                    f"move_abs_diff_effective={move_abs_diff_effective:.6f}, "
+                    f"move_corr_effective={move_corr_effective:.6f}, "
+                    f"move_source_soft_keep_mean={move_source_soft_keep_mean:.6f}, "
+                    f"move_target_soft_add_mean={move_target_soft_add_mean:.6f}, "
+                    f"raw_hard_move_mean={raw_hard_move_mean:.6f}, "
+                    f"move_guard_reject_rate={move_guard_reject_rate:.6f}, "
+                    f"move_ratio_soft={move_ratio_soft_value:.6f}, "
+                    f"move_ratio_hard={move_ratio_hard_value:.6f}, "
+                    f"move_amount_abs_diff={move_amount_abs_diff:.6f}, "
+                    f"move_amount_voxel_abs_diff={move_amount_voxel_abs_diff:.6f}, "
+                    f"move_amount_ratio_abs_diff={move_amount_ratio_abs_diff:.6f}, "
+                    f"soft_move_budget_mean={soft_move_budget_mean:.6f}, "
+                    f"soft_move_sum={soft_move_sum_value:.6f}, "
+                    f"hard_move_sum={hard_move_sum_value:.6f}, "
+                    f"soft_move_voxel_sum={soft_move_voxel_sum_value:.6f}, "
+                    f"hard_move_voxel_sum={hard_move_voxel_sum_value:.6f}, "
+                    f"valid_move_source_voxel_count={valid_move_source_voxel_count_value:.6f}, "
+                    f"valid_move_source_voxel_count_effective={valid_move_source_voxel_count_effective_value:.6f}, "
+                    f"hard_move_count={hard_move_count_value}, "
+                    f"raw_hard_move_count={raw_hard_move_count_value}, "
+                    f"move_dir_conf={move_dir_conf:.6f}, "
+                    f"move_dir_entropy={move_dir_entropy:.6f}, "
+                    f"add_soft_mean={add_soft_mean:.6f}, "
+                    f"add_soft_sum={add_soft_sum:.6f}, "
+                    f"add_count={add_count_value}, "
+                    f"add_effective_count={add_effective_count_value}, "
+                    f"add_target_voxel_count={add_target_voxel_count_value}, "
+                    f"add_ratio_soft={add_ratio_soft_value:.6f}, "
+                    f"add_ratio_hard={add_ratio_hard_value:.6f}, "
+                    f"add_amount_abs_diff={add_amount_abs_diff:.6f}, "
+                    f"add_amount_ratio_abs_diff={add_amount_ratio_abs_diff:.6f}, "
+                    f"add_soft_budget_mean={add_soft_budget_mean:.6f}, "
+                    f"add_soft_pair_sum={add_soft_pair_sum:.6f}, "
+                    f"add_hard_pair_sum={add_hard_pair_sum:.6f}, "
+                    f"add_target_soft_add_sum={add_target_soft_add_sum:.6f}, "
+                    f"add_target_hard_add_sum={add_target_hard_add_sum:.6f}, "
+                    f"add_target_soft_hard_sum_abs_diff={add_target_soft_hard_sum_abs_diff:.6f}, "
+                    f"learned_drop_ratio={_mf(learned_drop_ratio):.6f}, "
+                    f"learned_move_ratio={_mf(learned_move_ratio):.6f}, "
+                    f"learned_add_ratio={_mf(learned_add_ratio):.6f}, "
+                    f"final_w_mean={final_w_mean:.6f}, "
+                    f"final_w_min={final_w_min:.6f}, "
+                    f"final_w_max={final_w_max:.6f}, "
+                    f"before_voxels={before_occupied_voxels}, "
+                    f"after_voxels={after_occupied_voxels}, "
+                    f"occupied_voxel_delta={after_occupied_voxels - before_occupied_voxels}, "
+                    f"actuator_voxel_mode={actuator_voxel_mode}, "
+                    f"local_recomputed={bool(actuator_local_recomputed)}, "
+                    f"uses_context_voxel_frame={bool(uses_context_voxel_frame)}, "
+                    f"final_voxel_update_mode=state_update_from_initial_voxels, "
+                    f"final_voxel_recomputed_from_pts_out=False, "
+                    f"initial_voxel_point_count={int(voxel_coords.shape[2])}, "
+                    f"final_voxel_point_count={int(final_voxel_coords.shape[2])}, "
+                    f"final_voxel_added_slots={int(final_voxel_coords.shape[2] - voxel_coords.shape[2])}"
+                )
+        # SparsePCGC/Voxel modeでは、Actuatorの公開出力もoccupied voxel状態から復元する。
+        # 点ごとのsoft座標差分はproxy勾配用に内部で使うだけで、出力点群にはしない。
+        voxel_restored_output_enabled = bool(
+            getattr(
+                self.args,
+                "repair_output_voxel_restored_points",
+                sparsepcgc_context and voxel_edit_state_enabled,
+            )
+        )
+        point_soft_delta_debug = delta
+        if voxel_restored_output_enabled and voxel_edit_state_enabled:
+            pts_out = self._voxel_centers_from_global_coords(
+                voxel_edit_final_coords,
+                voxel_step,
+                voxel_offset,
+                dtype=pts_xyz.dtype,
+            )
+            final_w = voxel_edit_final_weights.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            delta = pts_xyz.new_zeros(pts_xyz.shape)
+            delta_norm = torch.zeros_like(delta_norm)
+            moved_delta_mean = pts_xyz.new_zeros(())
+
+        # Phase2: Voxel/Octree出力を点群xyzへ戻すためのdebug経路。
+        canonical_voxel_coords_before = voxel_coords.detach()
+        canonical_voxel_coords_after = (
+            voxel_edit_final_coords.detach()
+            if voxel_edit_state_enabled
+            else final_voxel_coords.detach()
+        )
+
+        voxel_restore_meta = {
+            "global_qs": voxel_step.detach(),
+            "global_offset": voxel_offset.detach(),
+            "effective_qs_tensor": voxel_step.detach(),
+            "global_offset_tensor": voxel_offset.detach(),
+            "voxel_size": float(getattr(self.args, "sparsepcgc_voxel_size", 1.0)),
+            "pos_quantscale": int(getattr(self.args, "sparsepcgc_pos_quantscale", 1)),
+            "quant_mode": str(getattr(self.args, "sparsepcgc_quant_mode", "round_voxel_then_pos")),
+        }
+
+        restored_xyz_debug = None
+        restore_info = {
+            "restore_input_points": int(canonical_voxel_coords_after.shape[-1]),
+            "restore_output_points": int(canonical_voxel_coords_after.shape[-1]),
+            "restore_unique": bool(getattr(self.args, "sparsepcgc_restore_unique_voxels", True)),
+            "restore_center": bool(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+            "restore_has_meta": True,
+        }
+
+        if bool(getattr(self.args, "sparsepcgc_restore_points_debug", False)):
+            with torch.no_grad():
+                restored_xyz_debug, restore_info = restore_points_from_voxel_coords(
+                    canonical_voxel_coords_after,
+                    meta=voxel_restore_meta,
+                    args=self.args,
+                    center=bool(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+                    unique=bool(getattr(self.args, "sparsepcgc_restore_unique_voxels", True)),
+                    dtype=pts_xyz.dtype,
+                    device=pts_xyz.device,
+                )
+                restored_xyz_debug = restored_xyz_debug.detach()
+
+        self.debug_tensors = {
+            # AdjustをSoft Prune + Soft Addとして扱うための情報
+            "operation_amount_direct_loss": operation_amount_direct_loss,
+            "drop_amount_target": drop_amount_target.detach(),
+            "move_amount_target": move_amount_target.detach(),
+            "add_amount_target": add_amount_target.detach(),
+            "move_source_soft_delete": move_source_soft_delete,
+            "move_source_soft_keep": move_source_soft_keep,
+            "move_target_soft_add": move_target_soft_add,
+            "move_source_voxel_coords": voxel_coords,
+            "move_target_voxel_coords": move_target_voxel_coords,
+            "move_soft_score_effective": soft_move_score_effective,
+            "move_soft_value_mode": "soft_prune_source_and_soft_add_target",
+            "full_octree_context_available": pts_xyz.new_tensor(float(full_context_available)).detach(),
+            "actuator_parent_occupancy_code": pts_xyz.new_tensor(float(actuator_parent_occupancy_code)).detach(),
+            "actuator_sibling_count": pts_xyz.new_tensor(float(actuator_sibling_count)).detach(),
+            "actuator_ancestor_count": pts_xyz.new_tensor(float(actuator_ancestor_count)).detach(),
+            "full_context_bonus_mean": full_context_bonus.mean().detach(),
+            "child_slot_candidate_ratio": child_slot_candidate_ratio.detach(),
+            "full_context_bonus_mean": full_context_bonus.mean().detach(),
+
+            # Section4:
+            # leaf pattern priorがActuatorへ入っているか確認するdebug。
+            "leaf_actuator_prior_enabled": pts_xyz.new_tensor(
+                float(bool(leaf_actuator_prior.get("enabled", False)))
+            ).detach(),
+            "leaf_actuator_drop_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("delete_prior_mean", 0.0))
+            ).detach(),
+            "leaf_actuator_add_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("add_prior_mean", 0.0))
+            ).detach(),
+            "leaf_actuator_move_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("move_prior_mean", 0.0))
+            ).detach(),
+            "leaf_actuator_best_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("best_prior_mean", 0.0))
+            ).detach(),
+            "leaf_actuator_best_prior_max": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("best_prior_max", 0.0))
+            ).detach(),
+
+            # Section5:
+            # leaf pattern診断がAdd/Move target方向へ反映されたか確認する。
+            "leaf_target_direction_prior_enabled": pts_xyz.new_tensor(
+                float(bool(leaf_target_direction_prior.get("enabled", False)))
+            ).detach(),
+            "leaf_add_target_match_ratio": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("add_target_match_ratio", 0.0))
+            ).detach(),
+            "leaf_move_target_match_ratio": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("move_target_match_ratio", 0.0))
+            ).detach(),
+            "leaf_add_target_bias_mean": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("add_target_bias_mean", 0.0))
+            ).detach(),
+            "leaf_move_target_bias_mean": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("move_target_bias_mean", 0.0))
+            ).detach(),
+
+            "child_slot_candidate_ratio": child_slot_candidate_ratio.detach(),
+            "repair_gate": repair_gate.mean().detach(),
+            # 既存keyの add_ratio は互換用に残すが、中身は学習用のsoft実行率にする。
+            "add_ratio": add_ratio_soft.detach(),
+            "add_prob_mean": add_prob.mean().detach(),
+            "add_prob_max": add_prob.max().detach() if add_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "add_priority_mean": add_priority.mean().detach(),
+            "add_priority_max": add_priority.max().detach() if add_priority.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "add_candidate_ratio": pts_xyz.new_tensor(float(add_candidate_ratio)).detach(),
+            "add_candidate_count": pts_xyz.new_tensor(float(add_k)).detach(),
+            "add_ratio_soft": add_ratio_soft.detach(),
+            "add_ratio_hard": add_ratio_hard.detach(),
+            "add_amount_supervision_loss": add_amount_supervision_loss.detach(),
+            "add_amount_soft_consistency_loss": add_amount_soft_consistency_loss.detach(),
+            "actual_oracle_drop_amount_loss": actual_oracle_drop_amount_loss.detach(),
+            "actual_oracle_add_amount_loss": actual_oracle_add_amount_loss.detach(),
+            "actual_oracle_move_amount_loss": actual_oracle_move_amount_loss.detach(),
+            "actual_oracle_drop_amount_logit_loss": actual_oracle_drop_amount_logit_loss.detach(),
+            "actual_oracle_add_amount_logit_loss": actual_oracle_add_amount_logit_loss.detach(),
+            "actual_oracle_amount_supervision_loss": actual_oracle_amount_supervision_loss.detach(),
+            "add_soft_budget_mean": soft_add_budget.detach().mean(),
+            "add_soft_pair_sum": soft_add_pair.detach().sum(),
+            "add_hard_pair_sum": hard_add_pair.detach().sum(),
+            "add_soft_hard_sum_abs_diff": (soft_add_pair.detach().sum() - hard_add_pair.detach().sum()).abs(),
+            "add_hard_soft_consistency_loss": add_hard_soft_consistency_loss.detach(),
+            # target voxel単位のAdd Hard/Soft状態。
+            # Addの主指標はこちらを使う。
+            "add_target_soft_add": add_target_soft_add.detach(),
+            "add_target_hard_add": add_target_hard_add.detach(),
+            "add_target_add_st": add_target_add_st.detach(),
+            "add_target_voxel_coords": add_target_voxel_coords.detach(),
+            "add_target_soft_add_sum": add_target_soft_add.detach().sum(),
+            "add_target_hard_add_sum": add_target_hard_add.detach().sum(),
+            "add_target_soft_hard_sum_abs_diff": (
+                add_target_soft_add.detach().sum()
+                - add_target_hard_add.detach().sum()
+            ).abs(),
+            "operation_gate_prob": operation_gate_prob.detach(),
+            "operation_gate_hard": operation_gate_hard.detach(),
+            "heuristic_guidance_enabled": bool(heuristic_guidance is not None),
+            "heuristic_guidance_dataset": str((heuristic_guidance or {}).get("dataset", "")),
+            "heuristic_guidance_scale_m": int((heuristic_guidance or {}).get("scale_m", -1)),
+            "heuristic_guidance_profile_source": str((heuristic_guidance or {}).get("profile_source", "")),
+            "heuristic_guidance_total_ratio": float((heuristic_guidance or {}).get("total_ratio", 0.0)),
+            "heuristic_guidance_add_amount_prior": float(((heuristic_guidance or {}).get("amount_prior", {}) or {}).get("Add", 0.0)),
+            "heuristic_guidance_prune_amount_prior": float(((heuristic_guidance or {}).get("amount_prior", {}) or {}).get("Prune", 0.0)),
+            "heuristic_guidance_adjust_amount_prior": float(((heuristic_guidance or {}).get("amount_prior", {}) or {}).get("Adjust", 0.0)),
+            "operation_gate_logit": operation_gate_logit.detach(),
+            "drop_operation_gate": drop_operation_gate.detach().mean(),
+            "add_operation_gate": add_operation_gate.detach().mean(),
+            "move_operation_gate": move_operation_gate.detach().mean(),
+            "operation_gate_oracle_loss": operation_gate_oracle_loss.detach(),
+            "actual_oracle_candidate_where_loss": actual_oracle_candidate_where_loss.detach(),
+            "actual_oracle_direction_supervision_loss": actual_oracle_direction_supervision_loss.detach(),
+            "actual_oracle_bad_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_bad_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_improving_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_improving_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_combo_extra_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_combo_extra_count", 0))
+            ).detach(),
+            "actual_oracle_generated_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_generated_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_prune_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_prune_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_add_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_add_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_adjust_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_adjust_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_subtree_move_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_subtree_move_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_parent_collapse_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_parent_collapse_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_pattern_canonicalize_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_pattern_canonicalize_count", 0))
+            ).detach(),
+            "actual_oracle_noop_label_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_noop_label_count", 0))
+            ).detach(),
+            "actual_oracle_noop_label_weight": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_noop_label_weight", 0.0))
+            ).detach(),
+            "actual_oracle_high_rate_mppov_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_high_rate_mppov_count", 0))
+            ).detach(),
+            "actual_oracle_low_prob_occupied_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_low_prob_occupied_count", 0))
+            ).detach(),
+            "actual_oracle_single_child_chain_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_single_child_chain_count", 0))
+            ).detach(),
+            "actual_oracle_context_pattern_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_context_pattern_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_eval_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_eval_count", 0))
+            ).detach(),
+            "actual_oracle_eval_max": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_eval_max", 0))
+            ).detach(),
+            "actual_oracle_time": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_time", 0.0))
+            ).detach(),
+            "actual_oracle_drop_bad_count": pts_xyz.new_tensor(float(actual_oracle_drop_bad_count_value)).detach(),
+            "actual_oracle_add_bad_count": pts_xyz.new_tensor(float(actual_oracle_add_bad_count_value)).detach(),
+            "actual_oracle_move_bad_count": pts_xyz.new_tensor(float(actual_oracle_move_bad_count_value)).detach(),
+            "actual_oracle_drop_reason": str(leaf_operation_masks.get("actual_oracle_drop_reason", "")),
+            "actual_oracle_operation": str(leaf_operation_masks.get("actual_oracle_operation", "")),
+            "actual_oracle_scheduled_operation": str(
+                leaf_operation_masks.get("actual_oracle_scheduled_operation", "")
+            ),
+            "actual_oracle_edit_record_bits": pts_xyz.new_tensor(
+                float(actual_oracle_edit_record_bits_value)
+            ).detach(),
+            "actual_oracle_raw_percent": pts_xyz.new_tensor(
+                float(actual_oracle_raw_percent_value)
+            ).detach(),
+            "actual_oracle_delta_actual_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_delta_actual_percent", 0.0))
+            ).detach(),
+            "actual_oracle_proxy_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_proxy_percent", 0.0))
+            ).detach(),
+            "actual_oracle_geometry_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_geometry_percent", 0.0))
+            ).detach(),
+            "actual_oracle_original_actual_bits": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_original_actual_bits", 0.0))
+            ).detach(),
+            "actual_oracle_edited_actual_bits": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_edited_actual_bits", 0.0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_used": pts_xyz.new_tensor(
+                float(bool(leaf_operation_masks.get("actual_oracle_fast_diagnostic_used", False)))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_full_drop_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_full_drop_count", 0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_local_drop_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_count", 0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_full_drop_ratio": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_full_drop_ratio", 0.0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_local_drop_ratio": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0))
+            ).detach(),
+            "actual_oracle_apply_teacher_actions": pts_xyz.new_tensor(
+                float(actual_oracle_apply_teacher_actions)
+            ).detach(),
+            "actual_oracle_force_no_edit_used": pts_xyz.new_tensor(float(actual_oracle_force_no_edit_used)).detach(),
+            "actual_oracle_has_drop": pts_xyz.new_tensor(float(actual_oracle_has_drop)).detach(),
+            "prune_after_prior_mode": prune_after_prior_mode,
+            "phase0_network_prune_mode": pts_xyz.new_tensor(float(phase0_network_prune_mode)).detach(),
+            "legacy_amount_selector_blocked_by_guidance": pts_xyz.new_tensor(
+                float(legacy_amount_selector_blocked_by_guidance)
+            ).detach(),
+            "algorithmic_proposal_selector_enabled": pts_xyz.new_tensor(
+                float(algorithmic_proposal_selector_enabled)
+            ).detach(),
+            "algorithmic_proposal_selector_active": pts_xyz.new_tensor(
+                float(algorithmic_proposal_selector_active)
+            ).detach(),
+            "algorithmic_proposal_where_source_id": pts_xyz.new_tensor(
+                float(algorithmic_proposal_where_source_id)
+            ).detach(),
+            "algorithmic_proposal_noop_selected": pts_xyz.new_tensor(
+                float(algorithmic_proposal_noop_selected)
+            ).detach(),
+            "algorithmic_amount_selected_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_class_value)
+            ).detach(),
+            "algorithmic_amount_selected_bin_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_bin_ratio_value)
+            ).detach(),
+            "algorithmic_amount_residual": pts_xyz.new_tensor(
+                float(algorithmic_amount_residual_value)
+            ).detach(),
+            "algorithmic_amount_final_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_final_ratio_value)
+            ).detach(),
+            "algorithmic_amount_noop_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_noop_prob_value)
+            ).detach(),
+            "algorithmic_amount_selected_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_selected_prob_value)
+            ).detach(),
+            "algorithmic_amount_teacher_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_teacher_class_id)
+            ).detach(),
+            "algorithmic_amount_teacher_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_teacher_ratio_value)
+            ).detach(),
+            "algorithmic_amount_selector_teacher_loss": algorithmic_amount_selector_teacher_loss.detach(),
+            "algorithmic_amount_residual_teacher_loss": algorithmic_amount_residual_teacher_loss.detach(),
+            "full_cloud_amount_enabled": pts_xyz.new_tensor(
+                float(full_cloud_amount_override_enabled)
+            ).detach(),
+            "full_cloud_amount_input_points": pts_xyz.new_tensor(float(N)).detach(),
+            "full_cloud_amount_selected_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_class_value)
+            ).detach(),
+            "full_cloud_amount_action_log_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_selected_log_prob_value)
+            ).detach(),
+            "full_cloud_amount_action_temperature": pts_xyz.new_tensor(
+                float(algorithmic_amount_temperature_value)
+            ).detach(),
+            "full_cloud_amount_action_entropy": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_entropy_value)
+            ).detach(),
+            "full_cloud_amount_action_sample_mode": str(algorithmic_amount_action_sample_mode),
+            "full_cloud_amount_bin": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_bin_ratio_value)
+            ).detach(),
+            "full_cloud_amount_residual_raw": (
+                algorithmic_amount_residual_raw.detach()
+                if torch.is_tensor(algorithmic_amount_residual_raw)
+                else pts_xyz.new_zeros((int(actuator_features.shape[0]),), dtype=pts_xyz.dtype, device=pts_xyz.device)
+            ),
+            "full_cloud_amount_residual": pts_xyz.new_tensor(
+                float(algorithmic_amount_residual_value)
+            ).detach(),
+            "full_cloud_amount_final_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_final_ratio_value)
+            ).detach(),
+            "full_cloud_amount_noop_selected": pts_xyz.new_tensor(
+                float(full_cloud_amount_override_enabled and algorithmic_amount_selected_class_value <= 0)
+            ).detach(),
+            "full_cloud_amount_selected_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_selected_prob_value)
+            ).detach(),
+            "full_cloud_amount_predicted_delta": pts_xyz.new_tensor(
+                float(full_cloud_amount_predicted_delta_value)
+            ).detach(),
+            "full_cloud_amount_bin_logits": algorithmic_amount_selector_logits.detach(),
+            "full_cloud_amount_predicted_delta_per_amount": (
+                full_cloud_amount_terms.get("predicted_delta_per_amount").detach()
+                if torch.is_tensor(full_cloud_amount_terms.get("predicted_delta_per_amount", None))
+                else pts_xyz.new_zeros((1, int(algorithmic_amount_selector_logits.shape[1])))
+            ),
+            "full_cloud_amount_ratio_reg_loss": pts_xyz.new_tensor(0.0).detach(),
+            "actual_gate_prune_enabled": pts_xyz.new_tensor(
+                float(require_actual_gate_prune)
+            ).detach(),
+            "actual_gate_prune_allowed": pts_xyz.new_tensor(
+                float(hard_prune_actual_allowed)
+            ).detach(),
+            "hard_prune_actual_allowed": pts_xyz.new_tensor(
+                float(hard_prune_actual_allowed)
+            ).detach(),
+            "hard_drop_block_reason": hard_drop_block_reason,
+            "phase0_network_mode_but_hard_drop_zero": pts_xyz.new_tensor(
+                float(phase0_network_mode_but_hard_drop_zero)
+            ).detach(),
+            "phase0_noop_only_collapse_detected": pts_xyz.new_tensor(
+                float(phase0_noop_only_collapse_detected)
+            ).detach(),
+            "collapse_reason": phase0_collapse_reason,
+            "hard_drop_count_trace": hard_drop_count_trace,
+            "codec_prune_prior_enabled": pts_xyz.new_tensor(
+                float(codec_prune_prior_enabled)
+            ).detach(),
+            "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase).detach(),
+            "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio).detach(),
+            "codec_prune_prior_base_ratio": pts_xyz.new_tensor(float(codec_prune_prior_ratio)).detach(),
+            "codec_prune_prior_active_ratio": pts_xyz.new_tensor(float(codec_prune_prior_active_ratio)).detach(),
+            "codec_prune_prior_hybrid_alpha": pts_xyz.new_tensor(
+                float(codec_prune_prior_hybrid_alpha)
+            ).detach(),
+            "codec_prune_prior_count_alpha": pts_xyz.new_tensor(
+                float(codec_prune_prior_count_alpha)
+            ).detach(),
+            "codec_prune_prior_hard_action_alpha": pts_xyz.new_tensor(
+                float(codec_prune_prior_hard_action_alpha)
+            ).detach(),
+            "amount_mode_id": pts_xyz.new_tensor(float(amount_mode_id)).detach(),
+            "amount_mode_network": pts_xyz.new_tensor(float(amount_mode_network)).detach(),
+            "codec_prior_amount_blend_applied": pts_xyz.new_tensor(
+                float(codec_prior_amount_blend_applied)
+            ).detach(),
+            "codec_prior_amount_blend_alpha": pts_xyz.new_tensor(
+                float(codec_prior_amount_blend_alpha_value)
+            ).detach(),
+            "post_warmup_amount_hybrid_applied": pts_xyz.new_tensor(
+                float(post_warmup_amount_hybrid_applied)
+            ).detach(),
+            "post_warmup_amount_mode_id": pts_xyz.new_tensor(
+                float(post_warmup_amount_mode_id)
+            ).detach(),
+            "post_warmup_amount_strategy_id": pts_xyz.new_tensor(
+                float(post_warmup_amount_strategy_id)
+            ).detach(),
+            "post_warmup_amount_tail_phase": pts_xyz.new_tensor(
+                float(post_warmup_amount_tail_phase_value)
+            ).detach(),
+            "post_warmup_amount_alpha": pts_xyz.new_tensor(
+                float(post_warmup_amount_alpha_value)
+            ).detach(),
+            "post_warmup_amount_proposal_ratio": pts_xyz.new_tensor(
+                float(post_warmup_amount_proposal_ratio_value)
+            ).detach(),
+            "post_warmup_amount_teacher_loss": post_warmup_amount_teacher_loss.detach(),
+            "post_warmup_amount_teacher_weight_effective": pts_xyz.new_tensor(
+                float(post_warmup_amount_teacher_weight_effective)
+            ).detach(),
+            "amount_explore_step": pts_xyz.new_tensor(float(amount_explore_step)).detach(),
+            "amount_explore_prob": pts_xyz.new_tensor(float(amount_explore_prob_value)).detach(),
+            "amount_explore_candidate_ratio": pts_xyz.new_tensor(
+                float(amount_explore_candidate_ratio_value)
+            ).detach(),
+            "amount_explore_candidate_index": pts_xyz.new_tensor(
+                float(amount_explore_candidate_index_value)
+            ).detach(),
+            "amount_explore_teacher_ratio": pts_xyz.new_tensor(
+                float(amount_explore_teacher_ratio_value)
+            ).detach(),
+            "amount_explore_teacher_count": pts_xyz.new_tensor(
+                float(amount_explore_teacher_count_value)
+            ).detach(),
+            "amount_explore_teacher_score": pts_xyz.new_tensor(
+                float(amount_explore_teacher_score_value)
+            ).detach(),
+            "amount_explore_teacher_alpha": pts_xyz.new_tensor(
+                float(amount_explore_teacher_alpha_value)
+            ).detach(),
+            "amount_explore_used_teacher": pts_xyz.new_tensor(
+                float(amount_explore_used_teacher)
+            ).detach(),
+            "hard_drop_target_ratio_source_id": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_source_id)
+            ).detach(),
+            "hard_drop_target_ratio_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_value)
+            ).detach(),
+            "hard_drop_target_ratio_network_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_network_value)
+            ).detach(),
+            "hard_drop_target_ratio_codec_prior_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_codec_prior_value)
+            ).detach(),
+            "codec_prior_where_distill_loss": codec_prior_where_distill_loss.detach(),
+            "codec_prior_amount_distill_loss": codec_prior_amount_distill_loss.detach(),
+            "codec_prune_prior_block_size": pts_xyz.new_tensor(
+                float(codec_prune_prior_block_size)
+            ).detach(),
+            "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
+                float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)
+            ).detach(),
+            "prune_ratio_monotonic_floor": pts_xyz.new_tensor(
+                float(monotonic_prune_floor_value if monotonic_prune_floor_value is not None else float("nan"))
+            ).detach(),
+            "network_prune_ratio_floor": pts_xyz.new_tensor(float(network_prune_floor_ratio)).detach(),
+            "network_prune_min_hard_count": pts_xyz.new_tensor(float(network_prune_min_hard_count)).detach(),
+            "network_prune_floor_steps": pts_xyz.new_tensor(
+                float(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 0))
+            ).detach(),
+            "network_prune_floor_decay_steps": pts_xyz.new_tensor(
+                float(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 0))
+            ).detach(),
+            "drop_score_gate_applied_to_hard_selection": pts_xyz.new_tensor(float(not phase0_network_prune_mode)).detach(),
+            "raw_learned_drop_ratio": raw_learned_drop_ratio.mean().detach(),
+            "raw_learned_add_ratio": raw_learned_add_ratio.mean().detach(),
+            "raw_learned_move_ratio": raw_learned_move_ratio.mean().detach(),
+            "learned_drop_ratio_before_floor": learned_drop_ratio_before_floor.mean().detach(),
+            "learned_drop_ratio_after_floor": learned_drop_ratio_after_floor.mean().detach(),
+            "learned_drop_ratio_before_gate": learned_drop_ratio_before_gate.mean().detach(),
+            "learned_drop_ratio_after_gate": learned_drop_ratio_after_gate.mean().detach(),
+            "learned_drop_ratio_value": pts_xyz.new_tensor(float(learned_drop_ratio_value)).detach(),
+            "effective_drop_ratio_for_hard_count": effective_drop_ratio_for_hard_count.mean().detach(),
+            "voxel_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("voxel_count", 0.0))
+            ).detach(),
+            "codec_block_valid_point_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_valid_point_count", 0.0))
+            ).detach(),
+            "codec_block_budget_points": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_budget_points", 0.0))
+            ).detach(),
+            "codec_block_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_count", 0.0))
+            ).detach(),
+            "codec_block_selected_block_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_selected_block_count", 0.0))
+            ).detach(),
+            "codec_block_selected_point_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_selected_point_count", 0.0))
+            ).detach(),
+            "codec_block_budget_zero": pts_xyz.new_tensor(
+                float(bool(last_hard_drop_trace.get("codec_block_budget_zero", False)))
+            ).detach(),
+            "codec_block_target_drop_ratio": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_target_drop_ratio", 0.0))
+            ).detach(),
+            "codec_block_under_selected": pts_xyz.new_tensor(
+                float(bool(last_hard_drop_trace.get("codec_block_under_selected", False)))
+            ).detach(),
+            "where_mode": str(last_hard_drop_trace.get("where_mode", getattr(self.args, "sparsepcgc_where_mode", "block_only"))),
+            "where_mode_id": pts_xyz.new_tensor(float(last_hard_drop_trace.get("where_mode_id", 0.0))).detach(),
+            "macro_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_ratio", 0.0))).detach(),
+            "micro_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_ratio", 0.0))).detach(),
+            "macro_selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_selected_block_count", 0.0))).detach(),
+            "macro_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_drop_count", 0.0))).detach(),
+            "micro_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_drop_count", 0.0))).detach(),
+            "total_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("total_drop_count", last_hard_drop_trace.get("final_hard_drop_count", 0.0)))).detach(),
+            "selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("selected_block_count", 0.0))).detach(),
+            "micro_selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_selected_block_count", 0.0))).detach(),
+            "max_drop_count_per_block": pts_xyz.new_tensor(float(last_hard_drop_trace.get("max_drop_count_per_block", 0.0))).detach(),
+            "mean_drop_count_per_selected_block": pts_xyz.new_tensor(float(last_hard_drop_trace.get("mean_drop_count_per_selected_block", 0.0))).detach(),
+            "drop_concentration_top1_block_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("drop_concentration_top1_block_ratio", 0.0))).detach(),
+            "drop_concentration_top5_block_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("drop_concentration_top5_block_ratio", 0.0))).detach(),
+            "hard_where_uses_network_score": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("hard_where_uses_network_score", False)))).detach(),
+            "heuristic_where_score_mean": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_mean", 0.0))).detach(),
+            "heuristic_where_score_std": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_std", 0.0))).detach(),
+            "micro_quota_hit_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_quota_hit_block_count", 0.0))).detach(),
+            "micro_min_selected_blocks": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_min_selected_blocks", 0.0))).detach(),
+            "micro_candidate_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_candidate_block_count", 0.0))).detach(),
+            "micro_min_blocks_satisfied": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("micro_min_blocks_satisfied", False)))).detach(),
+            "micro_min_blocks_fallback_reason": str(last_hard_drop_trace.get("micro_min_blocks_fallback_reason", "")),
+            "macro_micro_hybrid_fallback": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("macro_micro_hybrid_fallback", False)))).detach(),
+            "effective_where_mode": str(last_hard_drop_trace.get("effective_where_mode", last_hard_drop_trace.get("where_mode", ""))),
+            "macro_disabled_reason": str(last_hard_drop_trace.get("macro_disabled_reason", "")),
+            "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)).detach(),
+            "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)).detach(),
+            "delete_candidate_after_leaf_mask_count": pts_xyz.new_tensor(float(delete_candidate_after_leaf_mask_count)).detach(),
+            "delete_candidate_count": pts_xyz.new_tensor(float(delete_candidate_voxel_count_value)).detach(),
+            "delete_candidate_point_count": pts_xyz.new_tensor(float(delete_candidate_point_count_value)).detach(),
+            "delete_candidate_empty_reason": delete_candidate_empty_reason,
+            "hard_delete_selection_count": pts_xyz.new_tensor(float(hard_delete_selection_voxel_count_value)).detach(),
+            "hard_delete_selection_point_count": pts_xyz.new_tensor(float(hard_delete_selection_count_value)).detach(),
+            "pre_round_target_count": pts_xyz.new_tensor(float(pre_round_target_count_value)).detach(),
+            "post_round_target_count": pts_xyz.new_tensor(float(post_round_target_count_value)).detach(),
+            "min_hard_drop_count_floor_applied": pts_xyz.new_tensor(float(min_hard_drop_count_floor_applied)).detach(),
+            "hard_mask_count": pts_xyz.new_tensor(float(hard_mask_count_value)).detach(),
+            "final_hard_drop_count": pts_xyz.new_tensor(float(hard_drop_count_value)).detach(),
+            "learned_drop_ratio": learned_drop_ratio.mean().detach(),
+            "learned_drop_prob": learned_drop_prob.detach(),
+            "drop_prob_mean": drop_prob.mean().detach(),
+            "drop_prob_min": drop_prob.amin().detach() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_max": drop_prob.amax().detach() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_direct_mean": drop_prob_direct.mean().detach(),
+            "drop_prob_direct_min": drop_prob_direct.amin().detach() if drop_prob_direct.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_direct_max": drop_prob_direct.amax().detach() if drop_prob_direct.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_proxy_mean": drop_prob_proxy.mean().detach(),
+            "drop_prob_proxy_min": drop_prob_proxy.amin().detach() if drop_prob_proxy.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_proxy_max": drop_prob_proxy.amax().detach() if drop_prob_proxy.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_logit_mean": learned_drop_logit.mean().detach(),
+            "drop_logit_min": learned_drop_logit.amin().detach() if learned_drop_logit.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_logit_max": learned_drop_logit.amax().detach() if learned_drop_logit.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "keep_prob_mean": keep_prob.mean().detach(),
+            "keep_prob_min": keep_prob.amin().detach() if keep_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "keep_prob_max": keep_prob.amax().detach() if keep_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_entropy": drop_entropy.detach(),
+            "soft_drop_mass": soft_drop_mass.detach(),
+            "prune_soft_geom": prune_soft_geom.detach(),
+            "prune_soft_rate": prune_soft_rate.detach(),
+            "prune_soft_node": prune_soft_node.detach(),
+            "prune_soft_single": prune_soft_single.detach(),
+            "prune_soft_bit": prune_soft_bit.detach(),
+            "learned_drop_ratio_std": learned_drop_ratio.detach().float().std(unbiased=False),
+            "learned_add_ratio": learned_add_ratio.mean().detach(),
+            "learned_add_ratio_std": learned_add_ratio.detach().float().std(unbiased=False),
+            "learned_move_ratio": learned_move_ratio.mean().detach(),
+            "learned_move_ratio_std": learned_move_ratio.detach().float().std(unbiased=False),
+            "operation_amount_consistency_loss": operation_amount_consistency_loss.detach(),
+            "operation_entropy": operation_entropy.detach(),
+            "operation_entropy_loss": operation_entropy_loss.detach(),
+            "operation_entropy_weight_effective": pts_xyz.new_tensor(
+                float(operation_entropy_weight_effective)
+            ).detach(),
+            "soft_activity_loss": soft_activity_loss.detach(),
+            "move_direction_ce": move_direction_ce.detach(),
+            "add_direction_ce": add_direction_ce.detach(),
+            "temperature": pts_xyz.new_tensor(float(operation_temperature)).detach(),
+            "exploration_noise": pts_xyz.new_tensor(float(exploration_noise)).detach(),
+            "operation_prob_floor_applied": pts_xyz.new_tensor(float(add_ratio_floor_applied)).detach(),
+            "move_score_noise": pts_xyz.new_tensor(float(move_score_noise)).detach(),
+            "sparsepcgc_add_experiment_enabled": pts_xyz.new_tensor(float(sparsepcgc_add_experiment_active)).detach(),
+            "sparsepcgc_add_warmup": pts_xyz.new_tensor(float(self._sparsepcgc_add_warmup())).detach(),
+            "add_score_noise": pts_xyz.new_tensor(float(add_score_noise)).detach(),
+            "add_weight_random_mix": pts_xyz.new_tensor(float(add_weight_random_mix)).detach(),
+            "drop_score_noise": pts_xyz.new_tensor(float(drop_score_noise)).detach(),
+            "drop_random_mix": pts_xyz.new_tensor(float(drop_random_mix)).detach(),
+            "add_enabled": pts_xyz.new_tensor(float(add_enabled)).detach(),
+            "prune_enabled": pts_xyz.new_tensor(float(prune_enabled)).detach(),
+            "disp_enabled": pts_xyz.new_tensor(float(disp_enabled)).detach(),
+            "actuator_strength": pts_xyz.new_tensor(float(actuator_strength)).detach(),
+            "force_joint_actuator": pts_xyz.new_tensor(float(force_joint_actuator)).detach(),
+            "threshold_cap_mode": pts_xyz.new_tensor(float(threshold_cap_mode)).detach(),
+            "actuator_voxel_mode": actuator_voxel_mode,
+            "local_recomputed": pts_xyz.new_tensor(float(actuator_local_recomputed)).detach(),
+            "add_drop_conflict_loss": add_drop_conflict_loss.detach(),
+            "added_keep_loss": added_keep_loss.detach(),
+            "add_min_offset_loss": add_min_offset_loss.detach(),
+            "quant_move_conflict_loss": quant_move_conflict_loss.detach(),
+            "quant_add_guard": quant_add_guard.detach(),
+            "local_edit_guard": local_edit_guard.detach(),
+            "quant_score_mean": quant_score.mean().detach(),
+            "delta_norm": delta_norm.mean().detach(),
+            "moved_delta_mean": moved_delta_mean.detach(),
+            "move_ratio": hard_move.mean().detach(),
+            "hard_move_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
+            "move_score_mean": move_score.mean().detach(),
+            "move_ratio_soft": move_ratio_soft.detach(),
+            "move_ratio_hard": move_ratio_hard.detach(),
+            "move_ratio_soft_batch_mean": move_ratio_soft_batch.detach().mean(),
+            "move_ratio_hard_batch_mean": move_ratio_hard_batch.detach().mean(),
+            "move_amount_supervision_loss": move_amount_supervision_loss.detach(),
+            "move_amount_soft_consistency_loss": move_amount_soft_consistency_loss.detach(),
+
+            "soft_move_budget_mean": soft_move_budget.detach().mean(),
+            "valid_move_source_voxel_count_mean": valid_move_source_voxel_count.detach().mean(),
+            "valid_move_source_voxel_count_effective_mean": valid_move_source_voxel_count_effective.detach().mean(),
+
+            # 点数基準のAdjust量。
+            "soft_move_sum": soft_move_score_for_guard.detach().sum(),
+            "hard_move_sum": hard_move.detach().sum(),
+            "move_soft_hard_sum_abs_diff": (
+                soft_move_score_for_guard.detach().sum() - hard_move.detach().sum()
+            ).abs(),
+
+            # Voxel数基準のAdjust量。
+            "soft_move_voxel_sum": soft_move_voxel_mass_per_batch.detach().sum(),
+            "hard_move_voxel_sum": hard_move_voxel_mass_per_batch.detach().sum(),
+            "move_soft_hard_voxel_sum_abs_diff": (
+                soft_move_voxel_mass_per_batch.detach().sum()
+                - hard_move_voxel_mass_per_batch.detach().sum()
+            ).abs(),
+
+            "move_soft_hard_ratio_abs_diff": (
+                move_ratio_soft.detach() - move_ratio_hard.detach()
+            ).abs(),
+            "move_source_prior_mean": move_source_prior.mean().detach(),
+            "subtree_move_source_prob_mean": subtree_move_source_prob.mean().detach(),
+            "subtree_move_source_prob_max": subtree_move_source_prob.amax().detach() if subtree_move_source_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "adjusted_point_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
+            "adjusted_point_rate": pts_xyz.new_tensor(float(adjusted_point_rate_value)).detach(),
+            "raw_hard_move_count_before_sparsepcgc_guard": pts_xyz.new_tensor(float(raw_hard_move_count_value)).detach(),
+            "source_unique_voxel_count": pts_xyz.new_tensor(float(sparsepcgc_source_unique_voxel_count_value)).detach(),
+            "target_unique_voxel_count": pts_xyz.new_tensor(float(sparsepcgc_target_unique_voxel_count_value)).detach(),
+            "target_duplicate_voxel_count": pts_xyz.new_tensor(float(sparsepcgc_target_duplicate_voxel_count_value)).detach(),
+            "target_voxel_duplicate_rate": pts_xyz.new_tensor(float(sparsepcgc_target_duplicate_rate_value)).detach(),
+            "target_existing_occupied_count": pts_xyz.new_tensor(float(target_existing_occupied_count_value)).detach(),
+            "target_existing_occupied_rate": pts_xyz.new_tensor(float(target_existing_occupied_rate_value)).detach(),
+            "target_empty_voxel_count": pts_xyz.new_tensor(float(target_empty_voxel_count_value)).detach(),
+            "target_empty_voxel_rate": pts_xyz.new_tensor(float(target_empty_voxel_rate_value)).detach(),
+            "empty_target_violation_loss": empty_target_violation_loss.detach(),
+            "target_duplicate_voxel_loss": target_duplicate_voxel_loss.detach(),
+            "enable_sparsepcgc_empty_target_guard": pts_xyz.new_tensor(float(empty_target_guard_enabled)).detach(),
+            "enable_sparsepcgc_target_duplicate_guard": pts_xyz.new_tensor(float(target_duplicate_guard_enabled)).detach(),
+            "sparsepcgc_empty_target_guard_rejected_count": pts_xyz.new_tensor(float(empty_guard_rejected_count_value)).detach(),
+            "sparsepcgc_target_duplicate_guard_rejected_count": pts_xyz.new_tensor(float(target_duplicate_guard_rejected_count_value)).detach(),
+            "sparsepcgc_guard_rejected_count": pts_xyz.new_tensor(float(sparsepcgc_guard_rejected_count_value)).detach(),
+            "sparsepcgc_move_existing_target_only": pts_xyz.new_tensor(float(getattr(self.args, "sparsepcgc_move_existing_target_only", False))).detach(),
+            "repair_move_require_empty_target": pts_xyz.new_tensor(float(getattr(self.args, "repair_move_require_empty_target", True))).detach(),
+            "repair_move_require_empty_target_effective": pts_xyz.new_tensor(float(require_empty_move)).detach(),
+            "repair_move_max_points_per_voxel": pts_xyz.new_tensor(float(getattr(self.args, "repair_move_max_points_per_voxel", 8))).detach(),
+            "repair_move_warmup": pts_xyz.new_tensor(float(move_warmup)).detach(),
+            "target_move_ratio": pts_xyz.new_tensor(float(target_move_ratio)).detach(),
+            "max_move_ratio": pts_xyz.new_tensor(float(max_move_ratio)).detach(),
+            "repair_move_hard_threshold": pts_xyz.new_tensor(float(getattr(self.args, "repair_move_hard_threshold", 0.5))).detach(),
+            "move_target_valid_ratio": move_target_valid.mean().detach(),
+            "before_occupied_voxel_count": pts_xyz.new_tensor(float(before_occupied_voxels)).detach(),
+            "after_occupied_voxel_count": pts_xyz.new_tensor(float(after_occupied_voxels)).detach(),
+            "occupied_voxel_delta": pts_xyz.new_tensor(float(after_occupied_voxels - before_occupied_voxels)).detach(),
+            "delete_target_voxel_count": pts_xyz.new_tensor(float(delete_target_voxel_count_value)).detach(),
+            "delete_emptied_voxel_count": pts_xyz.new_tensor(float(delete_emptied_voxel_count_value)).detach(),
+            "delete_removed_point_count": pts_xyz.new_tensor(float(delete_removed_point_count_value)).detach(),
+            "hard_drop_ratio": hard_drop.mean().detach(),
+            "hard_drop_count": pts_xyz.new_tensor(float(hard_drop_count_value)).detach(),
+            "add_target_voxel_count": pts_xyz.new_tensor(float(add_target_voxel_count_value)).detach(),
+            "add_actual_point_count": pts_xyz.new_tensor(float(add_effective_count_value)).detach(),
+            "move_source_voxel_count": pts_xyz.new_tensor(float(move_source_voxel_count_value)).detach(),
+            "move_target_voxel_count": pts_xyz.new_tensor(float(move_target_voxel_count_value)).detach(),
+            "move_source_emptied_voxel_count": pts_xyz.new_tensor(float(move_source_emptied_voxel_count_value)).detach(),
+            "move_target_new_voxel_count": pts_xyz.new_tensor(float(move_target_new_voxel_count_value)).detach(),
+            "move_source_not_emptied_count": pts_xyz.new_tensor(float(move_source_not_emptied_count_value)).detach(),
+            "moved_different_voxel_count": pts_xyz.new_tensor(float(moved_different_voxel_count_value)).detach(),
+            "same_voxel_adjust_count": pts_xyz.new_tensor(float(same_voxel_adjust_count_value)).detach(),
+            "preserve_ratio": preserve_ratio.detach(),
+            "edit_reg": edit_reg.detach(),
+            "drop_ratio": drop_ratio.detach(),
+            "drop_ratio_soft": drop_ratio_soft.detach(),
+            "drop_ratio_hard": drop_ratio_hard.detach(),
+            "drop_ratio_soft_batch_mean": drop_ratio_soft_batch.detach().mean(),
+            "drop_ratio_hard_batch_mean": drop_ratio_hard_batch.detach().mean(),
+            "drop_amount_supervision_loss": drop_amount_supervision_loss.detach(),
+            "drop_amount_soft_consistency_loss": drop_amount_soft_consistency_loss.detach(),
+
+            "soft_drop_budget_mean": soft_drop_budget.detach().mean(),
+            "valid_delete_voxel_count_mean": valid_delete_voxel_count.detach().mean(),
+
+            # 点数基準のPrune量。
+            "soft_drop_sum": soft_drop_prob_for_guard.detach().sum(),
+            "hard_drop_sum": hard_drop.detach().sum(),
+            "drop_soft_hard_sum_abs_diff": (
+                soft_drop_prob_for_guard.detach().sum() - hard_drop.detach().sum()
+            ).abs(),
+
+            # Voxel数基準のPrune量。
+            "soft_drop_voxel_sum": soft_drop_voxel_mass_per_batch.detach().sum(),
+            "hard_drop_voxel_sum": hard_drop_voxel_mass_per_batch.detach().sum(),
+            "drop_soft_hard_voxel_sum_abs_diff": (
+                soft_drop_voxel_mass_per_batch.detach().sum()
+                - hard_drop_voxel_mass_per_batch.detach().sum()
+            ).abs(),
+
+            "drop_soft_hard_ratio_abs_diff": (drop_ratio_soft.detach() - drop_ratio_hard.detach()).abs(),
+            "keep_ratio": keep_prob.mean().detach(),
+            "policy_chain_mean": p_chain.mean().detach(),
+            "policy_sibling_mean": p_sibling.mean().detach(),
+            "policy_parent_mean": p_parent.mean().detach(),
+            "policy_context_mean": p_context.mean().detach(),
+            "policy_comp_mean": p_comp.mean().detach(),
+            "policy_outlier_mean": p_outlier.mean().detach(),
+            "actuator_target_mode": actuator_target_mode, 
+            "voxel_edit_state_enabled": pts_xyz.new_tensor(float(voxel_edit_state_enabled)).detach(),
+            "voxel_edit_mode": (
+                (
+                    "ana_den6_online_one_pattern_plan"
+                    if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+                    == "ana_den6_online"
+                    else "ana_den6_exact_residual_plan"
+                )
+                if exact_residual_plan_applied
+                else "ana_den6_exact_anchor_with_network_soft_backward"
+                if exact_anchor_applied else voxel_edit_mode
+            ),
+            "ana_den6_exact_candidate_mode": pts_xyz.new_tensor(
+                float(exact_den6_candidate_mode)
+            ).detach(),
+            "ana_den6_exact_anchor_applied": pts_xyz.new_tensor(
+                float(exact_anchor_applied)
+            ).detach(),
+            "voxel_edit_initial_coords": voxel_edit_initial_coords,
+            "voxel_edit_final_coords": voxel_edit_final_coords.detach(),
+            "voxel_edit_final_weights": voxel_edit_final_weights.detach(),
+            "voxel_edit_valid_mask": voxel_edit_valid_mask.detach(),
+            "voxel_edit_initial_count": pts_xyz.new_tensor(float(voxel_edit_initial_count_value)).detach(),
+            "voxel_edit_final_count": pts_xyz.new_tensor(float(voxel_edit_final_count_value)).detach(),
+            "voxel_edit_drop_count": pts_xyz.new_tensor(float(voxel_edit_drop_count_value)).detach(),
+            "voxel_edit_add_count": pts_xyz.new_tensor(float(voxel_edit_add_count_value)).detach(),
+            "voxel_edit_move_count": pts_xyz.new_tensor(float(voxel_edit_move_count_value)).detach(),
+            "voxel_edit_same_voxel_move_rejected": pts_xyz.new_tensor(float(voxel_edit_same_voxel_move_rejected_value)).detach(),
+            "voxel_edit_existing_target_rejected": pts_xyz.new_tensor(float(voxel_edit_existing_target_rejected_value)).detach(),
+            "voxel_edit_duplicate_target_rejected": pts_xyz.new_tensor(float(voxel_edit_duplicate_target_rejected_value)).detach(),
+            "voxel_edit_child_slot_rejected": pts_xyz.new_tensor(float(voxel_edit_child_slot_rejected_value)).detach(),
+            "voxel_edit_empty_target_rejected": pts_xyz.new_tensor(float(voxel_edit_empty_target_rejected_value)).detach(),
+            "canonical_voxel_coords_before": canonical_voxel_coords_before,
+            "canonical_voxel_coords_after": canonical_voxel_coords_after,
+            "voxel_restore_meta": voxel_restore_meta,
+            "restored_xyz_debug": restored_xyz_debug,
+            "restore_info": restore_info,
+        }
+        if not bool(getattr(self.args, "retain_debug_tensors", False)):
+            self.debug_tensors = {
+                key: (value.detach() if torch.is_tensor(value) else value)
+                for key, value in self.debug_tensors.items()
+            }
+        # v7 single-proposal経路用のActual policy term。
+        # 旧candidate-pool planだけがpolicy_log_probを生成していたため、v7では
+        # 毎Step Actualを測っていてもWhere/Amount/Actionの方策損失が常に0だった。
+        # ここでは実際に実行した唯一のplanの尤度だけを作り、別候補の生成・評価はしない。
+        guidance_formula = (
+            str(heuristic_guidance.get("formula_basis", ""))
+            if isinstance(heuristic_guidance, dict) else ""
+        )
+        single_proposal_policy = (
+            (
+                str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+                == "ana_den6_online"
+                and guidance_formula == "ana_den6_single_proposal_network_residual_online_v7"
+            )
+            or network_only_codec_mode
+        )
+        single_policy_zero = pts_xyz.new_zeros(())
+        single_where_log_prob = single_policy_zero
+        single_amount_log_prob = single_policy_zero
+        single_action_log_prob = single_policy_zero
+        single_direction_log_prob = single_policy_zero
+        single_direction_entropy = single_policy_zero
+        single_policy_entropy = single_policy_zero
+        if single_proposal_policy:
+            policy_eps = max(float(torch.finfo(pts_xyz.dtype).eps), 1e-6)
+
+            def _executed_where_log_prob(base_logits, executed):
+                policy_terms = (
+                    network_only_policy_terms
+                    if isinstance(network_only_policy_terms, dict) else {}
+                )
+                sampling_temperature = policy_terms.get(
+                    "where_sampling_temperature", base_logits.new_tensor(1.0)
+                )
+                # Hard selection is Gumbel-top-k.  Use the corresponding
+                # relative categorical likelihood, rather than independent
+                # sigmoid probabilities that can be improved by shifting all
+                # voxel logits without changing their ranking.
+                return self.network_only_topk_log_prob(
+                    base_logits, executed, sampling_temperature
+                )
+
+            where_terms = []
+            selected_gate = operation_gate_hard.detach().float().mean(dim=(0, 2))
+            network_base_where = (
+                network_only_policy_terms.get("base_where_logits")
+                if network_only_codec_mode else None
+            )
+            if prune_enabled and bool(selected_gate[0].item() > 0.5):
+                prune_base_logits = (
+                    network_base_where[:, 0:1].float()
+                    if torch.is_tensor(network_base_where)
+                    else torch.logit(drop_prob_proxy.float().clamp(policy_eps, 1.0 - policy_eps))
+                )
+                where_terms.append(_executed_where_log_prob(prune_base_logits, hard_drop_mask))
+            if add_enabled and bool(selected_gate[1].item() > 0.5) and hard_add_pair.numel() > 0:
+                if network_only_codec_mode:
+                    add_selected_nk = hard_add_pair.detach().view(
+                        B, N, int(self.neighbor_offsets.shape[0])
+                    ) > 0.0
+                    add_source_selected = add_selected_nk.any(dim=2).unsqueeze(1)
+                    add_where_logits = network_base_where[:, 1:2].float()
+                else:
+                    add_where_logits = (
+                        exact_add_pair_logits.float().reshape_as(hard_add_pair)
+                        if torch.is_tensor(exact_add_pair_logits)
+                        else torch.logit(soft_add_pair.float().clamp(policy_eps, 1.0 - policy_eps))
+                    )
+                    add_source_selected = hard_add_pair > 0.0
+                where_terms.append(
+                    _executed_where_log_prob(add_where_logits, add_source_selected)
+                )
+            if disp_enabled and bool(selected_gate[2].item() > 0.5):
+                move_base_logits = (
+                    network_base_where[:, 2:3].float()
+                    if torch.is_tensor(network_base_where)
+                    else torch.logit(move_score.float().clamp(policy_eps, 1.0 - policy_eps))
+                )
+                where_terms.append(_executed_where_log_prob(move_base_logits, hard_move_mask))
+            if where_terms:
+                single_where_log_prob = torch.stack(where_terms).mean()
+
+            direction_terms = []
+            direction_entropies = []
+            def _selected_network_direction_term(operation_index, selected_source, selected_direction):
+                base_vectors = network_only_policy_terms["base_direction_vectors"]
+                concentration = network_only_policy_terms["direction_concentration"]
+                unit_offsets = torch.nn.functional.normalize(
+                    self.neighbor_offsets.to(device=base_vectors.device, dtype=base_vectors.dtype),
+                    dim=1,
+                )
+                log_prob_values = []
+                entropy_values = []
+                for batch_index in range(B):
+                    source_indices = torch.nonzero(
+                        selected_source[batch_index], as_tuple=False
+                    ).reshape(-1)
+                    if source_indices.numel() == 0:
+                        continue
+                    vectors = base_vectors[batch_index, operation_index, :, source_indices].transpose(0, 1)
+                    scales = concentration[batch_index, operation_index, 0, source_indices].unsqueeze(1)
+                    direction_temperature = torch.as_tensor(
+                        network_only_policy_terms.get("direction_sampling_temperature", 1.0),
+                        device=vectors.device,
+                        dtype=vectors.dtype,
+                    ).clamp_min(0.05)
+                    logits = (
+                        torch.matmul(vectors, unit_offsets.transpose(0, 1)) * scales
+                    ) / direction_temperature
+                    probabilities = torch.softmax(logits.float(), dim=1).clamp_min(policy_eps)
+                    directions = selected_direction[batch_index, source_indices].to(dtype=torch.long)
+                    log_prob_values.append(
+                        probabilities.gather(1, directions.unsqueeze(1)).log().mean()
+                    )
+                    entropy_values.append(
+                        -(probabilities * probabilities.log()).sum(dim=1).mean()
+                    )
+                if not log_prob_values:
+                    return None, None
+                return torch.stack(log_prob_values).mean(), torch.stack(entropy_values).mean()
+
+            if add_enabled and hard_add_pair.numel() > 0 and torch.is_tensor(exact_add_pair_logits):
+                if network_only_codec_mode:
+                    add_selected_nk = hard_add_pair.detach().view(
+                        B, N, int(self.neighbor_offsets.shape[0])
+                    ) > 0.0
+                    add_selected_source = add_selected_nk.any(dim=2)
+                    add_selected_direction = add_selected_nk.to(dtype=torch.long).argmax(dim=2)
+                    direction_term, direction_entropy = _selected_network_direction_term(
+                        0, add_selected_source, add_selected_direction
+                    )
+                    if direction_term is not None:
+                        direction_terms.append(direction_term)
+                        direction_entropies.append(direction_entropy)
+                else:
+                    add_dir_prob = torch.softmax(exact_add_pair_logits.float(), dim=2)
+                    add_selected_nk = hard_add_pair.detach().view_as(add_dir_prob) > 0.0
+                    if bool(add_selected_nk.any().item()):
+                        direction_terms.append(add_dir_prob.clamp_min(policy_eps)[add_selected_nk].log().mean())
+                    direction_entropies.append(
+                        -(add_dir_prob.clamp_min(policy_eps) * add_dir_prob.clamp_min(policy_eps).log()).sum(dim=2).mean()
+                    )
+            if disp_enabled and torch.is_tensor(move_probs):
+                selected_move = hard_move_mask.detach().squeeze(1).to(dtype=torch.bool)
+                if network_only_codec_mode:
+                    direction_term, direction_entropy = _selected_network_direction_term(
+                        1, selected_move, move_idx.squeeze(1)
+                    )
+                    if direction_term is not None:
+                        direction_terms.append(direction_term)
+                        direction_entropies.append(direction_entropy)
+                else:
+                    direction_move_probs = move_probs.float()
+                    if bool(selected_move.any().item()):
+                        chosen_move_prob = torch.gather(direction_move_probs, 1, move_idx).squeeze(1)
+                        direction_terms.append(chosen_move_prob.clamp_min(policy_eps)[selected_move].log().mean())
+                    direction_entropies.append(
+                        -(direction_move_probs.clamp_min(policy_eps) * direction_move_probs.clamp_min(policy_eps).log()).sum(dim=1).mean()
+                    )
+            if direction_terms:
+                single_direction_log_prob = torch.stack(direction_terms).mean()
+            if direction_entropies:
+                single_direction_entropy = torch.stack(direction_entropies).mean()
+
+            gate_probability_for_log = (
+                network_only_policy_terms.get("gate_base_probability", operation_gate_prob)
+                if network_only_codec_mode else operation_gate_prob
+            )
+            gate_prob = gate_probability_for_log.float().mean(dim=(0, 2)).clamp(
+                policy_eps, 1.0 - policy_eps
+            )
+            active = selected_gate.to(device=gate_prob.device, dtype=gate_prob.dtype)
+            enabled = gate_prob.new_tensor([
+                float(prune_enabled), float(add_enabled), float(disp_enabled)
+            ])
+            action_terms = (
+                active * gate_prob.log()
+                + (1.0 - active) * (1.0 - gate_prob).log()
+            )
+            single_action_log_prob = (action_terms * enabled).sum()
+
+            # 実行したAmountの尤度。改善したplanでは同じ方向の操作量を強め、
+            # 悪化したplanでは弱める。全操作の変更Voxel上限はargs側で1%未満に保つ。
+            amount_prob = torch.stack([
+                (learned_drop_ratio.float().mean() / max(float(max_drop_ratio), policy_eps)),
+                (learned_add_ratio.float().mean() / max(float(max_add_ratio_value), policy_eps)),
+                (learned_move_ratio.float().mean() / max(float(max_move_ratio), policy_eps)),
+            ]).clamp(policy_eps, 1.0 - policy_eps)
+            if network_only_codec_mode:
+                single_amount_log_prob = (
+                    network_only_policy_terms["amount_sample_log_prob"]
+                    + network_only_policy_terms["share_sample_log_prob"]
+                    + network_only_policy_terms["priority_sample_log_prob"]
+                )
+            else:
+                amount_terms = active * amount_prob.log()
+                active_enabled = active * enabled
+                single_amount_log_prob = (
+                    (amount_terms * enabled).sum() / active_enabled.sum().clamp_min(1.0)
+                )
+            action_entropy = -(gate_prob * gate_prob.log())
+            amount_entropy = -(
+                amount_prob * amount_prob.log()
+                + (1.0 - amount_prob) * (1.0 - amount_prob).log()
+            )
+            single_policy_entropy = (
+                action_entropy.sum() + (amount_entropy * active).sum()
+            ) / 2.0 + single_direction_entropy
+            if network_only_codec_mode:
+                # Keep the learned three-way share exploratory without a
+                # fixed 0.4/0.4/0.2 target.  This acts on raw softmax shares,
+                # so a temporary hard exploration floor cannot hide collapse.
+                share_entropy = network_only_policy_terms.get("amount_entropy")
+                if torch.is_tensor(share_entropy):
+                    single_policy_entropy = single_policy_entropy + share_entropy
+                distribution_entropies = [
+                    network_only_policy_terms.get("amount_distribution_entropy"),
+                    network_only_policy_terms.get("share_distribution_entropy"),
+                    network_only_policy_terms.get("priority_entropy"),
+                ]
+                distribution_entropies = [
+                    value for value in distribution_entropies if torch.is_tensor(value)
+                ]
+                if distribution_entropies:
+                    single_policy_entropy = single_policy_entropy + torch.stack(
+                        [value.float().mean() for value in distribution_entropies]
+                    ).mean().to(dtype=single_policy_entropy.dtype)
+
+        # Each family describes one part of the same composite action.  Use
+        # their mean so adding Where/Direction/priority terms cannot multiply
+        # the effective PG coefficient or overwhelm geometry/Surrogate loss.
+        single_policy_log_prob = torch.stack((
+            single_where_log_prob,
+            single_amount_log_prob,
+            single_action_log_prob,
+            single_direction_log_prob,
+        )).mean()
+        external_composite_log_prob = (
+            network_only_policy_terms.get("composite_policy_log_prob")
+            if network_only_codec_mode and isinstance(network_only_policy_terms, dict)
+            else None
+        )
+        if torch.is_tensor(external_composite_log_prob):
+            # K specialists are deterministic proposals.  Their stochastic
+            # credit is the batched Critic's selected-slot distribution, not
+            # the legacy single-policy sum over thousands of voxel log-probs.
+            single_policy_log_prob = external_composite_log_prob
+            external_composite_entropy = network_only_policy_terms.get(
+                "composite_policy_entropy"
+            )
+            if torch.is_tensor(external_composite_entropy):
+                single_policy_entropy = external_composite_entropy
+        if single_proposal_policy:
+            selected_action_mask = operation_gate_hard.detach()[0, :, 0].to(
+                dtype=torch.int64
+            ).cpu().tolist()
+            selected_action_count = int(sum(selected_action_mask))
+
+            def _coord_rows_hash(rows):
+                if not torch.is_tensor(rows) or rows.numel() == 0:
+                    return hashlib.sha256(b"").hexdigest()
+                values = rows.detach().to(device="cpu", dtype=torch.int64).tolist()
+                canonical = sorted(set(tuple(int(item) for item in row) for row in values))
+                return hashlib.sha256(
+                    json.dumps(canonical, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+
+            prune_selected = voxel_coords[0].transpose(0, 1)[
+                hard_drop_mask.detach()[0, 0].to(dtype=torch.bool)
+            ]
+            add_selected = add_target_voxel_coords[0].transpose(0, 1)[
+                add_target_hard_add.detach()[0, 0].to(dtype=torch.bool)
+            ] if add_target_voxel_coords.shape[-1] > 0 else voxel_coords.new_empty((0, 3))
+            move_selected_mask = hard_move_mask.detach()[0, 0].to(dtype=torch.bool)
+            move_sources = voxel_coords[0].transpose(0, 1)[move_selected_mask]
+            move_targets = move_target_voxel_coords[0].transpose(0, 1)[move_selected_mask]
+            coord_hashes = {
+                "Prune": _coord_rows_hash(prune_selected),
+                "Add": _coord_rows_hash(add_selected),
+                "AdjustSource": _coord_rows_hash(move_sources),
+                "AdjustTarget": _coord_rows_hash(move_targets),
+            }
+
+            def _tagged_coord_keys(tag, rows):
+                if not torch.is_tensor(rows) or rows.numel() == 0:
+                    return set()
+                return {
+                    (str(tag), int(row[0]), int(row[1]), int(row[2]))
+                    for row in rows.detach().to(device="cpu", dtype=torch.int64).tolist()
+                }
+
+            selected_coord_key_set = set()
+            selected_coord_key_set.update(_tagged_coord_keys("P", prune_selected))
+            selected_coord_key_set.update(_tagged_coord_keys("A", add_selected))
+            selected_coord_key_set.update(_tagged_coord_keys("MS", move_sources))
+            selected_coord_key_set.update(_tagged_coord_keys("MT", move_targets))
+            sampled_priority_order = (
+                network_only_policy_terms.get("priority_order")[0].detach().cpu().tolist()
+                if network_only_codec_mode
+                and torch.is_tensor(network_only_policy_terms.get("priority_order"))
+                else [0, 1, 2]
+            )
+            plan_hash_payload = {
+                "coord_hashes": coord_hashes,
+                "action_mask": selected_action_mask,
+                "amounts": [
+                    round(float(learned_drop_ratio.detach().mean()), 9),
+                    round(float(learned_add_ratio.detach().mean()), 9),
+                    round(float(learned_move_ratio.detach().mean()), 9),
+                ],
+                "priority_order": sampled_priority_order,
+            }
+            network_plan_hash = hashlib.sha256(
+                json.dumps(plan_hash_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            add_direction_indices = (
+                torch.nonzero(hard_add_pair.detach()[0].reshape(-1) > 0.0, as_tuple=False)
+                .reshape(-1)
+                .remainder(int(self.neighbor_offsets.shape[0]))
+                .cpu().tolist()
+            )
+            move_direction_indices = (
+                move_idx_flat.detach()[0][move_selected_mask].cpu().tolist()
+                if bool(move_selected_mask.any().item()) else []
+            )
+            external_selected_counts = None
+            if external_executable_plan_applied:
+                external_mask = external_executable_plan.accepted_mask[0, 0]
+                prune_selected = external_executable_plan.source_coord[0, 0, 0][external_mask[0]]
+                add_selected = external_executable_plan.target_coord[0, 0, 1][external_mask[1]]
+                move_sources = external_executable_plan.source_coord[0, 0, 2][external_mask[2]]
+                move_targets = external_executable_plan.target_coord[0, 0, 2][external_mask[2]]
+                external_selected_counts = {
+                    "Prune": int(external_mask[0].sum().item()),
+                    "Add": int(external_mask[1].sum().item()),
+                    "Adjust": int(external_mask[2].sum().item()),
+                }
+                selected_action_mask = [1, 1, 1]
+                selected_action_count = 3
+                sampled_priority_order = external_executable_plan.operation_order[
+                    0, 0
+                ].detach().cpu().tolist()
+                coord_hashes = {
+                    "Prune": _coord_rows_hash(prune_selected),
+                    "Add": _coord_rows_hash(add_selected),
+                    "AdjustSource": _coord_rows_hash(move_sources),
+                    "AdjustTarget": _coord_rows_hash(move_targets),
+                }
+                selected_coord_key_set = set()
+                selected_coord_key_set.update(_tagged_coord_keys("P", prune_selected))
+                selected_coord_key_set.update(_tagged_coord_keys("A", add_selected))
+                selected_coord_key_set.update(_tagged_coord_keys("MS", move_sources))
+                selected_coord_key_set.update(_tagged_coord_keys("MT", move_targets))
+                add_direction_indices = external_executable_plan.direction_index[
+                    0, 0, 1
+                ][external_mask[1]].detach().cpu().tolist()
+                move_direction_indices = external_executable_plan.direction_index[
+                    0, 0, 2
+                ][external_mask[2]].detach().cpu().tolist()
+                plan_hash_payload = {
+                    "coord_hashes": coord_hashes,
+                    "action_mask": selected_action_mask,
+                    "amounts": [
+                        round(float(learned_drop_ratio.detach().mean()), 9),
+                        round(float(learned_add_ratio.detach().mean()), 9),
+                        round(float(learned_move_ratio.detach().mean()), 9),
+                    ],
+                    "priority_order": sampled_priority_order,
+                }
+                network_plan_hash = hashlib.sha256(
+                    json.dumps(
+                        plan_hash_payload, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+            exact_residual_plan_debug.update({
+                "plan_count": 1,
+                "pool_reference_count": 0,
+                "candidate_actual_encode_count": 0,
+                "selected_counts": external_selected_counts or {
+                    "Prune": int(hard_drop_mask.detach().sum().item()),
+                    "Add": int((hard_add_pair.detach() > 0.0).sum().item()),
+                    "Adjust": int(hard_move_mask.detach().sum().item()),
+                },
+                "selected_amount_ratios": {
+                    "Prune": float(learned_drop_ratio.detach().mean().item()),
+                    "Add": float(learned_add_ratio.detach().mean().item()),
+                    "Adjust": float(learned_move_ratio.detach().mean().item()),
+                },
+                "add_selection_diagnostics": {
+                    "requested_k": int(add_k),
+                    "effective_count": int(add_effective_count_value),
+                    "target_voxel_count": int(add_target_voxel_count_value),
+                    "fixed_direction_pairs": int(fixed_add_direction_pair_count),
+                    "fixed_valid_before_unique": int(fixed_add_valid_before_unique_count),
+                    "fixed_valid_after_unique": int(fixed_add_valid_after_unique_count),
+                    "selected_fixed_pairs": int(selected_fixed_add_pair_count),
+                },
+                "selected_coord_hashes": coord_hashes,
+                "selected_coord_key_set": selected_coord_key_set,
+                "plan_hash": network_plan_hash,
+                "priority_order": sampled_priority_order,
+                "add_direction_indices": add_direction_indices,
+                "adjust_direction_indices": move_direction_indices,
+                "selected_action_index": (
+                    int(selected_action_mask.index(1))
+                    if selected_action_count == 1 else -1
+                ),
+                "selected_action_mask": selected_action_mask,
+                "selected_action_count": selected_action_count,
+                "policy_log_prob": single_policy_log_prob,
+                "policy_entropy": single_policy_entropy,
+                "where_log_prob": single_where_log_prob,
+                "amount_log_prob": single_amount_log_prob,
+                "action_log_prob": single_action_log_prob,
+                "direction_log_prob": single_direction_log_prob,
+                "direction_entropy": single_direction_entropy,
+                "proposal_source": (
+                    "network_only_codec_cost_policy"
+                    if network_only_codec_mode
+                    else "network_plus_gt_fixed_den6_features"
+                ),
+                "network_forward_count": 1 if network_only_codec_mode else 0,
+                "den6_call_count": 0,
+                "candidate_object_count": 0,
+                "teacher_plan_reference_count": 0,
+                "behavior_cloning_loss": 0.0,
+            })
+
+        return pts_out, final_w, loss, {
+            # Adjust Soft状態
+            "learned_drop_ratio_requires_grad": pts_xyz.new_tensor(float(learned_drop_ratio.requires_grad)),
+            "network_drop_logit_for_outcome": network_drop_logit_for_distill,
+            "codec_prune_prior_score_for_outcome": codec_prune_prior_score.detach(),
+            "delete_prior_for_outcome": delete_prior.detach(),
+            "hard_drop_mask_for_outcome": hard_drop_mask.detach(),
+            "hard_delete_selection_mask_for_outcome": hard_delete_selection_mask.detach(),
+            "drop_ratio_hard_for_outcome": drop_ratio_hard.detach(),
+            "raw_learned_drop_ratio_for_outcome": raw_learned_drop_ratio,
+            "codec_prune_prior_hard_action_alpha": pts_xyz.new_tensor(
+                float(codec_prune_prior_hard_action_alpha)
+            ).detach(),
+            "codec_prior_amount_blend_applied": pts_xyz.new_tensor(
+                float(codec_prior_amount_blend_applied)
+            ).detach(),
+            "codec_prior_amount_blend_alpha": pts_xyz.new_tensor(
+                float(codec_prior_amount_blend_alpha_value)
+            ).detach(),
+            "codec_prior_where_distill_loss": codec_prior_where_distill_loss.detach(),
+            "codec_prior_amount_distill_loss": codec_prior_amount_distill_loss.detach(),
+            "learned_add_ratio_requires_grad": pts_xyz.new_tensor(float(learned_add_ratio.requires_grad)),
+            "learned_move_ratio_requires_grad": pts_xyz.new_tensor(float(learned_move_ratio.requires_grad)),
+            "operation_amount_logit_loss": operation_amount_logit_loss.detach(),
+            "drop_amount_logit_mean": drop_amount_logit.detach(),
+            "add_amount_logit_mean": add_amount_logit.detach(),
+            "move_amount_logit_mean": move_amount_logit.detach(),
+            "drop_amount_target_logit": drop_amount_target_logit.detach(),
+            "add_amount_target_logit": add_amount_target_logit.detach(),
+            "move_amount_target_logit": move_amount_target_logit.detach(),
+
+            "drop_amount_head_weight_requires_grad": pts_xyz.new_tensor(float(self.drop_amount_head.weight.requires_grad)),
+            "add_amount_head_weight_requires_grad": pts_xyz.new_tensor(float(self.add_amount_head.weight.requires_grad)),
+            "move_amount_head_weight_requires_grad": pts_xyz.new_tensor(float(self.move_amount_head.weight.requires_grad)),
+            "move_source_soft_delete": move_source_soft_delete,
+            "move_source_soft_keep": move_source_soft_keep,
+            "move_target_soft_add": move_target_soft_add,
+            "move_source_voxel_coords": voxel_coords,
+            "move_target_voxel_coords": move_target_voxel_coords,
+            "move_soft_score_effective": soft_move_score_effective,
+            "move_soft_value_mode": "soft_prune_source_and_soft_add_target",
+            "child_slot_candidate_ratio": child_slot_candidate_ratio,
+            "repair_gate": repair_gate,
+            "child_slot_candidate_ratio": child_slot_candidate_ratio,
+
+            # Section4:
+            # Network / train.py / CSVへ渡すためのleaf pattern actuator prior debug。
+            "leaf_actuator_prior_enabled": pts_xyz.new_tensor(
+                float(bool(leaf_actuator_prior.get("enabled", False)))
+            ),
+            "leaf_actuator_drop_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("delete_prior_mean", 0.0))
+            ),
+            "leaf_actuator_add_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("add_prior_mean", 0.0))
+            ),
+            "leaf_actuator_move_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("move_prior_mean", 0.0))
+            ),
+            "leaf_actuator_best_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("best_prior_mean", 0.0))
+            ),
+            "leaf_actuator_best_prior_max": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("best_prior_max", 0.0))
+            ),
+
+            # Section5:
+            "leaf_target_direction_prior_enabled": pts_xyz.new_tensor(
+                float(bool(leaf_target_direction_prior.get("enabled", False)))
+            ),
+            "leaf_add_target_match_ratio": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("add_target_match_ratio", 0.0))
+            ),
+            "leaf_move_target_match_ratio": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("move_target_match_ratio", 0.0))
+            ),
+            "leaf_add_target_bias_mean": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("add_target_bias_mean", 0.0))
+            ),
+            "leaf_move_target_bias_mean": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("move_target_bias_mean", 0.0))
+            ),
+
+            "repair_gate": repair_gate,
+            "drop_prob": drop_prob,
+            "keep_prob": keep_prob,
+            "drop_prob_direct": drop_prob_direct,
+            "drop_prob_proxy": drop_prob_proxy,
+            "drop_logit": learned_drop_logit,
+            "learned_drop_logit": learned_drop_logit,
+            "soft_drop_where_grad_base": soft_drop_where_grad_base,
+            "prune_where_proxy": soft_drop_where_grad_base,
+            "soft_drop_prob_for_ste": soft_drop_prob_for_ste,
+            "soft_drop_where_grad_masked": soft_drop_where_grad_masked,
+            "soft_drop_where_grad_direct": soft_drop_where_grad_direct,
+            "add_prob": add_prob,
+            "add_priority": add_priority,
+            "add_ratio": add_ratio,
+
+            # Phase7-3: soft ratioも既に計算済みのratio値を使う。
+            # mean(score)とratioがズレるとdebug解釈が混乱するため、ratio系はratio変数に統一する。
+            "drop_ratio_soft": drop_ratio_soft.detach() if torch.is_tensor(drop_ratio_soft) else pts_xyz.new_tensor(0.0),
+            "add_ratio_soft": add_ratio_soft.detach() if torch.is_tensor(add_ratio_soft) else pts_xyz.new_tensor(0.0),
+            "move_ratio_soft": move_ratio_soft.detach() if torch.is_tensor(move_ratio_soft) else pts_xyz.new_tensor(0.0),
+
+            # Phase7-3: hard ratioは既に計算済みの値を使う。
+            # add_target_mask / move_source_mask という変数はこの実装には存在しないため使わない。
+            "drop_ratio_hard": drop_ratio_hard.detach() if torch.is_tensor(drop_ratio_hard) else pts_xyz.new_tensor(0.0),
+            "add_ratio_hard": add_ratio_hard.detach() if torch.is_tensor(add_ratio_hard) else pts_xyz.new_tensor(0.0),
+            "move_ratio_hard": move_ratio_hard.detach() if torch.is_tensor(move_ratio_hard) else pts_xyz.new_tensor(0.0),
+
+            "voxel_soft_drop_mean": torch.nan_to_num(drop_prob_proxy.float().mean(), nan=0.0, posinf=0.0, neginf=0.0).detach(),
+            "voxel_soft_add_mean": torch.nan_to_num(add_target_soft_add.float().mean(), nan=0.0, posinf=0.0, neginf=0.0).detach(),
+            "voxel_soft_move_mean": torch.nan_to_num(soft_move_score_effective.float().mean(), nan=0.0, posinf=0.0, neginf=0.0).detach(),
+
+            "add_ratio_loss_value": add_ratio_loss.detach() if torch.is_tensor(add_ratio_loss) else pts_xyz.new_tensor(0.0),
+            # Phase7-3: Add単体のhard/soft整合性debug。
+            # add_consistency_loss という変数は存在しないため、既存の add_hard_soft_consistency_loss を使う。
+            "add_consistency_loss_value": add_hard_soft_consistency_loss.detach() if torch.is_tensor(add_hard_soft_consistency_loss) else pts_xyz.new_tensor(0.0),
+            # Phase7-3: Add Amount head側のsoft ratio整合性debug。
+            "add_amount_consistency_loss_value": add_amount_soft_consistency_loss.detach() if torch.is_tensor(add_amount_soft_consistency_loss) else pts_xyz.new_tensor(0.0),
+            "add_prob_mean": add_prob.mean(),
+            "add_prob_max": add_prob.max() if add_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "add_priority_mean": add_priority.mean(),
+            "add_priority_max": add_priority.max() if add_priority.numel() > 0 else pts_xyz.new_zeros(()),
+            "add_count": add_count_value,
+            "add_effective_count": add_effective_count_value,
+            "add_candidate_ratio": float(add_candidate_ratio),
+            "add_candidate_count": int(add_k),
+            "add_ratio_soft": add_ratio_soft.detach(),
+            "add_ratio_hard": add_ratio_hard.detach(),
+            "add_amount_supervision_loss": add_amount_supervision_loss.detach(),
+            "add_amount_soft_consistency_loss": add_amount_soft_consistency_loss.detach(),
+            "actual_oracle_drop_amount_loss": actual_oracle_drop_amount_loss.detach(),
+            "actual_oracle_add_amount_loss": actual_oracle_add_amount_loss.detach(),
+            "actual_oracle_move_amount_loss": actual_oracle_move_amount_loss.detach(),
+            "actual_oracle_drop_amount_logit_loss": actual_oracle_drop_amount_logit_loss.detach(),
+            "actual_oracle_add_amount_logit_loss": actual_oracle_add_amount_logit_loss.detach(),
+            "actual_oracle_amount_supervision_loss": actual_oracle_amount_supervision_loss.detach(),
+            "add_soft_budget_mean": soft_add_budget.detach().mean(),
+            "add_soft_pair_sum": soft_add_pair.detach().sum(),
+            "add_hard_pair_sum": hard_add_pair.detach().sum(),
+            "add_soft_hard_sum_abs_diff": (soft_add_pair.detach().sum() - hard_add_pair.detach().sum()).abs(),
+            "add_soft_hard_ratio_abs_diff": (add_ratio_soft.detach() - add_ratio_hard.detach()).abs(),
+            # target voxel単位のAdd Hard/Soft状態。
+            "add_target_soft_add": add_target_soft_add,
+            "add_target_hard_add": add_target_hard_add,
+            "add_target_add_st": add_target_add_st,
+            "add_target_voxel_coords": add_target_voxel_coords,
+            "add_target_soft_add_sum": add_target_soft_add.detach().sum(),
+            "add_target_hard_add_sum": add_target_hard_add.detach().sum(),
+            "add_target_soft_hard_sum_abs_diff": (
+                add_target_soft_add.detach().sum()
+                - add_target_hard_add.detach().sum()
+            ).abs(),
+            "operation_gate_prob": operation_gate_prob,
+            "operation_gate_hard": operation_gate_hard.detach(),
+            "heuristic_guidance_enabled": bool(heuristic_guidance is not None),
+            "heuristic_guidance_dataset": str((heuristic_guidance or {}).get("dataset", "")),
+            "heuristic_guidance_scale_m": int((heuristic_guidance or {}).get("scale_m", -1)),
+            "heuristic_guidance_profile_source": str((heuristic_guidance or {}).get("profile_source", "")),
+            "heuristic_guidance_total_ratio": float((heuristic_guidance or {}).get("total_ratio", 0.0)),
+            "heuristic_guidance_operation_heuristics": dict((heuristic_guidance or {}).get("operation_heuristics", {}) or {}),
+            "heuristic_guidance_amount_prior": dict((heuristic_guidance or {}).get("amount_prior", {}) or {}),
+            "heuristic_guidance_action_gate_prior": dict((heuristic_guidance or {}).get("action_gate_prior", {}) or {}),
+            "operation_gate_logit": operation_gate_logit,
+            "drop_operation_gate": drop_operation_gate.mean(),
+            "add_operation_gate": add_operation_gate.mean(),
+            "move_operation_gate": move_operation_gate.mean(),
+            "operation_gate_oracle_loss": operation_gate_oracle_loss.detach(),
+            "actual_oracle_candidate_where_loss": actual_oracle_candidate_where_loss.detach(),
+            "actual_oracle_direction_supervision_loss": actual_oracle_direction_supervision_loss.detach(),
+            "actual_oracle_bad_candidate_count": int(leaf_operation_masks.get("actual_oracle_bad_candidate_count", 0)),
+            "actual_oracle_improving_candidate_count": int(leaf_operation_masks.get("actual_oracle_improving_candidate_count", 0)),
+            "actual_oracle_combo_extra_count": int(leaf_operation_masks.get("actual_oracle_combo_extra_count", 0)),
+            "actual_oracle_generated_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_generated_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_prune_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_prune_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_add_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_add_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_adjust_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_adjust_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_subtree_move_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_subtree_move_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_parent_collapse_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_parent_collapse_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_pattern_canonicalize_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_pattern_canonicalize_count", 0))
+            ).detach(),
+            "actual_oracle_noop_label_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_noop_label_count", 0))
+            ).detach(),
+            "actual_oracle_noop_label_weight": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_noop_label_weight", 0.0))
+            ).detach(),
+            "actual_oracle_high_rate_mppov_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_high_rate_mppov_count", 0))
+            ).detach(),
+            "actual_oracle_low_prob_occupied_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_low_prob_occupied_count", 0))
+            ).detach(),
+            "actual_oracle_single_child_chain_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_single_child_chain_count", 0))
+            ).detach(),
+            "actual_oracle_context_pattern_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_context_pattern_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_eval_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_eval_count", 0))
+            ).detach(),
+            "actual_oracle_eval_max": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_eval_max", 0))
+            ).detach(),
+            "actual_oracle_time": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_time", 0.0))
+            ).detach(),
+            "actual_oracle_drop_bad_count": actual_oracle_drop_bad_count_value,
+            "actual_oracle_add_bad_count": actual_oracle_add_bad_count_value,
+            "actual_oracle_move_bad_count": actual_oracle_move_bad_count_value,
+            "actual_oracle_drop_reason": str(leaf_operation_masks.get("actual_oracle_drop_reason", "")),
+            "actual_oracle_operation": str(leaf_operation_masks.get("actual_oracle_operation", "")),
+            "actual_oracle_scheduled_operation": str(
+                leaf_operation_masks.get("actual_oracle_scheduled_operation", "")
+            ),
+            "actual_oracle_edit_record_bits": float(actual_oracle_edit_record_bits_value),
+            "actual_oracle_raw_percent": float(actual_oracle_raw_percent_value),
+            "actual_oracle_delta_actual_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_delta_actual_percent", 0.0))
+            ).detach(),
+            "actual_oracle_proxy_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_proxy_percent", 0.0))
+            ).detach(),
+            "actual_oracle_geometry_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_geometry_percent", 0.0))
+            ).detach(),
+            "actual_oracle_original_actual_bits": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_original_actual_bits", 0.0))
+            ).detach(),
+            "actual_oracle_edited_actual_bits": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_edited_actual_bits", 0.0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_used": pts_xyz.new_tensor(
+                float(bool(leaf_operation_masks.get("actual_oracle_fast_diagnostic_used", False)))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_full_drop_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_full_drop_count", 0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_local_drop_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_count", 0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_full_drop_ratio": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_full_drop_ratio", 0.0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_local_drop_ratio": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0))
+            ).detach(),
+            "actual_oracle_apply_teacher_actions": pts_xyz.new_tensor(
+                float(actual_oracle_apply_teacher_actions)
+            ),
+            "actual_oracle_force_no_edit_used": pts_xyz.new_tensor(float(actual_oracle_force_no_edit_used)),
+            "actual_oracle_has_drop": pts_xyz.new_tensor(float(actual_oracle_has_drop)),
+            "prune_after_prior_mode": prune_after_prior_mode,
+            "phase0_network_prune_mode": pts_xyz.new_tensor(float(phase0_network_prune_mode)),
+            "legacy_amount_selector_blocked_by_guidance": pts_xyz.new_tensor(
+                float(legacy_amount_selector_blocked_by_guidance)
+            ),
+            "algorithmic_proposal_selector_enabled": pts_xyz.new_tensor(
+                float(algorithmic_proposal_selector_enabled)
+            ),
+            "algorithmic_proposal_selector_active": pts_xyz.new_tensor(
+                float(algorithmic_proposal_selector_active)
+            ),
+            "algorithmic_proposal_where_source_id": pts_xyz.new_tensor(
+                float(algorithmic_proposal_where_source_id)
+            ),
+            "algorithmic_proposal_noop_selected": pts_xyz.new_tensor(
+                float(algorithmic_proposal_noop_selected)
+            ),
+            "algorithmic_amount_selected_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_class_value)
+            ),
+            "algorithmic_amount_selected_bin_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_bin_ratio_value)
+            ),
+            "algorithmic_amount_residual": pts_xyz.new_tensor(
+                float(algorithmic_amount_residual_value)
+            ),
+            "algorithmic_amount_final_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_final_ratio_value)
+            ),
+            "algorithmic_amount_noop_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_noop_prob_value)
+            ),
+            "algorithmic_amount_selected_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_selected_prob_value)
+            ),
+            "algorithmic_amount_teacher_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_teacher_class_id)
+            ),
+            "algorithmic_amount_teacher_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_teacher_ratio_value)
+            ),
+            "algorithmic_amount_selector_teacher_loss": algorithmic_amount_selector_teacher_loss,
+            "algorithmic_amount_residual_teacher_loss": algorithmic_amount_residual_teacher_loss,
+            "full_cloud_amount_enabled": pts_xyz.new_tensor(float(full_cloud_amount_override_enabled)),
+            "full_cloud_amount_input_points": pts_xyz.new_tensor(float(N)),
+            "full_cloud_amount_selected_class": pts_xyz.new_tensor(float(algorithmic_amount_selected_class_value)),
+            "full_cloud_amount_action_log_prob": pts_xyz.new_tensor(float(algorithmic_amount_selector_selected_log_prob_value)),
+            "full_cloud_amount_action_temperature": pts_xyz.new_tensor(float(algorithmic_amount_temperature_value)),
+            "full_cloud_amount_action_entropy": pts_xyz.new_tensor(float(algorithmic_amount_selector_entropy_value)),
+            "full_cloud_amount_action_sample_mode": str(algorithmic_amount_action_sample_mode),
+            "full_cloud_amount_bin": pts_xyz.new_tensor(float(algorithmic_amount_selected_bin_ratio_value)),
+            "full_cloud_amount_residual_raw": (
+                algorithmic_amount_residual_raw
+                if torch.is_tensor(algorithmic_amount_residual_raw)
+                else pts_xyz.new_zeros((int(actuator_features.shape[0]),), dtype=pts_xyz.dtype, device=pts_xyz.device)
+            ),
+            "full_cloud_amount_residual": pts_xyz.new_tensor(float(algorithmic_amount_residual_value)),
+            "full_cloud_amount_final_ratio": pts_xyz.new_tensor(float(algorithmic_amount_selector_final_ratio_value)),
+            "full_cloud_amount_noop_selected": pts_xyz.new_tensor(
+                float(full_cloud_amount_override_enabled and algorithmic_amount_selected_class_value <= 0)
+            ),
+            "full_cloud_amount_selected_prob": pts_xyz.new_tensor(float(algorithmic_amount_selector_selected_prob_value)),
+            "full_cloud_amount_predicted_delta": pts_xyz.new_tensor(float(full_cloud_amount_predicted_delta_value)),
+            "full_cloud_amount_bin_logits": algorithmic_amount_selector_logits,
+            "full_cloud_amount_predicted_delta_per_amount": (
+                full_cloud_amount_terms.get("predicted_delta_per_amount")
+                if torch.is_tensor(full_cloud_amount_terms.get("predicted_delta_per_amount", None))
+                else pts_xyz.new_zeros((1, int(algorithmic_amount_selector_logits.shape[1])))
+            ),
+            "full_cloud_amount_ratio_reg_loss": pts_xyz.new_tensor(0.0),
+            "actual_gate_prune_enabled": pts_xyz.new_tensor(float(require_actual_gate_prune)),
+            "actual_gate_prune_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),
+            "hard_prune_actual_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),
+            "hard_drop_block_reason": hard_drop_block_reason,
+            "phase0_network_mode_but_hard_drop_zero": pts_xyz.new_tensor(float(phase0_network_mode_but_hard_drop_zero)),
+            "phase0_noop_only_collapse_detected": pts_xyz.new_tensor(float(phase0_noop_only_collapse_detected)),
+            "collapse_reason": phase0_collapse_reason,
+            "hard_drop_count_trace": hard_drop_count_trace,
+            "codec_prune_prior_enabled": pts_xyz.new_tensor(float(codec_prune_prior_enabled)),
+            "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase),
+            "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio),
+            "codec_prune_prior_base_ratio": pts_xyz.new_tensor(float(codec_prune_prior_ratio)),
+            "codec_prune_prior_active_ratio": pts_xyz.new_tensor(float(codec_prune_prior_active_ratio)),
+            "codec_prune_prior_count_alpha": pts_xyz.new_tensor(float(codec_prune_prior_count_alpha)),
+            "amount_mode_id": pts_xyz.new_tensor(float(amount_mode_id)),
+            "amount_mode_network": pts_xyz.new_tensor(float(amount_mode_network)),
+            "hard_drop_target_ratio_source_id": pts_xyz.new_tensor(float(hard_drop_target_ratio_source_id)),
+            "hard_drop_target_ratio_value": pts_xyz.new_tensor(float(hard_drop_target_ratio_value)),
+            "hard_drop_target_ratio_network_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_network_value)
+            ),
+            "hard_drop_target_ratio_codec_prior_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_codec_prior_value)
+            ),
+            "post_warmup_amount_hybrid_applied": pts_xyz.new_tensor(
+                float(post_warmup_amount_hybrid_applied)
+            ),
+            "post_warmup_amount_mode_id": pts_xyz.new_tensor(
+                float(post_warmup_amount_mode_id)
+            ),
+            "post_warmup_amount_strategy_id": pts_xyz.new_tensor(
+                float(post_warmup_amount_strategy_id)
+            ),
+            "post_warmup_amount_tail_phase": pts_xyz.new_tensor(
+                float(post_warmup_amount_tail_phase_value)
+            ),
+            "post_warmup_amount_alpha": pts_xyz.new_tensor(
+                float(post_warmup_amount_alpha_value)
+            ),
+            "post_warmup_amount_proposal_ratio": pts_xyz.new_tensor(
+                float(post_warmup_amount_proposal_ratio_value)
+            ),
+            "post_warmup_amount_teacher_loss": post_warmup_amount_teacher_loss.detach(),
+            "post_warmup_amount_teacher_weight_effective": pts_xyz.new_tensor(
+                float(post_warmup_amount_teacher_weight_effective)
+            ),
+            "amount_explore_step": pts_xyz.new_tensor(float(amount_explore_step)),
+            "amount_explore_prob": pts_xyz.new_tensor(float(amount_explore_prob_value)),
+            "amount_explore_candidate_ratio": pts_xyz.new_tensor(
+                float(amount_explore_candidate_ratio_value)
+            ),
+            "amount_explore_candidate_index": pts_xyz.new_tensor(
+                float(amount_explore_candidate_index_value)
+            ),
+            "amount_explore_teacher_ratio": pts_xyz.new_tensor(
+                float(amount_explore_teacher_ratio_value)
+            ),
+            "amount_explore_teacher_count": pts_xyz.new_tensor(
+                float(amount_explore_teacher_count_value)
+            ),
+            "amount_explore_teacher_score": pts_xyz.new_tensor(
+                float(amount_explore_teacher_score_value)
+            ),
+            "amount_explore_teacher_alpha": pts_xyz.new_tensor(
+                float(amount_explore_teacher_alpha_value)
+            ),
+            "amount_explore_used_teacher": pts_xyz.new_tensor(
+                float(amount_explore_used_teacher)
+            ),
+            "codec_prune_prior_block_size": pts_xyz.new_tensor(float(codec_prune_prior_block_size)),
+            "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
+                float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)
+            ),
+            "prune_ratio_monotonic_floor": pts_xyz.new_tensor(
+                float(monotonic_prune_floor_value if monotonic_prune_floor_value is not None else float("nan"))
+            ),
+            "network_prune_ratio_floor": pts_xyz.new_tensor(float(network_prune_floor_ratio)),
+            "network_prune_min_hard_count": pts_xyz.new_tensor(float(network_prune_min_hard_count)),
+            "network_prune_floor_steps": pts_xyz.new_tensor(
+                float(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 0))
+            ),
+            "network_prune_floor_decay_steps": pts_xyz.new_tensor(
+                float(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 0))
+            ),
+            "drop_score_gate_applied_to_hard_selection": pts_xyz.new_tensor(float(not phase0_network_prune_mode)),
+            "raw_learned_drop_ratio": raw_learned_drop_ratio.mean(),
+            "raw_learned_add_ratio": raw_learned_add_ratio.mean(),
+            "raw_learned_move_ratio": raw_learned_move_ratio.mean(),
+            "learned_drop_ratio_before_floor": learned_drop_ratio_before_floor.mean(),
+            "learned_drop_ratio_after_floor": learned_drop_ratio_after_floor.mean(),
+            "learned_drop_ratio_before_gate": learned_drop_ratio_before_gate.mean(),
+            "learned_drop_ratio_after_gate": learned_drop_ratio_after_gate.mean(),
+            "learned_drop_ratio_value": pts_xyz.new_tensor(float(learned_drop_ratio_value)),
+            "effective_drop_ratio_for_hard_count": effective_drop_ratio_for_hard_count.mean(),
+            "voxel_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("voxel_count", 0.0))),
+            "codec_block_valid_point_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_valid_point_count", 0.0))
+            ),
+            "codec_block_budget_points": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_budget_points", 0.0))
+            ),
+            "codec_block_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_count", 0.0))
+            ),
+            "codec_block_selected_block_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_selected_block_count", 0.0))
+            ),
+            "codec_block_selected_point_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_selected_point_count", 0.0))
+            ),
+            "codec_block_budget_zero": pts_xyz.new_tensor(
+                float(bool(last_hard_drop_trace.get("codec_block_budget_zero", False)))
+            ),
+            "codec_block_target_drop_ratio": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_target_drop_ratio", 0.0))
+            ),
+            "codec_block_under_selected": pts_xyz.new_tensor(
+                float(bool(last_hard_drop_trace.get("codec_block_under_selected", False)))
+            ),
+            "where_mode": str(last_hard_drop_trace.get("where_mode", getattr(self.args, "sparsepcgc_where_mode", "block_only"))),
+            "where_mode_id": pts_xyz.new_tensor(float(last_hard_drop_trace.get("where_mode_id", 0.0))),
+            "macro_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_ratio", 0.0))),
+            "micro_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_ratio", 0.0))),
+            "macro_selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_selected_block_count", 0.0))),
+            "macro_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_drop_count", 0.0))),
+            "micro_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_drop_count", 0.0))),
+            "total_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("total_drop_count", last_hard_drop_trace.get("final_hard_drop_count", 0.0)))),
+            "selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("selected_block_count", 0.0))),
+            "micro_selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_selected_block_count", 0.0))),
+            "max_drop_count_per_block": pts_xyz.new_tensor(float(last_hard_drop_trace.get("max_drop_count_per_block", 0.0))),
+            "mean_drop_count_per_selected_block": pts_xyz.new_tensor(float(last_hard_drop_trace.get("mean_drop_count_per_selected_block", 0.0))),
+            "drop_concentration_top1_block_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("drop_concentration_top1_block_ratio", 0.0))),
+            "drop_concentration_top5_block_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("drop_concentration_top5_block_ratio", 0.0))),
+            "hard_where_uses_network_score": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("hard_where_uses_network_score", False)))),
+            "heuristic_where_score_mean": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_mean", 0.0))),
+            "heuristic_where_score_std": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_std", 0.0))),
+            "micro_quota_hit_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_quota_hit_block_count", 0.0))),
+            "micro_min_selected_blocks": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_min_selected_blocks", 0.0))),
+            "micro_candidate_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_candidate_block_count", 0.0))),
+            "micro_min_blocks_satisfied": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("micro_min_blocks_satisfied", False)))),
+            "micro_min_blocks_fallback_reason": str(last_hard_drop_trace.get("micro_min_blocks_fallback_reason", "")),
+            "macro_micro_hybrid_fallback": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("macro_micro_hybrid_fallback", False)))),
+            "effective_where_mode": str(last_hard_drop_trace.get("effective_where_mode", last_hard_drop_trace.get("where_mode", ""))),
+            "macro_disabled_reason": str(last_hard_drop_trace.get("macro_disabled_reason", "")),
+            "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)),
+            "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)),
+            "delete_candidate_after_leaf_mask_count": pts_xyz.new_tensor(float(delete_candidate_after_leaf_mask_count)),
+            "delete_candidate_count": pts_xyz.new_tensor(float(delete_candidate_voxel_count_value)),
+            "delete_candidate_point_count": pts_xyz.new_tensor(float(delete_candidate_point_count_value)),
+            "delete_candidate_empty_reason": delete_candidate_empty_reason,
+            "hard_delete_selection_count": pts_xyz.new_tensor(float(hard_delete_selection_voxel_count_value)),
+            "hard_delete_selection_point_count": pts_xyz.new_tensor(float(hard_delete_selection_count_value)),
+            "pre_round_target_count": pts_xyz.new_tensor(float(pre_round_target_count_value)),
+            "post_round_target_count": pts_xyz.new_tensor(float(post_round_target_count_value)),
+            "min_hard_drop_count_floor_applied": pts_xyz.new_tensor(float(min_hard_drop_count_floor_applied)),
+            "hard_mask_count": pts_xyz.new_tensor(float(hard_mask_count_value)),
+            "final_hard_drop_count": pts_xyz.new_tensor(float(hard_drop_count_value)),
+            "learned_drop_ratio": learned_drop_ratio.mean(),
+            "learned_drop_prob": learned_drop_prob,
+            "drop_prob_mean": drop_prob.mean(),
+            "drop_ratio_soft": drop_ratio_soft.detach(),
+            "drop_ratio_hard": drop_ratio_hard.detach(),
+            "drop_ratio_soft_batch_mean": drop_ratio_soft_batch.detach().mean(),
+            "drop_ratio_hard_batch_mean": drop_ratio_hard_batch.detach().mean(),
+            "drop_amount_supervision_loss": drop_amount_supervision_loss.detach(),
+            "drop_amount_soft_consistency_loss": drop_amount_soft_consistency_loss.detach(),
+
+            "soft_drop_budget_mean": soft_drop_budget.detach().mean(),
+            "valid_delete_voxel_count_mean": valid_delete_voxel_count.detach().mean(),
+
+            # 点数基準のPrune量。
+            "soft_drop_sum": soft_drop_prob_for_guard.detach().sum(),
+            "hard_drop_sum": hard_drop.detach().sum(),
+            "drop_soft_hard_sum_abs_diff": (
+                soft_drop_prob_for_guard.detach().sum() - hard_drop.detach().sum()
+            ).abs(),
+
+            # Voxel数基準のPrune量。
+            "soft_drop_voxel_sum": soft_drop_voxel_mass_per_batch.detach().sum(),
+            "hard_drop_voxel_sum": hard_drop_voxel_mass_per_batch.detach().sum(),
+            "drop_soft_hard_voxel_sum_abs_diff": (
+                soft_drop_voxel_mass_per_batch.detach().sum()
+                - hard_drop_voxel_mass_per_batch.detach().sum()
+            ).abs(),
+
+            "drop_soft_hard_ratio_abs_diff": (drop_ratio_soft.detach() - drop_ratio_hard.detach()).abs(),
+            "drop_prob_min": drop_prob.amin() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_max": drop_prob.amax() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_direct_mean": drop_prob_direct.mean(),
+            "drop_prob_direct_min": drop_prob_direct.amin() if drop_prob_direct.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_direct_max": drop_prob_direct.amax() if drop_prob_direct.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_proxy_mean": drop_prob_proxy.mean(),
+            "drop_prob_proxy_min": drop_prob_proxy.amin() if drop_prob_proxy.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_proxy_max": drop_prob_proxy.amax() if drop_prob_proxy.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_logit_mean": learned_drop_logit.mean(),
+            "drop_logit_min": learned_drop_logit.amin() if learned_drop_logit.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_logit_max": learned_drop_logit.amax() if learned_drop_logit.numel() > 0 else pts_xyz.new_zeros(()),
+            "keep_prob_mean": keep_prob.mean(),
+            "keep_prob_min": keep_prob.amin() if keep_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "keep_prob_max": keep_prob.amax() if keep_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_entropy": drop_entropy,
+            "soft_drop_mass": soft_drop_mass,
+            "selected_drop_count_hard": pts_xyz.new_tensor(float(hard_drop_count_value)),
+            "prune_soft_geom": prune_soft_geom,
+            "prune_soft_rate": prune_soft_rate,
+            "prune_soft_node": prune_soft_node,
+            "prune_soft_single": prune_soft_single,
+            "prune_soft_bit": prune_soft_bit,
+            "drop_direct_target_loss": drop_direct_target_loss,
+            "learned_drop_ratio_std": learned_drop_ratio.float().std(unbiased=False),
+            "learned_add_ratio": learned_add_ratio.mean(),
+            "learned_add_ratio_std": learned_add_ratio.float().std(unbiased=False),
+            "learned_move_ratio": learned_move_ratio.mean(),
+            "learned_move_ratio_std": learned_move_ratio.float().std(unbiased=False),
+            "operation_amount_consistency_loss": operation_amount_consistency_loss,
+            "operation_entropy": operation_entropy,
+            "operation_entropy_loss": operation_entropy_loss,
+            "operation_entropy_weight_effective": pts_xyz.new_tensor(
+                float(operation_entropy_weight_effective)
+            ),
+            "move_ratio_soft": move_ratio_soft.detach(),
+            "move_ratio_hard": move_ratio_hard.detach(),
+            "move_ratio_soft_batch_mean": move_ratio_soft_batch.detach().mean(),
+            "move_ratio_hard_batch_mean": move_ratio_hard_batch.detach().mean(),
+            "move_amount_supervision_loss": move_amount_supervision_loss.detach(),
+            "move_amount_soft_consistency_loss": move_amount_soft_consistency_loss.detach(),
+
+            "soft_move_budget_mean": soft_move_budget.detach().mean(),
+            "valid_move_source_voxel_count_mean": valid_move_source_voxel_count.detach().mean(),
+            "valid_move_source_voxel_count_effective_mean": valid_move_source_voxel_count_effective.detach().mean(),
+
+            # 点数基準のAdjust量。
+            "soft_move_sum": soft_move_score_for_guard.detach().sum(),
+            "hard_move_sum": hard_move.detach().sum(),
+            "move_soft_hard_sum_abs_diff": (
+                soft_move_score_for_guard.detach().sum() - hard_move.detach().sum()
+            ).abs(),
+
+            # Voxel数基準のAdjust量。
+            "soft_move_voxel_sum": soft_move_voxel_mass_per_batch.detach().sum(),
+            "hard_move_voxel_sum": hard_move_voxel_mass_per_batch.detach().sum(),
+            "move_soft_hard_voxel_sum_abs_diff": (
+                soft_move_voxel_mass_per_batch.detach().sum()
+                - hard_move_voxel_mass_per_batch.detach().sum()
+            ).abs(),
+
+            "move_soft_hard_ratio_abs_diff": (
+                move_ratio_soft.detach() - move_ratio_hard.detach()
+            ).abs(),
+            "soft_activity_loss": soft_activity_loss,
+            "subtree_move_source_prob_mean": subtree_move_source_prob.mean(),
+            "subtree_move_source_prob_max": subtree_move_source_prob.amax() if subtree_move_source_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "move_direction_ce": move_direction_ce,
+            "add_direction_ce": add_direction_ce,
+            "temperature": float(operation_temperature),
+            "actuator_voxel_mode": actuator_voxel_mode,
+            "local_recomputed": bool(actuator_local_recomputed),
+            "exploration_noise": float(exploration_noise),
+            "operation_prob_floor_applied": bool(add_ratio_floor_applied),
+            "move_score_noise": float(move_score_noise),
+            "sparsepcgc_add_experiment_enabled": bool(sparsepcgc_add_experiment_active),
+            "sparsepcgc_add_warmup": float(self._sparsepcgc_add_warmup()),
+            "add_score_noise": float(add_score_noise),
+            "add_weight_random_mix": float(add_weight_random_mix),
+            "drop_score_noise": float(drop_score_noise),
+            "drop_random_mix": float(drop_random_mix),
+            "add_enabled": bool(add_enabled),
+            "prune_enabled": bool(prune_enabled),
+            "disp_enabled": bool(disp_enabled),
+            "actuator_stage": stage,
+            "actuator_stage_raw": stage_raw,
+            "actuator_strength": float(actuator_strength),
+            "force_joint_actuator": bool(force_joint_actuator),
+            "threshold_cap_mode": bool(threshold_cap_mode),
+            "delta": delta,
+            "point_soft_delta_debug": point_soft_delta_debug,
+            "primitive_delta": primitive_delta,
+            "move_ratio": hard_move.mean(),
+            "hard_move_count": hard_move_count_value,
+            "move_score_mean": move_score.mean(),
+            "move_source_prior_mean": move_source_prior.mean(),
+            "adjusted_point_count": hard_move_count_value,
+            "adjusted_point_rate": adjusted_point_rate_value,
+            "raw_hard_move_count_before_sparsepcgc_guard": raw_hard_move_count_value,
+            "source_unique_voxel_count": sparsepcgc_source_unique_voxel_count_value,
+            "target_unique_voxel_count": sparsepcgc_target_unique_voxel_count_value,
+            "target_duplicate_voxel_count": sparsepcgc_target_duplicate_voxel_count_value,
+            "target_voxel_duplicate_rate": sparsepcgc_target_duplicate_rate_value,
+            "target_existing_occupied_count": target_existing_occupied_count_value,
+            "target_existing_occupied_rate": target_existing_occupied_rate_value,
+            "target_empty_voxel_count": target_empty_voxel_count_value,
+            "target_empty_voxel_rate": target_empty_voxel_rate_value,
+            "empty_target_violation_loss": empty_target_violation_loss,
+            "target_duplicate_voxel_loss": target_duplicate_voxel_loss,
+            "enable_sparsepcgc_empty_target_guard": empty_target_guard_enabled,
+            "enable_sparsepcgc_target_duplicate_guard": target_duplicate_guard_enabled,
+            "sparsepcgc_empty_target_guard_rejected_count": empty_guard_rejected_count_value,
+            "sparsepcgc_target_duplicate_guard_rejected_count": target_duplicate_guard_rejected_count_value,
+            "sparsepcgc_guard_rejected_count": sparsepcgc_guard_rejected_count_value,
+            "sparsepcgc_move_existing_target_only": bool(getattr(self.args, "sparsepcgc_move_existing_target_only", False)),
+            "repair_move_require_empty_target": bool(getattr(self.args, "repair_move_require_empty_target", True)),
+            "repair_move_require_empty_target_effective": bool(require_empty_move),
+            "repair_move_max_points_per_voxel": int(getattr(self.args, "repair_move_max_points_per_voxel", 8)),
+            "repair_move_warmup": float(move_warmup),
+            "target_move_ratio": float(target_move_ratio),
+            "max_move_ratio": float(max_move_ratio),
+            "repair_move_hard_threshold": float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
+            "move_target_valid_ratio": move_target_valid.mean(),
+            "moved_delta_mean": moved_delta_mean,
+            "before_occupied_voxel_count": before_occupied_voxels,
+            "after_occupied_voxel_count": after_occupied_voxels,
+            "occupied_voxel_delta": after_occupied_voxels - before_occupied_voxels,
+            "delete_target_voxel_count": delete_target_voxel_count_value,
+            "delete_emptied_voxel_count": delete_emptied_voxel_count_value,
+            "delete_removed_point_count": delete_removed_point_count_value,
+            "hard_drop_ratio": hard_drop.mean(),
+            "hard_drop_count": hard_drop_count_value,
+            "add_target_voxel_count": add_target_voxel_count_value,
+            "add_actual_point_count": add_effective_count_value,
+            "move_source_voxel_count": move_source_voxel_count_value,
+            "move_target_voxel_count": move_target_voxel_count_value,
+            "move_source_emptied_voxel_count": move_source_emptied_voxel_count_value,
+            "move_target_new_voxel_count": move_target_new_voxel_count_value,
+            "move_source_not_emptied_count": move_source_not_emptied_count_value,
+            "moved_different_voxel_count": moved_different_voxel_count_value,
+            "same_voxel_adjust_count": same_voxel_adjust_count_value,
+            "preserve_ratio": preserve_ratio,
+            "edit_reg": edit_reg,
+            "ratio_loss": ratio_loss,
+            "shape_guard": shape_guard,
+            "drop_ratio_loss": drop_ratio_loss,
+            "drop_cap_loss": drop_cap_loss,
+            "drop_shape_guard": drop_shape_guard,
+            "add_ratio_loss": add_ratio_loss,
+            "add_shape_guard": add_shape_guard,
+            "add_offset_reg": add_offset_reg,
+            "add_drop_conflict_loss": add_drop_conflict_loss,
+            "added_keep_loss": added_keep_loss,
+            "add_min_offset_loss": add_min_offset_loss,
+            "quant_move_conflict_loss": quant_move_conflict_loss,
+            "quant_add_guard": quant_add_guard,
+            "local_edit_guard": local_edit_guard,
+            "point_parent_node_ids": point_parent_node_ids,
+
+            # Phase3: occupied voxel集合としての編集状態。
+            # final_voxel_coords / final_voxel_weights は点対応ではなくoccupied voxel対応へ切り替える。
+            "voxel_edit_state_enabled": bool(voxel_edit_state_enabled),
+            "voxel_edit_mode": (
+                "ana_den6_exact_residual_plan"
+                if exact_residual_plan_applied
+                else "ana_den6_exact_anchor_with_network_soft_backward"
+                if exact_anchor_applied else voxel_edit_mode
+            ),
+            "ana_den6_exact_candidate_mode": bool(exact_den6_candidate_mode),
+            "ana_den6_exact_anchor_applied": bool(exact_anchor_applied),
+            "ana_den6_exact_residual_plan_applied": bool(exact_residual_plan_applied),
+            "ana_den6_exact_residual_plan_debug": exact_residual_plan_debug,
+            "den6_online_policy_log_prob": exact_residual_plan_debug.get(
+                "policy_log_prob", single_policy_log_prob
+            ),
+            "den6_online_policy_entropy": exact_residual_plan_debug.get(
+                "policy_entropy", single_policy_entropy
+            ),
+            "den6_online_where_log_prob": exact_residual_plan_debug.get(
+                "where_log_prob", single_where_log_prob
+            ),
+            "den6_online_amount_log_prob": exact_residual_plan_debug.get(
+                "amount_log_prob", single_amount_log_prob
+            ),
+            "den6_online_action_log_prob": exact_residual_plan_debug.get(
+                "action_log_prob", single_action_log_prob
+            ),
+            "den6_online_candidate_local_credit_loss": exact_residual_plan_debug.get(
+                "candidate_local_credit_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_candidate_actor_proxy_loss": exact_residual_plan_debug.get(
+                "candidate_actor_proxy_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_operation_local_credit_loss": exact_residual_plan_debug.get(
+                "operation_local_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_amount_local_credit_loss": exact_residual_plan_debug.get(
+                "amount_local_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_fine_local_credit_loss": exact_residual_plan_debug.get(
+                "fine_local_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_actor_critic_plan_feature": exact_residual_plan_debug.get(
+                "_actor_critic_plan_feature", pts_xyz.new_zeros((18,))
+            ),
+            "den6_online_actor_critic_plan_value": exact_residual_plan_debug.get(
+                "_actor_critic_plan_value", pts_xyz.new_zeros(())
+            ),
+            "den6_online_actor_critic_plan_log_variance": exact_residual_plan_debug.get(
+                "_actor_critic_plan_log_variance", pts_xyz.new_zeros(())
+            ),
+            "den6_online_actor_critic_changed_ratio": exact_residual_plan_debug.get(
+                "_actor_critic_selected_changed_ratio", pts_xyz.new_zeros(())
+            ),
+            "den6_online_actor_critic_operation_ratio": exact_residual_plan_debug.get(
+                "_actor_critic_selected_operation_ratio", pts_xyz.new_zeros(())
+            ),
+            "network_only_direction_log_prob": exact_residual_plan_debug.get(
+                "direction_log_prob", single_direction_log_prob
+            ),
+            "network_only_direction_entropy": exact_residual_plan_debug.get(
+                "direction_entropy", single_direction_entropy
+            ),
+            "network_only_total_ratio_raw": (
+                network_only_policy_terms["total_ratio_raw"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1, 1))
+            ),
+            "network_only_total_ratio": (
+                network_only_policy_terms["total_ratio"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1, 1))
+            ),
+            "network_only_total_ratio_unconstrained": (
+                network_only_policy_terms["total_ratio_unconstrained"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1, 1))
+            ),
+            "network_only_total_ratio_mean": (
+                network_only_policy_terms["total_ratio_mean"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1, 1))
+            ),
+            "network_only_shares": (
+                network_only_policy_terms["shares"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_shares_raw": (
+                network_only_policy_terms["shares_raw"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_shares_mean": (
+                network_only_policy_terms["shares_mean"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_priorities": (
+                network_only_policy_terms["priorities"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_temperature": (
+                network_only_policy_terms["temperature"]
+                if network_only_codec_mode else pts_xyz.new_ones((B, 1, 1))
+            ),
+            "network_only_where_threshold": (
+                network_only_policy_terms["where_threshold"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_where_sampling_temperature": (
+                network_only_policy_terms["where_sampling_temperature"]
+                if network_only_codec_mode else pts_xyz.new_ones((B, 1, 1))
+            ),
+            "network_only_direction_sampling_temperature": (
+                network_only_policy_terms["direction_sampling_temperature"]
+                if network_only_codec_mode else pts_xyz.new_ones(())
+            ),
+            "network_only_exploration_fraction": (
+                network_only_policy_terms["exploration_fraction"]
+                if network_only_codec_mode else pts_xyz.new_zeros(())
+            ),
+            "network_only_predicted_local_gain_sum": (
+                network_only_policy_terms["predicted_local_gain_sum"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1))
+            ),
+            "network_only_interaction_correction": (
+                network_only_policy_terms["interaction_correction"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1))
+            ),
+            "network_only_predicted_plan_gain": (
+                network_only_policy_terms["predicted_plan_gain"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1))
+            ),
+            "network_only_where_entropy": (
+                network_only_policy_terms["where_entropy"]
+                if network_only_codec_mode else pts_xyz.new_zeros(())
+            ),
+            "network_only_amount_entropy": (
+                network_only_policy_terms["amount_entropy"]
+                if network_only_codec_mode else pts_xyz.new_zeros(())
+            ),
+            "network_only_action_entropy": (
+                network_only_policy_terms["action_entropy"]
+                if network_only_codec_mode else pts_xyz.new_zeros(())
+            ),
+            "ana_den6_candidate_formula_basis": (
+                str(heuristic_guidance.get("formula_basis", ""))
+                if isinstance(heuristic_guidance, dict) else ""
+            ),
+            "initial_voxel_coords": voxel_edit_initial_coords,
+            "final_voxel_coords": voxel_edit_final_coords,
+            "final_voxel_weights": voxel_edit_final_weights,
+            "final_voxel_valid_mask": voxel_edit_valid_mask,
+            # Geometry Fit must distinguish true Add targets from Adjust
+            # destinations.  A final-vs-initial set difference contains both.
+            "voxel_edit_add_target_coords": voxel_edit_add_target_coords.detach(),
+            "voxel_edit_add_target_mask": voxel_edit_add_target_mask.detach(),
+            "external_executable_plan_applied": bool(external_executable_plan_applied),
+            "external_executable_plan_hash": str(external_executable_plan_hash),
+            "voxel_step": voxel_step,
+            "voxel_offset": voxel_offset,
+
+            # 既存の点対応Voxel状態も必要な場合に参照できるように残す。
+            "point_aligned_initial_voxel_coords": voxel_coords,
+            "point_aligned_final_voxel_coords": final_voxel_coords,
+            "point_aligned_final_voxel_weights": final_w,
+
+            "voxel_edit_initial_count": voxel_edit_initial_count_value,
+            "voxel_edit_final_count": voxel_edit_final_count_value,
+            "voxel_edit_drop_count": voxel_edit_drop_count_value,
+            "voxel_edit_add_count": voxel_edit_add_count_value,
+            "voxel_edit_move_count": voxel_edit_move_count_value,
+            "input_voxel_count": voxel_edit_initial_count_value,
+            "final_voxel_count": voxel_edit_final_count_value,
+            "before_occupied_voxel_count_for_stats": before_occupied_voxels,
+            "point_aligned_after_occupied_voxel_count": point_aligned_after_occupied_voxels,
+            "voxel_edit_same_voxel_move_rejected": voxel_edit_same_voxel_move_rejected_value,
+            "voxel_edit_existing_target_rejected": voxel_edit_existing_target_rejected_value,
+            "voxel_edit_duplicate_target_rejected": voxel_edit_duplicate_target_rejected_value,
+            "voxel_edit_child_slot_rejected": voxel_edit_child_slot_rejected_value,
+            "voxel_edit_empty_target_rejected": voxel_edit_empty_target_rejected_value,
+            "estimated_edit_record_bits": float(actual_oracle_edit_record_bits_value),
+            "estimated_edit_record_raw_percent": float(actual_oracle_raw_percent_value),
+            "canonical_voxel_coords_before": canonical_voxel_coords_before,
+            # Phase7-2: full-context / full-cloud correctionへ渡す微分可能なsoft編集量。
+            # hard mask / final_voxel_coords.long() ではなく、既存のsoft probability / score / amountを使う。
+            # ここはloss接続用なのでdetachしない。
+            "voxel_soft_drop_score": torch.nan_to_num(drop_prob_proxy.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            "voxel_soft_add_score": torch.nan_to_num(add_target_soft_add.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            "voxel_soft_move_score": torch.nan_to_num(soft_move_score_effective.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+
+            "voxel_soft_drop_amount": torch.nan_to_num(learned_drop_ratio.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            "voxel_soft_add_amount": torch.nan_to_num(learned_add_ratio.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            "voxel_soft_move_amount": torch.nan_to_num(learned_move_ratio.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+
+            "voxel_soft_edit_score": torch.nan_to_num(
+                (
+                    drop_prob_proxy.float().mean()
+                    + add_target_soft_add.float().mean()
+                    + soft_move_score_effective.float().mean()
+                ) / 3.0,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+
+            "voxel_soft_edit_count_proxy": torch.nan_to_num(
+                soft_drop_mass
+                + add_target_soft_add.float().sum()
+                + soft_move_score_effective.float().sum(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            "canonical_voxel_coords_after": canonical_voxel_coords_after,
+            "voxel_restore_meta": voxel_restore_meta,
+            "restored_xyz_debug": restored_xyz_debug,
+            "restore_info": restore_info,
+            "repair_output_voxel_restored_points": bool(voxel_restored_output_enabled),
+            "final_voxel_update_mode": "occupied_voxel_edit_state_phase3",
+            "final_voxel_recomputed_from_pts_out": False,
+            "point_child_slots": point_child_slots,
+            "point_valid_empty_child_mask": point_valid_empty_child_mask, 
+            "full_octree_context_available": bool(full_context_available),
+            "actuator_parent_occupancy_code": int(actuator_parent_occupancy_code),
+            "actuator_sibling_count": int(actuator_sibling_count),
+            "actuator_ancestor_count": int(actuator_ancestor_count),
+            "full_context_bonus_mean": full_context_bonus.mean(),
+        }

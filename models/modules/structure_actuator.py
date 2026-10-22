@@ -3408,7 +3408,16 @@ class StructureRepairActuator(nn.Module):
             neginf=-float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0)),
         )
         ratio_logit_scale = max(float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0)), 1e-6)
-        bounded_logit = ratio_logit_scale * torch.tanh(raw_logit / ratio_logit_scale)
+        from ..utils.training.sparsepcgc_actual_credit import (
+            sparsepcgc_credit_mode, stable_amount_tanh,
+        )
+        if sparsepcgc_credit_mode(self.args):
+            # Preserve the tanh function and bounded forward; use its stable
+            # sigmoid-tail identity so a trained FP32 logit around -55 does
+            # not lose the genuine derivative through a rounded tanh=-1.
+            bounded_logit = ratio_logit_scale * stable_amount_tanh(raw_logit / ratio_logit_scale)
+        else:
+            bounded_logit = ratio_logit_scale * torch.tanh(raw_logit / ratio_logit_scale)
         learned_ratio = torch.sigmoid(bounded_logit) * float(max_ratio)
 
         if bool(getattr(self.args, "repair_learn_operation_amounts", True)):
@@ -4624,6 +4633,19 @@ class StructureRepairActuator(nn.Module):
                 key=lambda name: (scores[name], -groups.index(name)),
             )
             score_audit[selected]["selected_by_consecutive_cap"] = True
+        from ..utils.training.sparsepcgc_actual_credit import (
+            sparsepcgc_credit_training, refresh_actual_credit_group,
+        )
+        if sparsepcgc_credit_training(self.args):
+            last_opened = getattr(self, '_sparsepcgc_group_last_opened_step', None)
+            if last_opened is None:
+                last_opened = {}
+                self._sparsepcgc_group_last_opened_step = last_opened
+            previous_selection = selected
+            selected = refresh_actual_credit_group(
+                selected, groups, scores, last_opened,
+                getattr(self.args, '_global_train_step', 0), min_share)
+            score_audit[selected]['selected_by_recent_teacher_coverage'] = (selected != previous_selection)
         current_streak = previous_streak + 1 if selected == previous_group else 1
         self._den6_last_factorized_exploration_group = str(selected)
         self._den6_factorized_exploration_group_streak = int(current_streak)
@@ -8077,6 +8099,13 @@ class StructureRepairActuator(nn.Module):
         return ratio.detach() + scale * (ratio - ratio.detach())
 
     def _scale_where_downstream_grad(self, value, op_name=""):
+        # These legacy STE multipliers must not attenuate the dedicated
+        # Actual score-function path (0.005 * 1/6 for Prune in old defaults).
+        # Forward is identical; codec-specific Actual credit retains its own
+        # measured advantage and downstream safety clipping.
+        from ..utils.training.sparsepcgc_actual_credit import sparsepcgc_credit_training
+        if sparsepcgc_credit_training(self.args):
+            return value
         # Where score / logit のforward値は変えず、backwardだけ強める。
         # これにより圧縮損失 L_com から drop_head / add_head / move_voxel_head へ戻る勾配を操作別に調整する。
         op_name = str(op_name).strip().lower()

@@ -1,0 +1,414 @@
+"""Read-only-source, isolated training audit of credit routing and Adam updates.
+
+All training semantics are delegated to the original train.py. Extra retained
+backwards restore gradients and RNG. Adam leave-one-source-out (LOO) evaluations
+use detached cloned parameters/state and fixed observed routing/clip factors;
+they are conditional diagnostics, not alternative codec experiments.
+"""
+import argparse
+import copy
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import random
+import shutil
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+
+def main():
+    parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument('--out', required=True)
+    parser.add_argument('--steps', type=int, default=6)
+    parser.add_argument('--seed-cache', type=Path)
+    parser.add_argument('--teacher-device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    opts = parser.parse_args()
+    out = Path(opts.out).resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    if opts.seed_cache:
+        # Do not mix a cached GT stream from a different CPU/GPU arithmetic
+        # backend with a freshly encoded edited stream. Re-encode each GT.
+        for folder in ('features', 'online', 'structure', 'tensors'):
+            source = opts.seed_cache / folder
+            if source.is_dir():
+                shutil.copytree(str(source), str(out / 'cache' / folder))
+
+    import numpy as np
+    import torch
+    import train as training
+    from models.utils.training import train_runtime as runtime
+
+    state = {'step': 0, 'vectors': {}, 'phase': {}, 'components': {}}
+    log_path = out / 'routing.jsonl'
+
+    def emit(kind, **fields):
+        with log_path.open('a') as f:
+            f.write(json.dumps(dict(kind=kind, step=state['step'], **fields),
+                               allow_nan=False, default=str) + '\n')
+
+    def initialize(model, args):
+        state.update(model=model, args=args)
+        named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        state['named'] = named
+        offsets, cursor = {}, 0
+        for n, p in named:
+            offsets[n] = (cursor, cursor + p.numel())
+            cursor += p.numel()
+        state['offsets'], state['size'] = offsets, cursor
+        specs = [('ALL', [''])]
+        specs += [('module:' + n, [n + '.']) for n, _ in model.named_children()]
+        specs += [('head:' + n, ['actuator.' + n + '.'])
+                  for n, _ in model.actuator.named_children()]
+        specs += [('AddWhere', ['actuator.add_head.', 'actuator.add_voxel_head.']),
+                  ('PruneWhere', ['actuator.drop_head.']),
+                  ('AdjustWhere', ['actuator.subtree_move_source_head.', 'actuator.move_voxel_head.']),
+                  ('AddAmount', ['actuator.add_amount_head.']),
+                  ('PruneAmount', ['actuator.drop_amount_head.']),
+                  ('AdjustAmount', ['actuator.move_amount_head.']),
+                  ('AmountSelector', ['actuator.algorithmic_amount_selector_head.']),
+                  ('Gate', ['actuator.operation_gate_head.']),
+                  ('feature_gate', ['point_transformer_feature_gate'])]
+        state['groups'] = {}
+        for label, prefixes in specs:
+            matched = [n for n, _ in named if any(n.startswith(pre) for pre in prefixes)]
+            ids = [i for n in matched for i in range(*offsets[n])]
+            state['groups'][label] = torch.tensor(ids, dtype=torch.long)
+        decisions = {id(p) for p in runtime._den6_online_decision_parameters(model)}
+        state['decision_mask'] = torch.cat([
+            torch.full((p.numel(),), id(p) in decisions, dtype=torch.bool) for _, p in named])
+        (out / 'effective_args.json').write_text(json.dumps(vars(args), indent=2, default=str))
+        inventory = [dict(name=n, shape=list(p.shape), requires_grad=p.requires_grad)
+                     for n, p in model.named_parameters()]
+        (out / 'parameters.json').write_text(json.dumps(inventory, indent=2))
+
+    def flat_grads():
+        return torch.cat([p.grad.detach().reshape(-1).double().cpu()
+                          if p.grad is not None else torch.zeros(p.numel(), dtype=torch.float64)
+                          for _, p in state['named']])
+
+    def flat_params():
+        return torch.cat([p.detach().reshape(-1).double().cpu() for _, p in state['named']])
+
+    def stats(vector):
+        results = {}
+        for label, indices in state['groups'].items():
+            v = vector.index_select(0, indices)
+            l2 = float(v.norm())
+            results[label] = dict(l2=l2, rms=l2 / math.sqrt(v.numel()) if v.numel() else None,
+                                  elements=v.numel(), max_abs=float(v.abs().max()) if v.numel() else None)
+        return results
+
+    def cosine(a, b):
+        den = float(a.norm() * b.norm())
+        return float(torch.dot(a, b)) / den if den > 1e-30 else None
+
+    def probe(label, tensor):
+        model = state['model']
+        all_params = list(model.parameters())
+        for module in vars(state['loss']).values():
+            if isinstance(module, torch.nn.Module):
+                all_params.extend(module.parameters())
+        all_params = list({id(p): p for p in all_params}.values())
+        saved = [(p, p.grad) for p in all_params]
+        decisions = runtime._den6_retained_decision_tensors(model)
+        retained = [(t, t.grad) for t in decisions]
+        rng = (random.getstate(), np.random.get_state(), torch.get_rng_state(),
+               torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [])
+        for p in all_params:
+            p.grad = None
+        for t in decisions:
+            t.grad = None
+        try:
+            if torch.is_tensor(tensor) and tensor.requires_grad:
+                tensor.backward(retain_graph=True)
+            vector = flat_grads()
+            state['vectors'][label] = vector
+            connected = [n for n, p in state['named'] if p.grad is not None]
+            decision_stats = []
+            rows = getattr(model.actuator, '_den6_online_operation_decision_tensors', {})
+            for op, tensors in rows.items():
+                for name, t in tensors.items():
+                    g = t.grad
+                    decision_stats.append(dict(operation=op, decision=name,
+                                               l2=float(g.double().norm()) if g is not None else None,
+                                               elements=t.numel()))
+            emit('source_gradient', source=label, groups=stats(vector),
+                 value=float(tensor.detach()) if torch.is_tensor(tensor) else None,
+                 connected_parameters=connected, decision_tensors=decision_stats)
+        finally:
+            for p, g in saved:
+                p.grad = g
+            for t, g in retained:
+                t.grad = g
+            random.setstate(rng[0]); np.random.set_state(rng[1]); torch.set_rng_state(rng[2])
+            if rng[3]:
+                torch.cuda.set_rng_state_all(rng[3])
+
+    original_network = training.Network
+    def make_network(*args, **kwargs):
+        model = original_network(*args, **kwargs)
+        original_policy = model.discrete_policy_loss
+        code = original_policy.__func__.__code__
+        def policy(*a, **kw):
+            captured = {}
+            def profile(frame, event, result):
+                if event == 'return' and frame.f_code is code:
+                    captured.update(frame.f_locals)
+            previous = sys.getprofile()
+            sys.setprofile(profile)
+            try:
+                result = original_policy(*a, **kw)
+            finally:
+                sys.setprofile(previous)
+            # Observe locals without changing baseline/replay/control flow.
+            metadata = {k: v for k, v in captured.items()
+                        if isinstance(v, (str, int, float, bool)) and len(str(v)) < 1200}
+            state['policy_locals'] = metadata
+            names = ['policy_core_weighted', 'plan_critic_loss_weighted',
+                     'actual_group_pair_weighted', 'actual_set_contrast_weighted',
+                     'actual_actor_replay_weighted', 'actual_candidate_critic_replay_weighted',
+                     'actual_proposal_replay_weighted', 'noop_actual_weighted']
+            state['components'] = {n: captured[n] for n in names if n in captured}
+            return result
+        model.discrete_policy_loss = policy
+        return model
+    training.Network = make_network
+
+    original_loss = training.Loss
+    def make_loss(*a, **kw):
+        loss = original_loss(*a, **kw)
+        state['loss'] = loss
+        return loss
+    training.Loss = make_loss
+    original_train = training.train
+    def train_entry(model, args, *rest, **kwargs):
+        initialize(model, args)
+        return original_train(model, args, *rest, **kwargs)
+    training.train = train_entry
+
+    original_capture = training._capture_den6_policy_only_gradients
+    def capture(policy_loss, model):
+        state['step'] += 1
+        state['vectors'], state['phase'] = {}, {}
+        emit('policy_conditions', scalars=state.pop('policy_locals'),
+             debug=dict(model.last_discrete_policy_debug),
+             input_file=str(getattr(state['args'], '_current_input_file', '')))
+        print('[ROUTING] step {} sources'.format(state['step']), flush=True)
+        scale = float(state['args'].heuristic_guidance_online_policy_backward_scale)
+        for key, value in model._den6_policy_source_losses.items():
+            probe('policy:' + key, scale * value)
+        for key, value in state.pop('components').items():
+            probe('component:' + key, scale * value)
+        probe('policy_total', policy_loss)
+        for name in ['den6_plan_critic', 'den6_candidate_critic']:
+            module = getattr(model.actuator, name)
+            emit('last_layer', module=name,
+                 weight_l2=float(module[-1].weight.detach().double().norm()),
+                 bias_l2=float(module[-1].bias.detach().double().norm()))
+        return original_capture(policy_loss, model)
+    training._capture_den6_policy_only_gradients = capture
+
+    def loss_rows(args, model, items, **where):
+        emit('location', location=where)
+        lookup = dict(items)
+        for label in ['L_downstream', 'L_geom', 'weighted_geometry_primary', 'L_total']:
+            probe(label, lookup[label])
+        emit('objective_debug', debug={k: v for k, v in state['loss'].last_compression_debug.items()
+                                      if isinstance(v, (str, int, float, bool)) and
+                                      (not isinstance(v, float) or math.isfinite(v))})
+        del lookup
+        return []
+    training.build_step_grad_rows = loss_rows
+
+    original_restore = training._restore_den6_policy_only_gradients
+    def restore(snapshot, model=None):
+        before = flat_grads()
+        state['phase']['joint_before_routing'] = before
+        result = original_restore(snapshot, model=model)
+        after = flat_grads()
+        state['phase']['after_routing'] = after
+        emit('routing', before=stats(before), after=stats(after), debug=result)
+        vectors = state['vectors']
+        sources = {k: v.clone() for k, v in vectors.items() if k.startswith('policy:')}
+        sources['policy:unclassified'] = vectors['policy_total'] - sum(sources.values())
+        sources['compression_pathwise'] = vectors['L_downstream'].clone()
+        sources['geometry_pathwise'] = vectors['weighted_geometry_primary'].clone()
+        sources['other_or_persistent'] = before - sum(sources.values())
+        for name, vector in sources.items():
+            if not name.startswith('policy:'):
+                vector[state['decision_mask']] = 0.
+        residual = after - sum(sources.values())
+        emit('decomposition_check', stage='after_routing', error_l2=float(residual.norm()),
+             relative_error=float(residual.norm()) / max(float(after.norm()), 1e-30))
+        state['routed_sources'] = sources
+        return result
+    training._restore_den6_policy_only_gradients = restore
+
+    def scale_sources(before, after, stage):
+        scale_vector = torch.ones_like(before)
+        worst = 0.
+        for n, _ in state['named']:
+            left, right = state['offsets'][n]
+            a, b = before[left:right], after[left:right]
+            den = float(torch.dot(a, a))
+            factor = float(torch.dot(a, b)) / den if den else 1.
+            scale_vector[left:right] = factor
+            worst = max(worst, float((factor*a-b).norm()))
+        for source in state['routed_sources'].values():
+            source.mul_(scale_vector)
+        emit('multiplicative_transform', stage=stage, max_parameter_error_l2=worst,
+             group_scales={n: (float(after[idx].norm()) / float(before[idx].norm())
+                               if float(before[idx].norm()) else None)
+                           for n, idx in state['groups'].items()})
+
+    original_balance = training._balance_actual_operation_head_gradients
+    def balance(*a, **kw):
+        before = flat_grads()
+        result = original_balance(*a, **kw)
+        after = flat_grads()
+        scale_sources(before, after, 'decision_balance')
+        emit('balance', before=stats(before), after=stats(after), debug=result)
+        return result
+    training._balance_actual_operation_head_gradients = balance
+
+    original_clip = training.clip_model_gradients
+    def clip(*a, **kw):
+        before = flat_grads()
+        result = original_clip(*a, **kw)
+        after = flat_grads()
+        scale_sources(before, after, 'global_clip')
+        emit('clip', before=stats(before), after=stats(after), debug=result)
+        return result
+    training.clip_model_gradients = clip
+
+    original_adam = torch.optim.Adam.step
+    def clone_update(optimizer, subtract=None):
+        # Isolated state clones: no original Parameter or momentum is written.
+        mapping = {}
+        groups = []
+        names_by_id = {id(p): n for n, p in state['named']}
+        for group in optimizer.param_groups:
+            cloned = []
+            for p in group['params']:
+                q = torch.nn.Parameter(p.detach().clone())
+                if p.grad is not None:
+                    q.grad = p.grad.detach().clone()
+                    name = names_by_id[id(p)]
+                    if subtract is not None:
+                        left, right = state['offsets'][name]
+                        q.grad.sub_(subtract[left:right].to(q.device, q.dtype).reshape_as(q))
+                mapping[id(p)] = q
+                cloned.append(q)
+            groups.append(dict(group, params=cloned))
+        cloned_optimizer = torch.optim.Adam(groups)
+        cloned_optimizer.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+        original_adam(cloned_optimizer)
+        result = torch.zeros(state['size'], dtype=torch.float64)
+        for n, p in state['named']:
+            if id(p) not in mapping:
+                continue
+            left, right = state['offsets'][n]
+            result[left:right] = (mapping[id(p)].detach().double() - p.detach().double()).reshape(-1).cpu()
+        return result
+
+    def adam_step(optimizer, *a, **kw):
+        if 'named' not in state:
+            return original_adam(optimizer, *a, **kw)
+        ids = {id(p) for group in optimizer.param_groups for p in group['params']}
+        model_ids = {id(p) for _, p in state['named']}
+        if not ids.intersection(model_ids):
+            return original_adam(optimizer, *a, **kw)
+        is_emulator = all(n.startswith('single_plan_student.')
+                          for n, p in state['named'] if id(p) in ids)
+        before = flat_params()
+        if is_emulator:
+            result = original_adam(optimizer, *a, **kw)
+            emit('emulator_update', groups=stats(flat_params()-before))
+            return result
+        mask = torch.cat([torch.full((p.numel(),), id(p) in ids, dtype=torch.bool)
+                          for _, p in state['named']])
+        gradient = flat_grads()
+        effective = gradient.clone(); effective[~mask] = 0.
+        baseline = clone_update(optimizer)
+        loo = {}
+        for label, source in state['routed_sources'].items():
+            if float(source[mask].norm()) == 0.:
+                loo[label] = baseline.clone()
+            else:
+                loo[label] = clone_update(optimizer, subtract=source)
+        result = original_adam(optimizer, *a, **kw)
+        delta = flat_params() - before
+        error = delta-baseline
+        emit('adam_clone_validation', max_abs_error=float(error.abs().max()),
+             l2_error=float(error.norm()), update_l2=float(delta.norm()))
+        source_projection, update_attribution, conflicts = [], [], []
+        for group, idx in state['groups'].items():
+            g, d, theta = effective[idx], delta[idx], before[idx]
+            den, dnorm = float(torch.dot(g,g)), float(d.norm())
+            for label, source in state['routed_sources'].items():
+                part = source.clone(); part[~mask] = 0.
+                v = part[idx]
+                effect = (baseline-loo[label])[idx]
+                source_projection.append(dict(group=group, source=label, l2=float(v.norm()),
+                    rms=float(v.norm())/math.sqrt(v.numel()) if v.numel() else None,
+                    gradient_projection=float(torch.dot(v,g))/den if den else None))
+                update_attribution.append(dict(group=group, source=label,
+                    actual_update_l2=dnorm,
+                    update_rate=dnorm/float(theta.norm()) if float(theta.norm()) else None,
+                    loo_effect_l2=float(effect.norm()),
+                    loo_effect_over_actual=float(effect.norm())/dnorm if dnorm else None,
+                    loo_effect_cosine=cosine(effect,d)))
+            comparisons = [('L_downstream','weighted_geometry_primary'),
+                           ('policy:actual_compression_policy','policy:geometry'),
+                           ('policy:proxy','policy:actual_compression_policy'),
+                           ('policy:proxy','policy:entropy')]
+            for x,y in comparisons:
+                conflicts.append(dict(group=group, left=x,right=y,
+                                      cosine=cosine(state['vectors'][x][idx],state['vectors'][y][idx])))
+        emit('optimizer_update', gradient=stats(effective), update=stats(delta), theta=stats(before),
+             source_projection=source_projection, conditional_adam_loo=update_attribution,
+             gradient_cosines=conflicts,
+             optimizer_lrs=[group['lr'] for group in optimizer.param_groups])
+        torch.save(dict(raw_sources=state['vectors'], routed_sources=state['routed_sources'],
+                        phases=state['phase'], final_gradient=gradient,
+                        update=delta, theta_before=before, optimizer_mask=mask),
+                   str(out / ('step_{:02d}_vectors.pt'.format(state['step']))))
+        print('[ROUTING] step {} measured optimizer update'.format(state['step']), flush=True)
+        return result
+    torch.optim.Adam.step = adam_step
+
+    hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in [ROOT/'train.py', *sorted((ROOT/'models').rglob('*.py'))] if p.is_file()}
+    (out/'source_sha256.json').write_text(json.dumps(hashes, indent=2))
+    argv = ['train.py','--compression','SparsePCGC','--max_train_steps',str(opts.steps),
+            '--log_root',str(out/'log'),'--out_path',str(out/'checkpoints'),
+            '--mail_notify','false','--heuristic_guidance_online_grad_audit','true']
+    argv += ['--sparsepcgc_device', opts.teacher_device]
+    for flag, folder in [('point_transformer_feature_disk_cache_dir','features'),
+                         ('sparsepcgc_actual_gt_disk_cache_dir','actual_gt'),
+                         ('exact_teacher_cache_root','exact'),
+                         ('heuristic_guidance_online_cache_dir','online'),
+                         ('heuristic_guidance_tensor_disk_cache_dir','tensors'),
+                         ('structure_fixed_disk_cache_dir','structure'),
+                         ('surrogate_pretrain_cache_dir','surrogate'),
+                         ('sparsepcgc_tmp_dir','tmp')]:
+        argv += ['--'+flag,str(out/'cache'/folder)]
+    (out/'invocation.json').write_text(json.dumps(argv,indent=2))
+    (out/'audit_script.py.txt').write_text(Path(__file__).read_text())
+    sys.argv=argv
+    os.chdir(str(ROOT))
+    try:
+        training.main()
+        emit('completed')
+    finally:
+        emit('integrity', changed=[n for n,h in hashes.items()
+                                  if hashlib.sha256((ROOT/n).read_bytes()).hexdigest()!=h])
+
+
+if __name__ == '__main__':
+    main()

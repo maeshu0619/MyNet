@@ -272,12 +272,14 @@ class Network(nn.Module):
             "_den6_actual_actor_replay",
             "_den6_noop_edit_actual_memory",
             "_den6_plan_critic_replay",
+            "_sparsepcgc_geometry_pair_memory",
         )
         actuator_names = (
             "_den6_factorized_group_counts",
             "_den6_factorized_group_uncertainty",
             "_den6_last_factorized_exploration_group",
             "_den6_factorized_exploration_group_streak",
+            "_sparsepcgc_group_last_opened_step",
             "_den6_actual_action_evidence",
             "_den6_actual_action_comparisons",
             "_den6_actual_candidate_critic_quality",
@@ -835,6 +837,15 @@ class Network(nn.Module):
                 self.args, "repair_exploration_fraction", 1.0
             )), 0.0), 1.0)
             warmup_steps = max(int(round(total_steps * exploration_fraction)), 1)
+            # Auto warmup across the complete exploration curriculum made the
+            # first feature residual ~1e-12 and FP32 adapter updates exactly 0.
+            # Keep the same bounded smoothstep, but introduce this trainable
+            # representation within a short native-codec warmup. Explicit
+            # warmup settings and conventional-codec paths are unchanged.
+            codec = str(getattr(self.args, 'compress', '')).lower().replace('-', '').replace('_', '')
+            if codec == 'sparsepcgc' and str(getattr(self.args, 'heuristic_guidance_mode', '')) == 'ana_den6_online':
+                warmup_steps = min(warmup_steps, max(int(getattr(
+                    self.args, 'sparsepcgc_feature_auto_warmup_cap', 100)), 1))
         global_step = getattr(self.args, "_global_train_step", None)
         if warmup_steps > 0 and global_step is not None:
             phase = min(max((float(global_step) + 1.0) / float(warmup_steps), 0.0), 1.0)
@@ -1620,6 +1631,7 @@ class Network(nn.Module):
         # is never copied to each candidate as an individual target.
         actual_group_pair_raw = objective.new_zeros(())
         actual_group_pair_weighted = objective.new_zeros(())
+        actual_group_critic_weighted = objective.new_zeros(())
         actual_group_pair_available = False
         actual_group_pair_delta = 0.0
         actual_group_actor_correct = 0.0
@@ -1709,12 +1721,13 @@ class Network(nn.Module):
                         "heuristic_guidance_online_actual_candidate_critic_replay_weight",
                         0.20,
                     )), 0.0)
-                    policy_loss = policy_loss + (
+                    actual_group_critic_weighted = (
                         float(critic_pair_weight)
                         * float(matched_anchor_age_confidence)
                         * critic_pair_loss
                         / float(policy_backward_scale)
                     )
+                    policy_loss = policy_loss + actual_group_critic_weighted
 
                 actuator_for_group = getattr(self, "actuator", None)
                 if actuator_for_group is not None:
@@ -2513,9 +2526,14 @@ class Network(nn.Module):
         geometry_baseline_source = "unavailable"
         amount_log_prob = state.get("den6_online_amount_log_prob", None)
         action_log_prob = state.get("den6_online_action_log_prob", None)
+        from .utils.training.sparsepcgc_actual_credit import (
+            sparsepcgc_credit_training, matched_geometry_advantage,
+        )
+        native_geometry_credit = sparsepcgc_credit_training(self.args)
         if (
             mode == "ana_den6_online"
             and not actor_critic_selection
+            and not native_geometry_credit
             and torch.is_tensor(geometry)
             and torch.is_tensor(amount_log_prob)
         ):
@@ -2632,6 +2650,37 @@ class Network(nn.Module):
                 sequence_geometry_baseline.move_to_end(sequence_key)
                 while len(sequence_geometry_baseline) > 128:
                     sequence_geometry_baseline.popitem(last=False)
+
+        if (native_geometry_credit and not actor_critic_selection
+                and torch.is_tensor(geometry)
+                and torch.is_tensor(current_group_log_prob)
+                and current_group_log_prob.requires_grad):
+            memory = getattr(self, '_sparsepcgc_geometry_pair_memory', None)
+            if memory is None:
+                memory = OrderedDict()
+                self._sparsepcgc_geometry_pair_memory = memory
+            advantage_value = matched_geometry_advantage(
+                memory, frame_key=cache_key, anchor_hash=matched_anchor_hash,
+                group=factorized_group, reused=matched_reused,
+                rate=float(objective.detach().cpu()),
+                geometry=float(geometry_objective_for_rd.detach().cpu()),
+                tolerance=float(getattr(self.args, 'heuristic_guidance_online_geometry_compression_tolerance', .05)),
+                clip=float(getattr(self.args, 'heuristic_guidance_online_geometry_advantage_clip', .25)))
+            geometry_baseline_source = 'matched_frame_anchor' if advantage_value is not None else 'matched_unavailable'
+            if advantage_value is not None:
+                geometry_guard_passed = True
+                geometry_advantage = objective.new_tensor(advantage_value)
+                geometry_policy_raw = -geometry_advantage * current_group_log_prob.float().mean()
+                # Native Actual RD already contains cp_lambda_geom * G.
+                # A second normalized geometry-only reward gave the same
+                # Amount action a conflicting teacher (measured cosine -0.975).
+                # Retain the constrained auxiliary only if RD has no geometry;
+                # never change the declared compression/geometry objective.
+                if float(actor_geometry_weight) <= 0.0:
+                    geometry_policy_weighted = (
+                        max(float(getattr(self.args, 'heuristic_guidance_online_geometry_policy_weight', .55)), 0.)
+                        * geometry_policy_raw / float(policy_backward_scale))
+                    policy_loss = policy_loss + geometry_policy_weighted
 
         # Learn edit efficiency as a constrained tie-break, not as a fixed
         # operation-ratio target.  Only an Amount/Gate/Fine action whose Actual
@@ -2954,6 +3003,12 @@ class Network(nn.Module):
             "geometry": geometry_policy_weighted,
             "efficiency": efficiency_policy_weighted,
         }
+        if native_geometry_credit:
+            # Include the existing pair-Critic objective in its proper source;
+            # do not add it to policy_loss a second time.
+            self._den6_policy_source_losses['actual_compression_policy'] = (
+                self._den6_policy_source_losses['actual_compression_policy']
+                + actual_group_critic_weighted)
         return policy_loss.to(dtype=reward.dtype)
 
     def network_only_plan_gain_loss(self, actual_bit_percent):

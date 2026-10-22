@@ -1,6 +1,9 @@
 """MyNetの訓練エントリポイント。"""
 
 from models.utils.training.train_runtime import *
+from models.utils.training.sparsepcgc_actual_credit import (
+    matched_frame_repeats, matched_sparsepcgc_dataset,
+)
 
 def train(model, args, loss, writer, plot, notifier=None):
     """==========================================================="""
@@ -231,7 +234,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             "runtime_den6=0, candidate_actual=0"
         )
     _configure_streaming_exact_caches(args, seq_datasets, writer)
-    total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
+    total_train_files = sum(len(dataset) for _, dataset in seq_datasets) * matched_frame_repeats(args)
     den6_prefetch_lookahead = max(
         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
     )
@@ -561,6 +564,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
             """基本情報のセットアップ"""
             active_dataset = apply_epoch_file_window(dataset, args, episode) # 各系列の訓練フレームを1周ごとに再配置し、非重複windowで読む
+            active_dataset = matched_sparsepcgc_dataset(active_dataset, args)
             loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 現在Epochの窓Datasetから点群ファイルを順に読み出す
             num_steps = len(active_dataset)
             active_files = list(getattr(active_dataset, "files", ()))

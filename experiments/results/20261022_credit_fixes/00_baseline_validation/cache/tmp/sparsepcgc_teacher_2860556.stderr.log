@@ -1,0 +1,13 @@
+CMD: /home/maejima/miniconda3/envs/sparsepcgc/bin/python /home/maejima/MasterEx/myNet/models/utils/loss/sparsepcgc_teacher_worker.py --sparsepcgc-root /home/maejima/MasterEx/compress/octree/SparsePCGC --mode dense_lossy --device cpu --ckptdir /home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/dense/epoch_last.pth --ckptdir-sr /home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/dense_1stage/epoch_last.pth --ckptdir-ae /home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/dense_slne/epoch_last.pth --ckptdir-low /home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/sparse_low/epoch_last.pth --ckptdir-high /home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/sparse_high/epoch_last.pth --ckptdir-offset /home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/sparse_offset/epoch_last.pth --voxel-size 1.0 --pos-quantscale 1 --psnr-resolution 511 --dense-scale-ae-list 0 --dense-scale-sr-list 1 --pos-quantscale-list 4 --scale-m 8 --scale-ae 0 --scale-sr 1 --cpu-trim-interval 16 --cuda-cleanup-interval 1
+[SparsePCGCWorker] using root=/home/maejima/MasterEx/compress/octree/SparsePCGC
+[SparsePCGCWorker] importing encoder_multiple.SparsePCGCEncoder
+[SparsePCGCWorker] imported SparsePCGCEncoder
+[SparsePCGCWorker] initializing SparsePCGCEncoder mode=dense_lossy device=cpu
+Using /home/maejima/.cache/torch_extensions/py38_cu113 as PyTorch extensions root...
+Emitting ninja build file /home/maejima/.cache/torch_extensions/py38_cu113/torchac_backend/build.ninja...
+Building extension module torchac_backend...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1/2] c++ -MMD -MF torchac_backend.o.d -DTORCH_EXTENSION_NAME=torchac_backend -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1011\" -isystem /home/maejima/miniconda3/envs/sparsepcgc/lib/python3.8/site-packages/torch/include -isystem /home/maejima/miniconda3/envs/sparsepcgc/lib/python3.8/site-packages/torch/include/torch/csrc/api/include -isystem /home/maejima/miniconda3/envs/sparsepcgc/lib/python3.8/site-packages/torch/include/TH -isystem /home/maejima/miniconda3/envs/sparsepcgc/lib/python3.8/site-packages/torch/include/THC -isystem /home/maejima/miniconda3/envs/sparsepcgc/include/python3.8 -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++14 -c /home/maejima/miniconda3/envs/sparsepcgc/lib/python3.8/site-packages/torchac/backend/torchac_backend.cpp -o torchac_backend.o 
+[2/2] c++ torchac_backend.o -shared -L/home/maejima/miniconda3/envs/sparsepcgc/lib/python3.8/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o torchac_backend.so
+Loading extension module torchac_backend...
+[SparsePCGCWorker] SparsePCGCEncoder ready

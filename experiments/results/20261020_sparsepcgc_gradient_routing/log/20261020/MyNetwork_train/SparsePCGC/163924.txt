@@ -1,0 +1,87 @@
+SetupTiming: writer_init=0.047s
+KNNBackend: pointops_available=True, knn_backend=pointops_cuda, allow_slow_knn_fallback=False, torch=1.11.0+cu113, torch_cuda=11.3, cuda_available=True
+SetupTiming: plot_init=0.000s
+Date of Training: 20261020-163924
+Log Root: /home/maejima/MasterEx/myNet/experiments/results/20261020_sparsepcgc_gradient_routing/log
+Checkpoint Root: /home/maejima/MasterEx/myNet/experiments/results/20261020_sparsepcgc_gradient_routing/checkpoints
+Method Name: Mine
+Surrogate Name: SparsePCGC
+Geometry Loss Type: cd
+Discrete Loss Mode: ste_hard
+Optimization Modes: geometry=ste_hard, compression=sparsepcgc_surrogate
+Compression Delta Sign: delta_percent=(after_bits-before_bits)/before_bits*100; negative means improved compression.
+Heuristic Guidance Mode: enabled=True, mode=ana_den6_online.
+Compression Loss Mode: compression_loss_delta=True (True keeps the standard delta, False uses 100-delta for the objective).
+Minimal Objective: minimal_loss_objective=True, geometry_fit_weight=0.05, geometry_use_d2=False
+Structure Control: direct_octree_targets=True, L_Attr_weight=0, L_Pol_weight=0
+Gradient Scale Groups: prune_where_compression=0.17, prune_where_actuator=1, operation_amount=200
+Gradient Diagnostics: compression_grad_probe=False(every=8), debug_grad_flow=False(rate=8)
+Compression Forward Metric: actual_total_bit_percent=100*(Mine_bits-GT_bits)/GT_bits with surrogate backward; soft auxiliaries are diagnostics unless explicitly enabled.
+Compression Teacher Refresh: periodic(interval=1, actual_eval_interval=1, warmup_steps=1, replay_steps=0, replay_batch=8, forward=teacher_ste, aux_node=0.0, aux_single=0.0, aux_in_objective=False, log_soft_aux=True, reuse_last_target=False)
+Surrogate Pretrain/Online Update: pretrain_steps=0, pretrain_lr=0.0001, pretrain_mode=subtree, pretrain_subtree_teacher=local_actual, pretrain_depth_percent=0-0.5, pretrain_full_calibration_interval=50, pretrain_full_calibration_steps=1, pretrain_actual_refresh_interval=1, pretrain_replay=True, pretrain_replay_steps=4, pretrain_replay_batch=16, pretrain_sparsepcgc_debug_interval=10, update_during_training=True, update_interval=1, joint_lr_scale=0.1, teacher_refresh_only=True
+Compression Surrogate Backward: enabled
+Surrogate compression objective on sparsepcgc_surrogate: actual_total_bit_percent = 100*(Mine_bits-GT_bits)/GT_bits with surrogate backward; soft auxiliary proxies are diagnostics unless explicitly enabled.
+Active Loss Weights: mode=compression_primary, compression(w_com)=3, geometry(cp_lambda_geom)=150, geometry_backward_scale=0.036, geometry_tau(cp_tau_geom)=0
+Legacy Loss Weight (inactive in compression_primary): geometry(w_geom)=10000
+Runtime Tradeoff: k=8, encoder_query_chunk=2048, structure_geo_max_points=2048, knn_backend=pointops_cuda, full_cloud_head_chunk=131072
+Point Edit Count Thresholds: drop_keep_threshold=0.5, adjust_threshold=1e-06
+Uniform Quantization Noise: use=False, delta=1, scope=train_only_after_edit_before_rate_struct, shape_loss=clean_X_edit, rate_struct_loss=noisy_X_edit, actual_codec_eval=clean_X_edit, supported_compress=gpcc,draco,octattention,sparsepcgc
+Profiling: log_step_time=True, log_gpu_memory=True, profile_interval=100, actual_eval_interval=1, disable_actual_codec_during_train=False, actual_codec_fallback_to_proxy_on_error=False, skip_optimizer_on_actual_fallback=True
+Checkpoint Selection: primary=actual_total_bit_percent(fresh only), geom_gate=True(rel=1.2, abs=0), safety_gate=True(repair_abs=10, node_abs=100, single_abs=100, op_ratio_max=100), metric_csv[compression=False, operation=False, checkpoint=True]
+Actual Compression Guard: enabled=True, patience=4, tolerance=0.1, lr_decay_enabled=False, lr_decay_factor=0.5, restore_best=False, max_restores=0, max_restore_age=16, rebase_stale=True, autonomy_compression_target=-3.5, fixed_validation_only=True, full_state_restore=True
+Compression Primary Geometry: lambda=150, backward_scale=0.036, tau=0, aux_ratio_cap=0.75
+Factorized Exploration: enabled=True, simultaneous_add_prune_adjust_where=True, min_group_share=0.1
+Network Pool Autonomy: start=1, max=1, new_best_increment=0, min_actual_improvement=0.01, gate=fixed_full_cloud_validation
+Network Amount RD Exploration: bins=0.0015,0.002,0.0025,0.00275,0.003, temperature=0.35, gumbel_scale=2, amount_authority_floor=0.75, geometry_policy_weight=0.55
+Network Edit Efficiency: weight=0.25, compression_tolerance=0.02pp, geometry_relative_tolerance=0.005, advantage_clip=0.25, direct_grad_scale=0.1, scope=same_frame_all_train_steps
+Compression Codec: SparsePCGC
+OctAttention Teacher Device: auto
+SparsePCGC Teacher: env=sparsepcgc, python=(auto), mode=dense_lossy, device=auto, gpu_min_free_mb=4096, oom_retries=2, match_qs=False, voxel_size=1.0, pos_quantscale=1, effective_qs=1.0, root=/home/maejima/MasterEx/compress/octree/SparsePCGC, skip_decode=True
+SparsePCGC Operation Safety: disable_add=False, add_experiment=True, add_only_cp=False, move_existing_target_only=False, target_add_ratio=0.0, max_add_ratio=0.0023571428571428576, add_hard_threshold=0.35, move_hard_threshold=0.2, move_source_prior_weight=0.55, exp_target=0.003, exp_max=0.5
+SparsePCGC Quantization Alignment: teacher=round(x/voxel_size)->unique->round(coord/posQuantscale)->unique, network_sparse_quant=sparsepcgc_twostep, surrogate_effective_qs=1.0, surrogate_levels=2,4,6,8,10
+SparsePCGC Prune Prior/Floor: prune_after_prior_mode=network, codec_prior_enabled=False, codec_prior_warmup_steps=0, warmup_force_codec_prior_amount=True, hybrid_amount_mode=network, hybrid_prior_amount_blend=False, codec_prior_amount_distill_weight=0.05, network_prune_ratio_floor=0.001, network_prune_min_hard_count=1, codec_prior_warmup_min_hard_count=1, network_prune_floor_steps=20, network_prune_floor_decay_steps=100
+SparsePCGC Multi-Subtree/Outcome: multi_subtree_train=True, multi_subtree_topk=3, outcome_imitation=True
+SparsePCGC Exact Occupancy Teacher: enabled=False, interval=1, mode=auto, loss_enabled=False, nll_weight=0.0, bits_weight=0.0
+Compression Rate Metric: total_bits
+Compression Loss Backend: sparsepcgc_surrogate
+Two-Stage Training: enabled=False, base_stage=joint, diagnosis_ratio=0.25, diagnosis_episodes=0
+SparsePCGC Train Guards: warmup_force_codec_prior_amount=True, hybrid_amount_mode=network, subtree_actual_filter=True, anchor_success_teacher=True, stage_switch_guard=True, surrogate_trust_gate=True
+Module BatchNorm Running Stats: False
+DirectNetworkPrune: INACTIVE. この状態ではPhase0後にoracle/gateでPruneが止まる可能性がある。
+SetupTiming: model_init=0.080s
+RepKPU encoder stem adapted for sparse input: (64, 3, 1) -> (64, 1, 1)
+RepKPU encoder loaded: repkpu_model/ckpt-best.pth
+PointTransformerNodeFeatures: enabled=True, encoder_frozen=True, bottleneck_dim=8, fusion=bounded_warmup_structure_residual, feature_scale=0.25, gate_max=0.1, warmup_steps=0, lr_scale=0.1, coarse_max_points=8192, ram_cache=True, disk_cache=True
+SetupTiming: encoder_ckpt_load=0.024s
+MoreTraining: disabled. Start training from current initialized model.
+SetupTiming: more_training_ckpt_load=0.000s
+SetupTiming: model_to_cuda=7.371s
+PruneWhereGradHook: registered, scale=0.166667, param_count=6
+SetupTiming: loss_init=0.001s
+SetupTiming: total_before_train=7.524s
+=== Start Training ===
+Total seq directories: 10
+TrainingPerformanceContract: heuristic_role=candidate_pool_and_safety_prior, applied_plan=prior_plus_rd_aligned_bounded_network_residual, actual_source=network_selected_plan, exploration_role=behavior_only, diagnostic_exact_anchor_steps=0
+StreamingExactCachePolicy: working_set=1000, ply_disk_total_mb=4759.0, dataset_ram_cache=0, episode_common_ram_cache=0, guidance_hot_entries=4, structure_hot_entries=4, guidance_disk_cache=1, structure_disk_cache=1
+ExplorationSchedule: training_episodes=382, schedule_episodes=382, policy_mode=annealed, policy_constant_multiplier=0.5, anneal_active=True, constant_legacy_phase=n/a, fraction=0.25, smooth_tail=0.25, plateau=0.4, where_change_fraction=0.5, where_change_cap=0, where_tail_fraction=1, where_full_safe_pool=True, anneal_steps=38200, exploration_end_step=9550, exploration_end_episode=95.500, total_train_steps=38200, source=training_limit
+CheckpointMetricCSV: enabled path=/home/maejima/MasterEx/myNet/experiments/results/20261020_sparsepcgc_gradient_routing/log/20261020/MyNetwork_train/SparsePCGC/163924_checkpoint_metrics_epi.csv
+StepGradCSV: disabled (Episode/100-Step plot mode)
+MemoryDiagnosticsCSV: enabled path=/home/maejima/MasterEx/myNet/experiments/results/20261020_sparsepcgc_gradient_routing/log/20261020/MyNetwork_train/SparsePCGC/163924_memory_diagnostics.csv
+Trainable encoder params: 0 (expected=0)
+PointTransformerFeatureLearning: frozen_encoder_params=0, trainable_adapter_params=2344, trainable_gate_params=8
+OptimizerGroups: main[lr=0.001,params=65], deform[lr=0.0001,params=0], point_transformer_feature[lr=0.0001,params=5], den6_online_decision[lr=0.0001,params=44], den6_online_amount[lr=1e-05,params=12], den6_online_critic[lr=0.0001,params=14]
+FastHeuristicEmulatorOptimizer: separate=True, lr=0.001, params=44
+AMP: disabled
+DataLoader workers were disabled because fork workers would duplicate the compression teacher/cache state (4 requested). Use --mp_start_method spawn to keep workers.
+Surrogate Model is found!! path=/data/maejima/data/pretrained_surrogate/SparsePCGC/20260729_001750.pth
+SurrogateRegistry loaded: path=/data/maejima/data/pretrained_surrogate/SparsePCGC/20260729_001750.pth, surrogate_step=215764, metric=surrogate_abs_bit_error, value=0.19018009901046753
+SurrogatePretrainCacheJointLR: 0.0003
+[Training] start surrogate_param_norm=30.646258 lr=0.00030000000000000003
+◆◆◆ Episode 1 / 382 ◆◆◆
+Training Stage Switch: episode=1, stage=joint
+Stage Loss Factors: geom=1.0, com=1.0, attr=1.0, policy=0.25, repair=1.0
+StageSwitchGuard: stage=joint, com=1.0000->1.0000, policy=1.0000->0.2500
+⦿⦿⦿ Epoch 1/10 : /data/maejima/data/ground/UVG/BlueBackpack ⦿⦿⦿
+TrainingWindow: episode=1, sequence=BlueBackpack, cycle=0, slot=1/10, files=10, signature=fcd5824e47cad303
+SparsePCGC actual encoder loaded: mode=dense_lossy, m=8, AE=0, SR=1, device=auto, python=/home/maejima/miniconda3/envs/sparsepcgc/bin/python, stderr=/home/maejima/MasterEx/myNet/experiments/results/20261020_sparsepcgc_gradient_routing/cache/tmp/sparsepcgc_teacher_3335688.stderr.log
+Training error: AttributeError: 'Loss' object has no attribute 'parameters'
