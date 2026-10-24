@@ -28,9 +28,9 @@ method_name = "Mine"
 
 model_name = "best_loss_joint"
 
-# dataname = "8i"
+dataname = "8i"
 # dataname = "MVUB"
-dataname = "UVG"
+# dataname = "UVG"
 
 dataset_name = "longdress"
 # dataset_name = "loot"
