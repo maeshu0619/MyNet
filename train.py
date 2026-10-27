@@ -4,6 +4,7 @@ from models.utils.training.train_runtime import *
 from models.utils.training.sparsepcgc_actual_credit import (
     matched_frame_repeats, matched_sparsepcgc_dataset,
 )
+from models.utils.training.episode_frames import configure_fixed_episode_frames
 
 def train(model, args, loss, writer, plot, notifier=None):
     """==========================================================="""
@@ -233,6 +234,26 @@ def train(model, args, loss, writer, plot, notifier=None):
             f"bootstrap_only={bool(k_all_actual_enabled)}, "
             "runtime_den6=0, candidate_actual=0"
         )
+    seq_datasets, fixed_frame_manifest = configure_fixed_episode_frames(seq_datasets, args)
+    num_seq = len(seq_datasets)
+    if fixed_frame_manifest is not None:
+        import json
+        fixed_frame_manifest["matched_views_per_frame"] = matched_frame_repeats(args)
+        fixed_frame_manifest["steps_per_episode"] = (
+            fixed_frame_manifest["unique_frames_per_episode"] * matched_frame_repeats(args)
+        )
+        manifest_path = os.path.join(plot.save_dir, f"{args.time}_training_frames.json")
+        with open(manifest_path, "x", encoding="utf-8") as handle:
+            json.dump(fixed_frame_manifest, handle, ensure_ascii=False, indent=2)
+        writer.write(
+            "FixedEpisodeFrames: unique_frames={}, matched_views={}, steps={}, "
+            "allocation={}, manifest={}".format(
+                fixed_frame_manifest["unique_frames_per_episode"],
+                fixed_frame_manifest["matched_views_per_frame"],
+                fixed_frame_manifest["steps_per_episode"],
+                [row["frames"] for row in fixed_frame_manifest["sequences"]], manifest_path,
+            )
+        )
     _configure_streaming_exact_caches(args, seq_datasets, writer)
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) * matched_frame_repeats(args)
     den6_prefetch_lookahead = max(
@@ -372,7 +393,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             f"interval={int(getattr(args, 'step_grad_log_interval', 1))}"
         )
     else:
-        writer.write("StepGradCSV: disabled (Episode/100-Step plot mode)")
+        writer.write("StepGradCSV: disabled (Episode plot mode)")
 
     """原因診断のためのログ"""
     memory_diagnostics_path = os.path.join(
@@ -563,7 +584,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             )
 
             """基本情報のセットアップ"""
-            active_dataset = apply_epoch_file_window(dataset, args, episode) # 各系列の訓練フレームを1周ごとに再配置し、非重複windowで読む
+            active_dataset = apply_epoch_file_window(dataset, args, episode)
             active_dataset = matched_sparsepcgc_dataset(active_dataset, args)
             loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 現在Epochの窓Datasetから点群ファイルを順に読み出す
             num_steps = len(active_dataset)
@@ -5840,14 +5861,12 @@ def train(model, args, loss, writer, plot, notifier=None):
         )
         plot.plot_loss_curve("epi")
         plot.plot_point_edit_curve("epi")
-        plot.plot_loss_curve("step100")
-        plot.plot_point_edit_curve("step100")
         _record_memory(
             "episode_after_plots",
             episode=episode + 1,
             global_step=global_train_step,
         )
-        writer.write(f"Saved episode CSV/plots and 100-step average plots: {plot.save_dir}")
+        writer.write(f"Saved episode CSV/plots: {plot.save_dir}")
         if _episode_input_common_cache_enabled(args):
             cache_summary = _episode_input_common_cache_summary(args)
             writer.write(
@@ -6568,7 +6587,10 @@ def main():
         notifier.training_finished( elapsed_sec=en - st, finish_date=finish_date, best_loss=best_loss, log_path=getattr(writer, "file_path", None))
     except Exception as exc:
         try:
+            import traceback
             writer.write(f"Training error: {type(exc).__name__}: {exc}")
+            writer.write(traceback.format_exc())
+            writer.flush()
         finally:
             notifier.training_error(exc, log_path=getattr(writer, "file_path", None))
         raise

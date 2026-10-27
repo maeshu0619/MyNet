@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from models.utils.loss.actual_encoder import _SparsePCGCActualEncoder
+from models.utils.loss.actual_encoder import _SparsePCGCActualEncoder, _SparsePCGCWorkerExited
 from models.utils.loss.sparsepcgc_teacher_worker import (
     _configure_persistent_cuda_allocator_cache,
 )
@@ -162,6 +162,52 @@ class SparsePCGCOOMRecoveryTest(unittest.TestCase):
         self.assertAlmostEqual(roundtrip, 0.75)
         self.assertEqual(audit["oom_retries"], 1)
         self.assertEqual(encoder._cuda_oom_retry_count, 1)
+
+    def test_broken_pipe_restarts_same_request_and_discards_partial_output(self):
+        encoder = self._encoder()
+        encoder._proc = Mock()
+        encoder._proc.poll.return_value = -9
+        encoder._stderr_path = "diagnostic.stderr.log"
+        encoder._stop_worker = Mock()
+        encoder._lazy_init = Mock()
+        encoder._send_worker_request_once = Mock(side_effect=[
+            BrokenPipeError("broken pipe"), ({"status": "ok", "result": {"bit": 123}}, .1),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "encoded")
+            os.mkdir(output)
+            partial = os.path.join(output, "partial.bin")
+            with open(partial, "wb") as handle:
+                handle.write(b"invalid")
+            request = {"input_file": "unchanged.ply", "output_dir": output}
+            response, _ = encoder._send_worker_request(request)
+            self.assertFalse(os.path.exists(partial))
+        self.assertEqual(response["result"]["bit"], 123)
+        self.assertEqual(encoder._send_worker_request_once.call_args_list[0],
+                         encoder._send_worker_request_once.call_args_list[1])
+        encoder._stop_worker.assert_called_once_with(preserve_workspace=True, preserve_cache=True)
+        encoder._lazy_init.assert_called_once_with()
+
+    def test_repeated_transport_failure_is_bounded_and_returns_no_label(self):
+        encoder = self._encoder()
+        encoder._proc = Mock()
+        encoder._proc.poll.return_value = -9
+        encoder._stderr_path = "diagnostic.stderr.log"
+        encoder._stop_worker = Mock()
+        encoder._lazy_init = Mock()
+        encoder._send_worker_request_once = Mock(side_effect=_SparsePCGCWorkerExited("exit=-9"))
+        with self.assertRaisesRegex(RuntimeError, "recovery exhausted; no Actual label"):
+            encoder._send_worker_request({"input_file": "same.ply"})
+        self.assertEqual(encoder._send_worker_request_once.call_count, 2)
+
+    def test_computation_errors_and_timeouts_do_not_trigger_transport_retry(self):
+        for error in (RuntimeError("invalid codec configuration"), TimeoutError("timeout")):
+            encoder = self._encoder()
+            encoder._send_worker_request_once = Mock(side_effect=error)
+            encoder._stop_worker = Mock()
+            with self.assertRaises(type(error)):
+                encoder._send_worker_request({})
+            encoder._stop_worker.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -228,6 +228,10 @@ def should_collect_sparsepcgc_hard_debug(args, *, log_this_step, profile_this_st
 
 
 def apply_epoch_file_window(dataset, args, window_index):
+    fixed_files = getattr(dataset, "fixed_episode_files", None)
+    if fixed_files is not None:
+        dataset.files = list(fixed_files)
+        return dataset
     # Dataset生成時に保持した全ファイル一覧を取り出し、なければ現在のfilesを全体として扱う。
     all_files = list(getattr(dataset, "all_files", getattr(dataset, "files", [])))
     # 推論・評価用フレームを訓練へ混入させず、各系列の先頭150件（既定値）だけを訓練窓の母集団にする。

@@ -539,11 +539,8 @@ class PlotMaker():
         }
 
         if mode == "step":
-            # 生Step履歴は保存せず、Episode平均と100 Step平均だけへ渡す。
+            # 生Step履歴と100 Step図は保存せず、Episode平均だけへ渡す。
             self._accumulate_plot_running("epi", numeric_values)
-            info["completed_100step_block"] = self._accumulate_step100_metrics(
-                numeric_values
-            )
             self.step_plot_recorded += 1
             return info
 
@@ -622,7 +619,6 @@ class PlotMaker():
             values = self._normalize_edit_values(edit_stats)
             info["plot_values"] = values
             self._accumulate_edit_running("epi", values)
-            info["completed_100step_block"] = self._accumulate_step100_edits(values)
             return info
         if mode == "epo":
             sums, counts, accepted_steps = self._edit_running_state("epo")
@@ -1069,6 +1065,8 @@ class PlotMaker():
                 pass
 
     def plot_loss_curve(self, epoORepi):
+        if epoORepi != "epi":
+            return
         write_csv = True
         if epoORepi == "step100":
             loss_history = self.step100_loss_his
@@ -1135,6 +1133,8 @@ class PlotMaker():
 
 
     def plot_point_edit_curve(self, epoORepi):
+        if epoORepi != "epi":
+            return
         write_csv = True
         if epoORepi == "step100":
             edit_history = self.step100_edit_his

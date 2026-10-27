@@ -191,7 +191,8 @@ def _configure_streaming_exact_caches(args, seq_datasets, writer):
     train_limit = max(int(getattr(args, "train_frames_per_sequence", 0)), 0)
     paths = []
     for _, dataset in seq_datasets:
-        source = list(getattr(dataset, "all_files", ()) or getattr(dataset, "files", ()))
+        source = list(getattr(dataset, "fixed_episode_files", None)
+                      or getattr(dataset, "all_files", ()) or getattr(dataset, "files", ()))
         if train_limit > 0:
             source = source[:train_limit]
         paths.extend(os.path.realpath(str(path)) for path in source)

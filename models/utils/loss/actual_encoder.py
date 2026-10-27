@@ -19,6 +19,10 @@ from models.utils.compression.draco import DracoGeometryEncoder
 from models.utils.compression.proxy_octree import ProxyOctreeConfig, SoftOctreeRateProxy
 
 
+class _SparsePCGCWorkerExited(RuntimeError):
+    """Transport failure, distinct from a codec/model computation error."""
+
+
 class _OctAttentionActualEncoder:
     """
     Run the same OctAttention path as compress/octree/OctAttention/encoder.py.
@@ -594,11 +598,19 @@ class _SparsePCGCActualEncoder:
                     proc.wait(timeout=5.0)
                 except Exception:
                     proc.kill()
+                    proc.wait(timeout=5.0)
         self._loaded = False
         if self._stdout_thread is not None:
             self._stdout_thread.join(timeout=1.0)
         self._stdout_thread = None
         self._stdout_queue = None
+        if proc is not None:
+            for stream in (proc.stdin, proc.stdout):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
         if self._stderr_file is not None:
             try:
                 self._stderr_file.close()
@@ -814,13 +826,14 @@ class _SparsePCGCActualEncoder:
 
     def _pump_stdout(self):
         proc = self._proc
-        if proc is None or proc.stdout is None or self._stdout_queue is None:
+        stdout_queue = self._stdout_queue
+        if proc is None or proc.stdout is None or stdout_queue is None:
             return
         try:
             for line in proc.stdout:
-                self._stdout_queue.put(line)
+                stdout_queue.put(line)
         except Exception as exc:
-            self._stdout_queue.put(json.dumps({"status": "stdout_error", "message": str(exc)}) + "\n")
+            stdout_queue.put(json.dumps({"status": "stdout_error", "message": str(exc)}) + "\n")
 
     def _read_worker_json(self, timeout):
         if self._proc is None or self._stdout_queue is None:
@@ -828,7 +841,7 @@ class _SparsePCGCActualEncoder:
         deadline = time.time() + max(float(timeout), 1.0)
         while time.time() < deadline:
             if self._proc.poll() is not None and self._stdout_queue.empty():
-                raise RuntimeError(
+                raise _SparsePCGCWorkerExited(
                     f"SparsePCGC worker exited with code {self._proc.returncode}. "
                     f"See stderr log: {self._stderr_path}"
                 )
@@ -847,9 +860,47 @@ class _SparsePCGCActualEncoder:
         raise TimeoutError(f"SparsePCGC worker timed out after {timeout}s. See stderr log: {self._stderr_path}")
 
     def _send_worker_request(self, request):
+        """Retry only a dead transport; never substitute an estimated label.
+
+        Requests encode from an immutable input file. On retry discard partial
+        output and relaunch the same codec configuration, without an optimizer
+        step, RNG draw in the main model, or a device/quality change.
+        """
+        maximum = max(int(getattr(self.args, "sparsepcgc_worker_restart_count", 1)), 0)
+        started = time.time()
+        for attempt in range(maximum + 1):
+            try:
+                response, _ = self._send_worker_request_once(request)
+                return response, float(time.time() - started)
+            except (BrokenPipeError, ConnectionResetError, EOFError,
+                    _SparsePCGCWorkerExited) as exc:
+                proc = self._proc
+                returncode = proc.poll() if proc is not None else None
+                diagnostic = (
+                    "SparsePCGC worker transport failed: {}: {}; exit_code={}; "
+                    "stderr={}".format(type(exc).__name__, str(exc), returncode,
+                                       self._stderr_path)
+                )
+                if self.writer is not None and hasattr(self.writer, "write"):
+                    self.writer.write(diagnostic + "; restart={}/{}".format(attempt + 1, maximum))
+                self._stop_worker(preserve_workspace=True, preserve_cache=True)
+                if attempt >= maximum:
+                    raise RuntimeError(diagnostic + "; recovery exhausted; no Actual label obtained") from exc
+                output_dir = request.get("output_dir")
+                if output_dir:
+                    if os.path.isdir(output_dir):
+                        shutil.rmtree(output_dir)
+                    os.makedirs(output_dir, exist_ok=True)
+                self._lazy_init()
+
+    def _send_worker_request_once(self, request):
         """Persistent workerへ1 requestを送り、対応するresponseだけを返す。"""
         if self._proc is None or self._proc.stdin is None:
             raise RuntimeError("SparsePCGC worker stdin is not available.")
+        if self._proc.poll() is not None:
+            raise _SparsePCGCWorkerExited(
+                "worker exited with code {} before request".format(self._proc.returncode)
+            )
         self._request_id += 1
         self._worker_request_count += 1
         request = dict(request)

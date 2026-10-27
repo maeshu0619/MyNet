@@ -73,7 +73,7 @@ class EpisodeAndHundredStepPlotTest(unittest.TestCase):
             self.assertLessEqual(axis.ylim[0], 1.25)
             self.assertGreaterEqual(axis.ylim[1], 7.75)
 
-    def test_step_values_are_kept_only_as_episode_and_block_average(self):
+    def test_step_values_are_kept_only_as_episode_average(self):
         with tempfile.TemporaryDirectory() as root:
             plot = PlotMaker(_args(root))
             for step in range(1, 101):
@@ -91,9 +91,11 @@ class EpisodeAndHundredStepPlotTest(unittest.TestCase):
 
             self.assertEqual(plot.step_x_his, [])
             self.assertEqual(plot.epo_x_his, [])
-            self.assertEqual(plot.step100_x_his, [1])
-            self.assertAlmostEqual(plot.step100_loss_his[0][0], 50.5)
-            self.assertAlmostEqual(plot.step100_edit_his[0][0], 50.5)
+            self.assertEqual(plot.step100_x_his, [])
+            self.assertTrue(all(not values for values in plot.step100_loss_his))
+            self.assertTrue(all(not values for values in plot.step100_edit_his))
+            info = plot.record_point_edits("epi", 1)
+            self.assertAlmostEqual(info["plot_values"][0], 50.5)
             self.assertEqual(
                 plot.group_title,
                 ["compression", "other", "repair", "repair_policy"],
@@ -137,13 +139,14 @@ class EpisodeAndHundredStepPlotTest(unittest.TestCase):
             plot.plot_point_edit_curve("step100")
 
             names = set(os.listdir(plot.save_dir))
-            for mode in ("epi", "100step"):
+            for mode in ("epi",):
                 for group in ("compression", "other", "repair", "repair_policy"):
                     self.assertIn(f"unit_{mode}_{group}.png", names)
                 self.assertIn(f"unit_{mode}_point_edits.png", names)
             self.assertIn("unit_epi_metrics.csv", names)
             self.assertIn("unit_epi_point_edits.csv", names)
             self.assertNotIn("unit_100step_metrics.csv", names)
+            self.assertFalse(any("100step" in name for name in names))
             self.assertFalse(any("occupancy" in name for name in names))
             self.assertFalse(any("voxel_collision" in name for name in names))
             self.assertFalse(any("_step_metrics.csv" in name for name in names))

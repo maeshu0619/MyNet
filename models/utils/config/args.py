@@ -1632,7 +1632,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_add_weight_mode', default='hard', type=str, help='追加点のfinal_wをhard/softのどちらで作るか')
     parser.add_argument('--repair_exploration_fraction', default=0.25, type=float, help='annealedモードで全学習Stepのうち探索ノイズを残す割合。既定は前半4分の1')
     parser.add_argument('--repair_exploration_smooth_tail_fraction', default=0.25, type=float, help='探索減衰末尾を傾き0へ滑らかにつなぐ割合。0なら従来の線形clip')
-    parser.add_argument('--repair_exploration_plateau_fraction', default=0.40, type=float, help='前半25% exploration window内で最大探索強度を保持する割合。windowの最後では必ず0へ収束する')
+    parser.add_argument('--repair_exploration_plateau_fraction', default=0.40, type=float, help='前半25%% exploration window内で最大探索強度を保持する割合。windowの最後では必ず0へ収束する')
     parser.add_argument('--repair_policy_exploration_mode', default='annealed', choices=['constant', 'annealed'], help='Exact-online離散方策の探索強度。annealedは指定fraction内で0へ滑らかに収束し、それ以降は決定論的方策を使う')
     parser.add_argument('--repair_policy_exploration_constant_multiplier', default=0.50, type=float, help='constant時のWhere/Amount/Fineおよび旧汎用random-mixの基準倍率。実効探索はActual evidence品質で縮小し、eval時の確率ノイズは常に0')
     parser.add_argument('--repair_add_candidate_ratio_start', default=0.0, type=float, help='探索初期の追加候補割合(0ならmax_add_ratio)')
@@ -1877,6 +1877,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
+    parser.add_argument('--train_fixed_episode_frames', default=100, type=int, help='毎Episodeで同じ先頭訓練フレームを使用する総数。系列間で均等配分。matched比較viewは別計数。0は診断用の従来巡回窓')
     parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
     parser.add_argument('--train_window_shuffle_each_cycle', default=True, type=str2bool, help='訓練フレームを1周ごとにseed固定で再配置し、固定的なEpisode周期を防ぐ')
     parser.add_argument('--episodes', default=382, type=int, help='学習エピソード数')
@@ -1928,7 +1929,7 @@ def parse_pugan_args(parser, file_day, file_time):
         type=float,
         help=(
             'cp_lambda_geomによるforward損失値を変えず、幾何primaryのbackwardだけを'
-            '倍率調整する。0.036はauxの固定25%化を解除した実効scale=1で、'
+            '倍率調整する。0.036はauxの固定25%%化を解除した実効scale=1で、'
             '圧縮/幾何gradient L2が同程度になるよう実Stepから校正'
         ),
     )
@@ -2139,6 +2140,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_gpu_wait_timeout', default=600.0, type=float, help='SparsePCGC CUDA teacherの空きGPU待機上限秒')
     parser.add_argument('--sparsepcgc_gpu_wait_interval', default=2.0, type=float, help='SparsePCGC CUDA teacherの空きGPU確認間隔秒')
     parser.add_argument('--sparsepcgc_oom_retry_count', default=2, type=int, help='SparsePCGC teacherがCUDA OOMになった場合に同じ点群を再実行する回数')
+    parser.add_argument('--sparsepcgc_worker_restart_count', default=1, type=int, help='終了・切断したSparsePCGC workerを同一設定で再起動して同じActual要求を再試行する上限。0は復旧なし')
     parser.add_argument('--sparsepcgc_actual_gt_disk_cache', default=True, type=str2bool, help='静的GTの実SparsePCGC統計をcodec条件付きで永続cacheするか')
     parser.add_argument('--sparsepcgc_actual_gt_disk_cache_dir', default=str((_DATA_ROOT / 'cache' / 'sparsepcgc_actual_gt').resolve()), type=str, help='実SparsePCGC GT統計の永続cache先')
     parser.add_argument(
@@ -2709,7 +2711,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_online_exploration_max_candidate_changes', default=0, type=int,
         help=(
             '1回のWhere探索でincumbentから入れ替えるcandidate上限。'
-            '0以下は固定上限なし（選択数比が上限）。実効数は前半25%の探索係数で0まで縮小する'
+            '0以下は固定上限なし（選択数比が上限）。実効数は前半25%%の探索係数で0まで縮小する'
         ),
     )
     parser.add_argument(
@@ -3621,7 +3623,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--save_compression_metric_csv', default=True, type=str2bool, help='actual/surrogate/proxy圧縮metricを分離したstep CSVを保存する')
     parser.add_argument('--save_operation_metric_csv', default=True, type=str2bool, help='Add/Prune/Adjustのsoft/hard/effective統計step CSVを保存する')
     parser.add_argument('--save_step_metric_csv', default=False, type=str2bool, help='詳細なStep単位CSVを保存するか。通常はEpisode CSVだけを保存する')
-    parser.add_argument('--plot_step_average_window', default=100, type=int, help='Step平均PNGの集計Step数。100なら横軸1目盛りが100 Step')
+    parser.add_argument('--plot_step_average_window', default=100, type=int, help='旧Step平均機能の互換設定（現在はEpisode図のみ出力）')
     parser.add_argument('--operation_dead_grad_warn_threshold', default=1e-12, type=float, help='operation branch/amount勾配が死んだとみなすnormしきい値')
     parser.add_argument('--operation_dead_grad_warn_patience', default=20, type=int, help='operation勾配が低い状態が何step続いたらwarningを出すか')
     parser.add_argument('--repair_add_ratio_floor', default=0.0, type=float, help='Add操作が完全に死なないための弱いratio下限。0で無効')
@@ -5699,6 +5701,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.train_window_shuffle_each_cycle = bool(getattr(
         args, "train_window_shuffle_each_cycle", True
     ))
+    args.train_fixed_episode_frames = int(getattr(args, "train_fixed_episode_frames", 100))
+    if args.train_fixed_episode_frames < 0:
+        raise ValueError("train_fixed_episode_frames must be nonnegative")
     args.full_cloud_empty_cache_threshold_mb = max(float(getattr(
         args, "full_cloud_empty_cache_threshold_mb", 8192.0
     )), 0.0)
@@ -5750,6 +5755,7 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_gpu_wait_timeout = max(float(getattr(args, "sparsepcgc_gpu_wait_timeout", 600.0)), 0.0)
     args.sparsepcgc_gpu_wait_interval = max(float(getattr(args, "sparsepcgc_gpu_wait_interval", 2.0)), 0.1)
     args.sparsepcgc_oom_retry_count = max(int(getattr(args, "sparsepcgc_oom_retry_count", 2)), 0)
+    args.sparsepcgc_worker_restart_count = max(int(getattr(args, "sparsepcgc_worker_restart_count", 1)), 0)
     args.sparsepcgc_worker_gpu_stats = bool(getattr(args, "sparsepcgc_worker_gpu_stats", False))
     args.disable_actual_codec_during_train = bool(getattr(args, "disable_actual_codec_during_train", False))
     args.actual_codec_fallback_to_proxy_on_error = bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", False))
