@@ -247,10 +247,11 @@ def train(model, args, loss, writer, plot, notifier=None):
             json.dump(fixed_frame_manifest, handle, ensure_ascii=False, indent=2)
         writer.write(
             "FixedEpisodeFrames: unique_frames={}, matched_views={}, steps={}, "
-            "allocation={}, manifest={}".format(
+            "per_dataset={}, allocation={}, manifest={}".format(
                 fixed_frame_manifest["unique_frames_per_episode"],
                 fixed_frame_manifest["matched_views_per_frame"],
                 fixed_frame_manifest["steps_per_episode"],
+                fixed_frame_manifest["frames_per_dataset"],
                 [row["frames"] for row in fixed_frame_manifest["sequences"]], manifest_path,
             )
         )

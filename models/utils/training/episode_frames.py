@@ -12,8 +12,8 @@ def _frame_key(path):
 def configure_fixed_episode_frames(seq_datasets, args):
     """Select unique frames once, preserving all_files for the validation split.
 
-    A frame can still have multiple matched anchor/variant views. The budget
-    counts original frames, not optimizer steps or repeated teacher requests.
+    Each dataset receives its own budget. Each selected frame is processed
+    once per Episode; matched comparison memory can span Episodes.
     Zero explicitly retains the legacy rotating-window diagnostic mode.
     """
     target = int(getattr(args, "train_fixed_episode_frames", 0))
@@ -21,6 +21,7 @@ def configure_fixed_episode_frames(seq_datasets, args):
         return list(seq_datasets), None
     limit = int(getattr(args, "train_frames_per_sequence", 100))
     populations = []
+    groups = {}
     seen = set()
     for seq_dir, dataset in seq_datasets:
         files = list(getattr(dataset, "all_files", dataset.files))
@@ -35,20 +36,31 @@ def configure_fixed_episode_frames(seq_datasets, args):
                 raise ValueError("Duplicate training frame: " + identity)
             seen.add(identity)
         populations.append(files)
-    if sum(map(len, populations)) < target:
-        raise ValueError(
-            "Fixed Episode needs {} unique training frames, only {} available; "
-            "will not repeat frames or use validation data. "
-            "For a short diagnostic use --train_fixed_episode_frames 0."
-            .format(target, sum(map(len, populations)))
-        )
+        dataset_name = str(getattr(dataset, "training_dataset_name",
+                                   getattr(args, "dataname", "dataset")))
+        groups.setdefault(dataset_name, []).append(len(populations) - 1)
+    if not groups:
+        raise ValueError("No training datasets for fixed Episode")
     quotas = [0] * len(populations)
-    remaining = target
-    while remaining:
-        for index, population in enumerate(populations):
-            if remaining and quotas[index] < len(population):
-                quotas[index] += 1
-                remaining -= 1
+    dataset_records = []
+    for dataset_name, indices in groups.items():
+        available = sum(len(populations[index]) for index in indices)
+        if available < target:
+            raise ValueError(
+                "Fixed Episode for {} needs {} unique training frames, only {} available; "
+                "will not repeat frames or use validation data. "
+                "For a short diagnostic use --train_fixed_episode_frames 0."
+                .format(dataset_name, target, available)
+            )
+        remaining = target
+        while remaining:
+            for index in indices:
+                if remaining and quotas[index] < len(populations[index]):
+                    quotas[index] += 1
+                    remaining -= 1
+        dataset_records.append({"dataset": dataset_name, "frames": target,
+                                "steps": target,
+                                "sequence_steps": [quotas[index] for index in indices]})
     selected = []
     records = []
     for (seq_dir, dataset), population, quota in zip(seq_datasets, populations, quotas):
@@ -66,6 +78,8 @@ def configure_fixed_episode_frames(seq_datasets, args):
         records.append({"sequence": str(seq_dir), "frames": quota,
                         "signature": dataset.active_window_signature,
                         "files": list(map(str, dataset.files))})
-    return selected, {"unique_frames_per_episode": target,
+    return selected, {"unique_frames_per_episode": target * len(groups),
+                      "frames_per_dataset": target,
+                      "datasets": dataset_records,
                       "order": "fixed_sequence_then_frame",
                       "sequences": records}

@@ -1877,7 +1877,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
-    parser.add_argument('--train_fixed_episode_frames', default=100, type=int, help='毎Episodeで同じ先頭訓練フレームを使用する総数。系列間で均等配分。matched比較viewは別計数。0は診断用の従来巡回窓')
+    parser.add_argument('--train_fixed_episode_frames', default=100, type=int, help='データセットごとの毎Episodeの固定フレーム数＝Step数。系列間で均等配分し各フレームは1回のみ処理する。0は診断用の従来巡回窓')
     parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
     parser.add_argument('--train_window_shuffle_each_cycle', default=True, type=str2bool, help='訓練フレームを1周ごとにseed固定で再配置し、固定的なEpisode周期を防ぐ')
     parser.add_argument('--episodes', default=382, type=int, help='学習エピソード数')
@@ -3605,7 +3605,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--checkpoint_full_cloud_min_count', default=1, type=int, help='full_cloud actualをcheckpoint主指標に使う最低件数')
     parser.add_argument('--checkpoint_min_optimizer_step_ratio', default=0.20, type=float, help='この割合未満しかoptimizer更新できないepisodeはbest/guard対象外')
     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
-    parser.add_argument('--sparsepcgc_matched_frame_repeats', default=2, type=int, choices=[1, 2], help='SparsePCGC ana_den6学習だけで同一frameのanchor/比較を連続処理する。1は従来順、2は1回ずつencodeする2-view。評価・他codecは変更しない')
+    parser.add_argument('--sparsepcgc_matched_frame_repeats', default=2, type=int, choices=[1, 2], help='train_fixed_episode_frames=0の診断時だけSparsePCGC ana_den6学習を同一frameの2-viewへ拡張する。固定Episodeでは指定値によらず各frameを1回処理する')
     parser.add_argument('--sparsepcgc_amount_exploration', default=False, type=str2bool,
                         help='実験用opt-in: SparsePCGC ana_den6だけcheckpoint基準の連続Amount残差と広い初期探索を有効化。短期Actual改善未確認のため標準OFF')
     parser.add_argument('--sparsepcgc_amount_joint_exploration', default=True, type=str2bool,

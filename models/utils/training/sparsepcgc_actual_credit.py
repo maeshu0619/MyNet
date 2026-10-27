@@ -58,6 +58,10 @@ def refresh_actual_credit_group(selected, groups, scores, last_opened, step, min
 
 
 def matched_frame_repeats(args):
+    # Fixed-frame Episodes have exactly one optimizer step per input frame.
+    # Retain frame/anchor comparison memories, but do not duplicate the loader.
+    if int(getattr(args, 'train_fixed_episode_frames', 0)) > 0:
+        return 1
     if not sparsepcgc_credit_training(args):
         return 1
     return max(1, min(int(getattr(args, 'sparsepcgc_matched_frame_repeats', 2)), 2))
