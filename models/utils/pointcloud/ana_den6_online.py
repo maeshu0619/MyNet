@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -334,6 +335,10 @@ def _canonical_geometry_terms(coords: torch.Tensor) -> dict[str, Any]:
 
 
 def _fast_profile(args: Any) -> tuple[float, dict[str, float]]:
+    from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+    if autonomous_search_enabled(args):
+        # A neutral normalization origin, NOT a behavioral Amount/share prior.
+        return .0025, {name: 1. / 3. for name in ('Add', 'Prune', 'Adjust')}
     dataset = _dataset_name(getattr(args, "dataname", "8i"))
     scale_m = int(getattr(args, "sparsepcgc_scale_m", 8))
     total, shares = _FAST_PROFILES.get(
@@ -381,6 +386,8 @@ def _build_fast_unordered_teacher(
         raise RuntimeError("fast unordered proposal received an empty cloud")
 
     total_ratio, shares = _fast_profile(args)
+    from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled, autonomous_pool_phase
+    autonomous = autonomous_search_enabled(args)
     requested_total = max(int(round(point_count * total_ratio)), 1)
     reserve = max(float(getattr(
         args, "heuristic_guidance_online_fast_pool_reserve_factor", 2.0
@@ -391,13 +398,21 @@ def _build_fast_unordered_teacher(
     budgets = {}
     for operation in ("Add", "Prune", "Adjust"):
         required = max(int(round(requested_total * shares[operation])), 1)
+        if autonomous:
+            # Every family can consume the full legal total budget. Pool size
+            # is independent of the old dataset-specific ratio/share tables.
+            maximum_ratio = min(float(getattr(
+                args, 'heuristic_guidance_online_max_total_ratio', .0099)), .0099)
+            required = max(int(math.ceil(point_count * maximum_ratio)), 1)
         budget = max(int(np.ceil(required * reserve)), required)
-        if configured_cap > 0:
+        if configured_cap > 0 and not autonomous:
             budget = min(budget, configured_cap)
         budgets[operation] = min(budget, point_count)
     setup_finished = time.perf_counter()
 
     seed = int(str(identity["input_sha256"])[:16], 16) & 0x7FFFFFFF
+    if autonomous:
+        seed = (seed + 104729 * autonomous_pool_phase(args)) & 0x7FFFFFFF
     sample_count = min(
         point_count,
         max(max(budgets.values()) * 2, max(budgets.values()) + 256),
@@ -440,11 +455,15 @@ def _build_fast_unordered_teacher(
         args, "sparsepcgc_native_resolution", 1023
     )), 1)
     in_domain = ((targets >= 0) & (targets <= native_resolution)).all(dim=-1)
+    if autonomous:
+        in_domain &= ((targets >= rows.amin(dim=0)) & (targets <= rows.amax(dim=0))).all(dim=-1)
+    interior = ((sampled_rows > rows.amin(dim=0)) &
+                (sampled_rows < rows.amax(dim=0))).all(dim=-1)
     empty = (~occupied.reshape_as(target_keys)) & in_domain
     neighbour_count = occupied.reshape_as(target_keys).sum(dim=1)
     membership_finished = time.perf_counter()
 
-    def choose_pairs(budget: int, phase: int):
+    def choose_pairs(budget: int, phase: int, protect_source: bool = False):
         starts = (sample_indices * 2654435761 + int(phase)) % len(_FAST_NEIGHBOR_OFFSETS)
         directions = torch.arange(
             len(_FAST_NEIGHBOR_OFFSETS), device=rows.device, dtype=torch.long
@@ -452,7 +471,10 @@ def _build_fast_unordered_teacher(
         priority = (directions - starts.view(-1, 1)) % len(_FAST_NEIGHBOR_OFFSETS)
         priority = priority.masked_fill(~empty, len(_FAST_NEIGHBOR_OFFSETS) + 1)
         selected_direction = priority.argmin(dim=1)
-        valid_rows = torch.nonzero(empty.any(dim=1), as_tuple=False).reshape(-1)
+        valid = empty.any(dim=1)
+        if protect_source:
+            valid = valid & interior
+        valid_rows = torch.nonzero(valid, as_tuple=False).reshape(-1)
         if int(valid_rows.numel()) > int(budget):
             valid_rows = valid_rows[: int(budget)]
         source_index = sample_indices.index_select(0, valid_rows)
@@ -465,8 +487,11 @@ def _build_fast_unordered_teacher(
     serialization_started = time.perf_counter()
     pools: dict[str, list[dict[str, Any]]] = {}
     prune_indices = sample_indices[: budgets["Prune"]]
+    if autonomous:
+        prune_indices = sample_indices[interior][:budgets['Prune']]
     prune_rows = rows.index_select(0, prune_indices)
-    prune_degree = neighbour_count[: int(prune_indices.numel())].float()
+    prune_degree = (neighbour_count[interior][:int(prune_indices.numel())].float()
+                    if autonomous else neighbour_count[:int(prune_indices.numel())].float())
     pools["Prune"] = [
         {
             "candidate_id": f"fast:Prune:{x}:{y}:{z}",
@@ -483,7 +508,7 @@ def _build_fast_unordered_teacher(
     ]
     for operation, phase in (("Add", seed + 17), ("Adjust", seed + 43)):
         direction_index, source, target, degree = choose_pairs(
-            budgets[operation], phase
+            budgets[operation], phase, protect_source=(autonomous and operation == 'Adjust')
         )
         pool = []
         seen_targets = set()
@@ -523,6 +548,7 @@ def _build_fast_unordered_teacher(
     cache_signature = hashlib.sha256("|".join((
         FAST_UNORDERED_SOURCE, str(identity["input_sha256"]),
         str(identity["setting_id"]), str(reserve), str(configured_cap),
+        *(('autonomous', str(seed), str(budgets)) if autonomous else ()),
     )).encode("utf-8")).hexdigest()
     return {
         **dict(identity),
@@ -568,6 +594,8 @@ def _build_fast_unordered_teacher(
         "proposal_sampled_source_count": int(sample_count),
         "contains_candidate_actual": False,
         "contains_heuristic_ranking": False,
+        "autonomous_search": autonomous,
+        "pool_phase": autonomous_pool_phase(args) if autonomous else 0,
     }
 
 
@@ -619,6 +647,9 @@ def _load_or_build_payload(context: Mapping[str, Any], args: Any) -> dict[str, A
             payload = None
 
     if payload is None:
+        from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        if autonomous_search_enabled(args):
+            raise RuntimeError('autonomous search requires a current input fingerprint; den6 fallback is disabled')
         coords = context.get("full_global_voxel_coords", context.get("global_voxel_coords"))
         if not torch.is_tensor(coords):
             raise RuntimeError("ana_den6 online contextにglobal_voxel_coordsが無い")
@@ -1061,7 +1092,10 @@ def attach_ana_den6_online_guidance(
         args, "heuristic_guidance_online_proposal_mode", "exact_den6"
     )).strip().lower()
     payload = None
-    if identity is not None and proposal_mode == "fast_unordered":
+    from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+    if autonomous_search_enabled(args) and identity is None:
+        raise RuntimeError('autonomous search needs an input fingerprint; den6 fallback is disabled')
+    if identity is not None and (proposal_mode == "fast_unordered" or autonomous_search_enabled(args)):
         payload = _build_fast_unordered_teacher(context, args, identity)
     elif identity is not None:
         payload = _load_exact_single_plan_teacher(args, identity)

@@ -4721,6 +4721,8 @@ class StructureRepairActuator(nn.Module):
             return None
         operations = ("Add", "Prune", "Adjust")
         from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        autonomous = autonomous_search_enabled(self.args)
         geometry_joint = bool(is_geometry_octree(self.args) and getattr(
             self.args, 'geometry_octree_joint_policy', True))
         if any(not isinstance(pools.get(name), list) or not pools.get(name) for name in operations):
@@ -4802,6 +4804,10 @@ class StructureRepairActuator(nn.Module):
             log_residual = torch.log(learned_raw[name] / prior_t.clamp_min(1e-9))
             bounded = torch.tanh(log_residual) * float(amount_beta) * float(residual_alpha)
             ratio_tensors[name] = prior_t * torch.exp(bounded)
+            if autonomous:
+                # Fine uses the trainable head-minus-frozen-reference path
+                # below; discard the legacy dataset-relative saturated mean.
+                ratio_tensors[name] = prior_t
         current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
         exact_anchor_steps = max(
             int(getattr(self.args, "heuristic_guidance_exact_anchor_steps", 0)), 0
@@ -4947,7 +4953,7 @@ class StructureRepairActuator(nn.Module):
             # prior-residual forward contract.
             "prior_residual",
         )).strip().lower()
-        actor_critic_selection = selection_mode == "actor_critic"
+        actor_critic_selection = selection_mode == "actor_critic" or autonomous
         # ``prior_residual`` keeps den6 as the safe forward prior, but it must
         # not disable the action-conditional Actual-RD evidence machinery.
         # The 20261008/041554 run reached E131 with factorized_group=all and
@@ -5047,7 +5053,7 @@ class StructureRepairActuator(nn.Module):
 
         def _confidence_forward_full_backward(residual, decision_group=None):
             """Scale hard forward authority but keep the residual trainable."""
-            if geometry_joint:
+            if geometry_joint or autonomous:
                 # SparsePCGC-specific alignment is not a geometry-codec
                 # safety proof and must not freeze Gate/Fine at their priors.
                 return residual
@@ -5142,7 +5148,7 @@ class StructureRepairActuator(nn.Module):
             amount_logits = prior_amount_logits + _confidence_forward_full_backward(
                 network_amount_logits - prior_amount_logits, "Amount"
             )
-            if geometry_joint:
+            if geometry_joint or autonomous:
                 # Every positive bin and no-op is reachable. A codec-specific
                 # Amount policy must not be trapped by the SparsePCGC prior.
                 amount_logits = network_amount_logits
@@ -5347,6 +5353,8 @@ class StructureRepairActuator(nn.Module):
                 gate_residual_raw, "Gate"
             )
             gate_combined_logits = prior_share_tensor.log() + gate_residual
+            if autonomous:
+                gate_combined_logits = gate_residual
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
             if (
                 factorized_behavior
@@ -5630,6 +5638,8 @@ class StructureRepairActuator(nn.Module):
         heuristic_prior_weight = max(float(getattr(
             self.args, "heuristic_guidance_final_where_weight", 0.01
         )), 0.0)
+        if autonomous:
+            heuristic_prior_weight = 0.0
         ordered_indices = {}
         static_compatible = {}
         candidate_log_probs = {}
@@ -5747,6 +5757,8 @@ class StructureRepairActuator(nn.Module):
                 actor_centered = actor_logit - actor_logit.mean()
                 actor_scale = actor_centered.detach().square().mean().sqrt().clamp_min(1.0)
                 actor_residual = 0.5 * torch.tanh(actor_centered / actor_scale)
+                if autonomous:
+                    actor_residual = 2. * torch.nn.functional.softsign(actor_centered / (2. * actor_scale))
                 candidate_value_score = actor_residual
                 candidate_value_scores[operation] = actor_logit
                 network_term_uncalibrated = actor_residual
@@ -5933,6 +5945,8 @@ class StructureRepairActuator(nn.Module):
                         max(int(requested_counts[operation]), 0),
                         proposal_count,
                     )
+                    if autonomous:
+                        heuristic_core_count = 0
                     heuristic_core = torch.topk(
                         heuristic_term.masked_fill(~proposal_mask, float("-inf")),
                         k=heuristic_core_count,
@@ -5959,9 +5973,9 @@ class StructureRepairActuator(nn.Module):
                         visits = getattr(
                             self, "_den6_proposal_coverage_visits", OrderedDict()
                         )
-                        visit_index = int(visits.get(coverage_key, 0))
-                        visits[coverage_key] = visit_index + 1
-                        visits.move_to_end(coverage_key)
+                        from ..utils.training.sparsepcgc_autonomous_policy import proposal_coverage_index
+                        visit_index = proposal_coverage_index(visits, coverage_key,
+                            training=self.training, autonomous=autonomous)
                         while len(visits) > max(int(getattr(
                             self.args,
                             "heuristic_guidance_online_proposal_coverage_entries",
@@ -7601,12 +7615,14 @@ class StructureRepairActuator(nn.Module):
             ),
             "candidate_actual_encode_count": 0,
             "proposal_source": (
-                "den6_unordered_safe_pool_actor_critic"
+                "autonomous_spatial_legal_pool"
+                if autonomous else "den6_unordered_safe_pool_actor_critic"
                 if actual_residual_learning
                 else "den6_pool_confidence_bounded_network_residual"
             ),
             "performance_source": (
-                "geometry_joint_conditional_occupancy_actual_actor"
+                "autonomous_network_amount_where"
+                if autonomous else "geometry_joint_conditional_occupancy_actual_actor"
                 if geometry_joint else "exact_teacher_anchor"
                 if exact_anchor_active
                 else "network_actor_critic_no_rank_fusion"
