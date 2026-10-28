@@ -62,9 +62,6 @@ class OctreeStructureAnalysis(nn.Module):
     def _fixed_structure_cache_key(self, cache_key):
         if not cache_key:
             return ""
-        from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
-        if autonomous_search_enabled(self.args):
-            cache_key = 'autonomous_node_aligned_v1|' + str(cache_key)
         return "|".join((
             "octree_fixed_structure_v1",
             str(cache_key),

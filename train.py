@@ -257,7 +257,6 @@ def train(model, args, loss, writer, plot, notifier=None):
         )
     _configure_streaming_exact_caches(args, seq_datasets, writer)
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) * matched_frame_repeats(args)
-    args._fixed_episode_steps = int(total_train_files)
     den6_prefetch_lookahead = max(
         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
     )
@@ -5905,7 +5904,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             "fixed_objective": None,
             "count": 0,
         }
-        if (not bool(getattr(args, 'sparsepcgc_autonomous_search', False))) and str(getattr(
+        if str(getattr(
             args, "heuristic_guidance_mode", ""
         )).strip().lower() == "ana_den6_online":
             # This is a plan-level deterministic baseline, not a candidate

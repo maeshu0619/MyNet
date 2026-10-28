@@ -967,14 +967,6 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
     if not torch.is_tensor(like):
         return {"enabled": False, "reason": "occupancy_nll_proxy_missing"}
 
-    from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
-    if autonomous_search_enabled(args):
-        exact = structure.get('ana_den6_ranked_candidate_guidance')
-        if not enabled or not isinstance(exact, Mapping) or not exact.get('autonomous_search'):
-            raise RuntimeError('autonomous policy requires its own current legal pool')
-        # Reuse coordinate mapping, not dataset profiles or cached rankings.
-        return _exact_den6_guidance(structure, args, like, exact)
-
     profile = resolve_profile(args)
     if not enabled:
         return {

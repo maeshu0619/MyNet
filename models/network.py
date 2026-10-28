@@ -5228,7 +5228,6 @@ class Network(nn.Module):
             raise RuntimeError(
                 "network_only_codec_policy received forbidden den/teacher/oracle payload"
             )
-        setattr(self.args, '_autonomous_policy_training', bool(self.training))
         if bool(getattr(self.args, "heuristic_guidance_enabled", True)):
             if guidance_mode == "ana_den6_online":
                 if not isinstance(full_octree_context, dict):
@@ -5426,11 +5425,6 @@ class Network(nn.Module):
                 if is_geometry_octree(self.args):
                     full_octree_context = align_geometry_context(full_octree_context, node_voxel_input_state["voxel_coords"])
                     canonical_subtree_tree = align_geometry_context(canonical_subtree_tree, node_voxel_input_state["voxel_coords"])
-                else:
-                    from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled, align_autonomous_context
-                    if autonomous_search_enabled(self.args):
-                        full_octree_context = align_autonomous_context(full_octree_context, node_voxel_input_state['voxel_coords'])
-                        canonical_subtree_tree = align_autonomous_context(canonical_subtree_tree, node_voxel_input_state['voxel_coords'])
 
                 # ここで selection_mask を full cloud 用maskのまま使ってはいけない。
                 # pts_xyz はすでに subtree subset のnode_xyzになっているため、

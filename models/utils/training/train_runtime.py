@@ -6536,12 +6536,6 @@ def run_episode_full_cloud_validation(
     amp_dtype,
     diagnostic_policy_override=None,
 ):
-    from models.utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled, validation_measurement
-    effective_diagnostic = (diagnostic_policy_override if diagnostic_policy_override is not None
-                            else getattr(args, 'heuristic_guidance_online_diagnostic_policy', 'normal'))
-    autonomous_validation = autonomous_search_enabled(args) and str(effective_diagnostic) in {'normal', 'network'}
-    if autonomous_validation:
-        args._autonomous_validation_measurements = []
     if (
         str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
         == "single_plan_student"
@@ -6791,9 +6785,6 @@ def run_episode_full_cloud_validation(
                         values.append(float(value))
                         sample_names.append(os.path.basename(str(file_path)))
                         if validation_geometry_value is not None:
-                            if autonomous_validation:
-                                args._autonomous_validation_measurements.append(validation_measurement(
-                                    args, loss, file_path, value, validation_geometry_value))
                             geometry_values.append(float(validation_geometry_value))
                             if is_geometry_octree(args) and getattr(args, 'geometry_octree_joint_policy', True):
                                 from models.utils.pointcloud.geometry_rd import geometry_penalty
@@ -6826,9 +6817,6 @@ def run_episode_full_cloud_validation(
         fixed_objective = avg_value + float(
             getattr(args, "cp_lambda_geom", 1.0)
         ) * geom_penalty
-        if autonomous_search_enabled(args):
-            fixed_objective = float(getattr(args, 'w_com', 1.)) * avg_value + float(
-                getattr(args, 'cp_lambda_geom', 1.)) * geom_penalty
         if is_geometry_octree(args) and getattr(args, 'geometry_octree_joint_policy', True):
             geom_penalty = sum(geometry_edit_penalties) / len(geometry_edit_penalties)
             fixed_objective = float(getattr(args, 'w_com', 1.)) * avg_value + float(
