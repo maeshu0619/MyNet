@@ -171,6 +171,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                 "tools/build_exact_teacher_cache.pyでfingerprint検証済みcacheを構築すること。"
                 "旧datasetへのsilent fallbackは許可しない"
             )
+    elif bool(getattr(args, 'test_route', False)):
+        writer.write(
+            "TrainingPerformanceContract: route=autonomous_joint_v2, den6_amount_prior=0, "
+            "den6_where_prior=0, independent_add_prune_adjust_amounts=True, "
+            "where_pool=all_current_legal_candidates, actual_teacher=complete_joint_plan, "
+            f"per_operation_max={float(args.test_route_max_operation_ratio)}, "
+            f"positive_bins={args.heuristic_guidance_online_amount_bins}, noop=per_operation"
+        )
     elif str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
         writer.write(
             "TrainingPerformanceContract: heuristic_role=candidate_pool_and_safety_prior, "
@@ -257,6 +265,8 @@ def train(model, args, loss, writer, plot, notifier=None):
         )
     _configure_streaming_exact_caches(args, seq_datasets, writer)
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) * matched_frame_repeats(args)
+    if bool(getattr(args, "test_route", False)):
+        args._fixed_episode_steps = int(total_train_files)
     den6_prefetch_lookahead = max(
         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
     )
@@ -5904,7 +5914,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             "fixed_objective": None,
             "count": 0,
         }
-        if str(getattr(
+        if (not bool(getattr(args, 'test_route', False))) and str(getattr(
             args, "heuristic_guidance_mode", ""
         )).strip().lower() == "ana_den6_online":
             # This is a plan-level deterministic baseline, not a candidate
@@ -6504,6 +6514,12 @@ def main():
     writer.write(f"SetupTiming: plot_init={time.time() - setup_plot_t0:.3f}s")
 
     log_training_setup( writer, args, file_day, file_time)
+    if str(getattr(args, "compress", "")).lower() == "sparsepcgc":
+        writer.write(
+            "TrainingRoute: test_route=" + str(bool(getattr(args, "test_route", False)))
+            + (" (experimental autonomous Amount/Where)"
+               if bool(getattr(args, "test_route", False)) else " (original den6)")
+        )
     # ============================================================
     # Direct Network Prune 起動確認
     # ============================================================

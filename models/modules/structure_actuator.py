@@ -498,6 +498,10 @@ class StructureRepairActuator(nn.Module):
             )
         nn.init.zeros_(self.algorithmic_amount_residual_head.weight)
         nn.init.zeros_(self.algorithmic_amount_residual_head.bias)
+        from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        if autonomous_search_enabled(self.args):
+            # No preferred bin from a dataset study, including at step zero.
+            nn.init.zeros_(self.algorithmic_amount_selector_head[-1].bias)
         # onlineのAmountはden6 profileに対するresidualである。初期weightの乱数が
         # profileの0.10/0.10/0.05%をStep 1から2倍以上へずらさないよう0初期化し、
         # 以後はActual/Surrogate勾配で入力依存residualを学習する。
@@ -547,6 +551,8 @@ class StructureRepairActuator(nn.Module):
             max(float(getattr(self.args, "repair_subtree_move_source_init_prob", 0.02)), 1e-4),
             1.0 - 1e-4,
         )
+        if autonomous_search_enabled(self.args):
+            nn.init.zeros_(self.operation_gate_head[-1].bias)
         nn.init.constant_(
             self.subtree_move_source_head[-1].bias,
             math.log(init_subtree_move / max(1.0 - init_subtree_move, 1e-6)),
@@ -559,6 +565,11 @@ class StructureRepairActuator(nn.Module):
         self.debug_tensors = {}
 
     def _load_from_state_dict(self, state_dict, prefix, *args):
+        from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        key = prefix + 'algorithmic_amount_selector_head.2.weight'
+        if (autonomous_search_enabled(self.args) and key in state_dict
+                and state_dict[key].shape[0] != self.algorithmic_amount_selector_head[-1].weight.shape[0]):
+            raise RuntimeError('test_route Amount候補数がcheckpointと異なります。保存時と同じ候補数・値を--test_route_amount_binsで指定するか、新規学習してください。重みの自動切捨て・補間は行いません。')
         from ..utils.training.sparsepcgc_amount_policy import migrate_amount_reference
         migrate_amount_reference(self, state_dict, prefix)
         super()._load_from_state_dict(state_dict, prefix, *args)
@@ -4721,6 +4732,8 @@ class StructureRepairActuator(nn.Module):
             return None
         operations = ("Add", "Prune", "Adjust")
         from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        autonomous = autonomous_search_enabled(self.args)
         geometry_joint = bool(is_geometry_octree(self.args) and getattr(
             self.args, 'geometry_octree_joint_policy', True))
         if any(not isinstance(pools.get(name), list) or not pools.get(name) for name in operations):
@@ -4751,6 +4764,10 @@ class StructureRepairActuator(nn.Module):
         if geometry_joint:
             max_total_ratio = max_changed_ratio = float(getattr(
                 self.args, 'geometry_octree_max_edit_ratio', .0099))
+        if autonomous:
+            maximum_per_operation = float(getattr(self.args, 'test_route_max_operation_ratio', .03))
+            max_total_ratio = 3. * maximum_per_operation
+            max_changed_ratio = 4. * maximum_per_operation
         # A plan needs at least one executable edit, but individual operation
         # families may be zero because their counts are owned by the Gate.
         if online_mode and int(math.floor(point_count * max_total_ratio)) < 1:
@@ -4802,6 +4819,10 @@ class StructureRepairActuator(nn.Module):
             log_residual = torch.log(learned_raw[name] / prior_t.clamp_min(1e-9))
             bounded = torch.tanh(log_residual) * float(amount_beta) * float(residual_alpha)
             ratio_tensors[name] = prior_t * torch.exp(bounded)
+            if autonomous:
+                # Fine uses the trainable head-minus-frozen-reference path
+                # below; discard the legacy dataset-relative saturated mean.
+                ratio_tensors[name] = prior_t
         current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
         exact_anchor_steps = max(
             int(getattr(self.args, "heuristic_guidance_exact_anchor_steps", 0)), 0
@@ -4947,7 +4968,7 @@ class StructureRepairActuator(nn.Module):
             # prior-residual forward contract.
             "prior_residual",
         )).strip().lower()
-        actor_critic_selection = selection_mode == "actor_critic"
+        actor_critic_selection = selection_mode == "actor_critic" or autonomous
         # ``prior_residual`` keeps den6 as the safe forward prior, but it must
         # not disable the action-conditional Actual-RD evidence machinery.
         # The 20261008/041554 run reached E131 with factorized_group=all and
@@ -4976,10 +4997,10 @@ class StructureRepairActuator(nn.Module):
             self._select_den6_factorized_exploration_group(
                 network_confidence_audit
             )
-            if factorized_actual_credit and exploration_active and not geometry_joint
+            if factorized_actual_credit and exploration_active and not geometry_joint and not autonomous
             else "all" if exploration_active else "none"
         )
-        if geometry_joint:
+        if geometry_joint or autonomous:
             # One composite Actual result must supervise the joint decision;
             # do not freeze the other operations/Amount behind factor anchors.
             factorized_behavior = False
@@ -5047,7 +5068,7 @@ class StructureRepairActuator(nn.Module):
 
         def _confidence_forward_full_backward(residual, decision_group=None):
             """Scale hard forward authority but keep the residual trainable."""
-            if geometry_joint:
+            if geometry_joint or autonomous:
                 # SparsePCGC-specific alignment is not a geometry-codec
                 # safety proof and must not freeze Gate/Fine at their priors.
                 return residual
@@ -5142,7 +5163,7 @@ class StructureRepairActuator(nn.Module):
             amount_logits = prior_amount_logits + _confidence_forward_full_backward(
                 network_amount_logits - prior_amount_logits, "Amount"
             )
-            if geometry_joint:
+            if geometry_joint or autonomous:
                 # Every positive bin and no-op is reachable. A codec-specific
                 # Amount policy must not be trapped by the SparsePCGC prior.
                 amount_logits = network_amount_logits
@@ -5347,6 +5368,8 @@ class StructureRepairActuator(nn.Module):
                 gate_residual_raw, "Gate"
             )
             gate_combined_logits = prior_share_tensor.log() + gate_residual
+            if autonomous:
+                gate_combined_logits = gate_residual
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
             if (
                 factorized_behavior
@@ -5382,6 +5405,27 @@ class StructureRepairActuator(nn.Module):
             )
             for index, name in enumerate(operations)
         }
+        if autonomous:
+            from ..utils.training.autonomous_joint_learning import sample_joint_amounts
+            if not torch.is_tensor(amount_selector_logits) or not torch.is_tensor(operation_gate_logits):
+                raise RuntimeError('joint autonomous policy requires trainable Amount and Gate logits')
+            joint_amount = sample_joint_amounts(
+                network_amount_logits, operation_fine_policy_means,
+                # Independent edit/no-edit logits need their common mode.
+                # Centering across operations would prevent all three gates
+                # from decreasing together when every edited plan is costly.
+                gate_logits_den6 / float(gate_logit_scale), bin_tensor, maximum_per_operation,
+                float(scheduled_exploration_multiplier), self.training,
+                float(getattr(self.args, 'sparsepcgc_amount_exploration_log_sigma', .30)))
+            sampled_ratio_tensors = joint_amount['ratios']
+            hard_total = sum(sampled_ratio_tensors.values()).detach()
+            no_op_selected = all(float(v.detach().cpu()) == 0. for v in sampled_ratio_tensors.values())
+            # Deterministic summaries only. There is no three-way quota or
+            # extra Gate draw in the executed joint policy.
+            gate_probs = torch.stack(tuple(sampled_ratio_tensors.values()))
+            gate_probs = gate_probs / gate_probs.sum().clamp_min(1e-12)
+            gate_log_probs = gate_probs.clamp_min(1e-12).log()
+            effective_amount_gumbel_scale = joint_amount['temperature']
         sampled_total_ratio = sum(sampled_ratio_tensors.values())
         amount_bin_log_prob = amount_behavior_log_probs[selected_amount_bin]
         if exact_anchor_active:
@@ -5426,6 +5470,13 @@ class StructureRepairActuator(nn.Module):
             max(int(math.floor(point_count * max_total_ratio)), minimum_plan_count),
         )
         requested_counts = self._den6_allocate_counts(total_budget, shares_value)
+        if autonomous:
+            requested_counts = {
+                name: min(int(math.ceil(point_count * float(value.detach().cpu()))),
+                          int(math.floor(point_count * maximum_per_operation)))
+                for name, value in sampled_ratio_tensors.items()
+            }
+            no_op_selected = sum(requested_counts.values()) == 0
         for name in operations:
             if geometry_joint:
                 capacity = sum(int(c.get('operation_count', 1)) for c in pools[name])
@@ -5630,6 +5681,8 @@ class StructureRepairActuator(nn.Module):
         heuristic_prior_weight = max(float(getattr(
             self.args, "heuristic_guidance_final_where_weight", 0.01
         )), 0.0)
+        if autonomous:
+            heuristic_prior_weight = 0.0
         ordered_indices = {}
         static_compatible = {}
         candidate_log_probs = {}
@@ -5727,9 +5780,8 @@ class StructureRepairActuator(nn.Module):
                     mapping.get("local_geometry_risk", actor_logit.new_zeros(actor_logit.shape))
                 )
                 candidate_critic_features[operation] = critic_features
-                proxy_critic_output = self.den6_candidate_proxy_critic(
-                    critic_features.detach()
-                )
+                proxy_critic_output = (actor_logit.new_zeros((actor_logit.numel(), 2))
+                    if autonomous else self.den6_candidate_proxy_critic(critic_features.detach()))
                 candidate_proxy_critic_values[operation] = proxy_critic_output[:, 0]
                 candidate_proxy_critic_uncertainties[operation] = (
                     torch.nn.functional.softplus(proxy_critic_output[:, 1])
@@ -5747,12 +5799,18 @@ class StructureRepairActuator(nn.Module):
                 actor_centered = actor_logit - actor_logit.mean()
                 actor_scale = actor_centered.detach().square().mean().sqrt().clamp_min(1.0)
                 actor_residual = 0.5 * torch.tanh(actor_centered / actor_scale)
+                if autonomous:
+                    actor_residual = 2. * torch.nn.functional.softsign(actor_centered / (2. * actor_scale))
                 candidate_value_score = actor_residual
                 candidate_value_scores[operation] = actor_logit
                 network_term_uncalibrated = actor_residual
                 if actor_critic_selection:
                     network_term = actor_residual
                     logits = actor_residual
+                    if autonomous:
+                        proposal_centered = proposal_logit - proposal_logit.mean()
+                        logits = logits + 2. * torch.nn.functional.softsign(proposal_centered / 2.)
+                        network_term = logits
                 else:
                     actual_authority = self._den6_actual_residual_authority(
                         f"{operation}Where"
@@ -5933,6 +5991,8 @@ class StructureRepairActuator(nn.Module):
                         max(int(requested_counts[operation]), 0),
                         proposal_count,
                     )
+                    if autonomous:
+                        heuristic_core_count = 0
                     heuristic_core = torch.topk(
                         heuristic_term.masked_fill(~proposal_mask, float("-inf")),
                         k=heuristic_core_count,
@@ -5959,9 +6019,14 @@ class StructureRepairActuator(nn.Module):
                         visits = getattr(
                             self, "_den6_proposal_coverage_visits", OrderedDict()
                         )
-                        visit_index = int(visits.get(coverage_key, 0))
-                        visits[coverage_key] = visit_index + 1
-                        visits.move_to_end(coverage_key)
+                        if autonomous:
+                            from ..utils.training.sparsepcgc_autonomous_policy import proposal_coverage_index
+                            visit_index = proposal_coverage_index(visits, coverage_key,
+                                training=self.training, autonomous=True)
+                        else:
+                            visit_index = int(visits.get(coverage_key, 0))
+                            visits[coverage_key] = visit_index + 1
+                            visits.move_to_end(coverage_key)
                         while len(visits) > max(int(getattr(
                             self.args,
                             "heuristic_guidance_online_proposal_coverage_entries",
@@ -6052,6 +6117,7 @@ class StructureRepairActuator(nn.Module):
             candidate_proposal_masks[operation] = proposal_mask
             if (
                 torch.is_tensor(utility_target)
+                and not autonomous
                 and int(utility_target.numel()) == int(policy_logits.numel())
             ):
                 utility_target = utility_target.to(
@@ -6277,6 +6343,7 @@ class StructureRepairActuator(nn.Module):
             candidate_entropy_by_operation[operation] = candidate_entropy
             operation_exploration_active = bool(
                 exploration_active
+                and not autonomous
                 and (
                     not factorized_behavior
                     or factorized_exploration_group in {
@@ -6649,6 +6716,12 @@ class StructureRepairActuator(nn.Module):
                 exploration_selection_change_rates[operation] = 0.0
                 order_tensor = deterministic_order
             ordered_indices[operation] = order_tensor.cpu().tolist()
+            if autonomous:
+                from ..utils.training.autonomous_joint_learning import sample_where_order
+                order_tensor = sample_where_order(policy_logits,
+                    float(scheduled_exploration_multiplier), self.training)
+                ordered_indices[operation] = order_tensor.cpu().tolist()
+                gumbel_scales.append(float(scheduled_exploration_multiplier))
 
         candidate_local_loss = (
             torch.stack(candidate_local_losses).mean()
@@ -6747,6 +6820,8 @@ class StructureRepairActuator(nn.Module):
         true_add_targets = set()
         selected_counts = {name: 0 for name in operations}
         joint_geometry_result = None
+        if autonomous:
+            joint_attempted_counts = {name: 0 for name in operations}
         if geometry_joint:
             from ..utils.pointcloud.geometry_joint_policy import select_joint_geometry_plan
             joint_geometry_result = select_joint_geometry_plan(
@@ -6760,6 +6835,8 @@ class StructureRepairActuator(nn.Module):
             for candidate_index in ordered_indices[operation]:
                 if selected_counts[operation] >= requested_counts[operation]:
                     break
+                if autonomous:
+                    joint_attempted_counts[operation] += 1
                 candidate = pools[operation][candidate_index]
                 if static_compatibility_available:
                     if not static_compatible[operation][candidate_index]:
@@ -6905,18 +6982,29 @@ class StructureRepairActuator(nn.Module):
 
         selected_where_log_probs = []
         selected_where_log_probs_by_operation = {name: [] for name in operations}
-        for operation, candidate_index, _ in selected:
-            selected_log_prob = candidate_log_probs[operation][candidate_index]
-            selected_where_log_probs.append(selected_log_prob)
-            selected_where_log_probs_by_operation[operation].append(selected_log_prob)
+        if autonomous:
+            for operation in operation_order:
+                ids = torch.as_tensor([index for op, index, _ in selected if op == operation],
+                    device=action_ratio_stack.device, dtype=torch.long)
+                values = candidate_log_probs[operation].index_select(0, ids)
+                selected_where_log_probs.append(values)
+                if ids.numel():
+                    selected_where_log_probs_by_operation[operation].append(values)
+        else:
+            for operation, candidate_index, _ in selected:
+                selected_log_prob = candidate_log_probs[operation][candidate_index]
+                selected_where_log_probs.append(selected_log_prob)
+                selected_where_log_probs_by_operation[operation].append(selected_log_prob)
         where_log_prob = (
-            torch.stack(selected_where_log_probs).mean()
-            if selected_where_log_probs
+            (torch.cat(selected_where_log_probs).mean() if autonomous
+             else torch.stack(selected_where_log_probs).mean())
+            if selected_where_log_probs and (not autonomous or sum(selected_counts.values()) > 0)
             else action_ratio_stack.new_zeros(())
         )
         where_log_prob_by_operation = {
             name: (
-                torch.stack(selected_where_log_probs_by_operation[name]).mean()
+                (selected_where_log_probs_by_operation[name][0].mean() if autonomous
+                 else torch.stack(selected_where_log_probs_by_operation[name]).mean())
                 if selected_where_log_probs_by_operation[name]
                 else action_ratio_stack.new_zeros(())
             )
@@ -7062,7 +7150,7 @@ class StructureRepairActuator(nn.Module):
         fine_utility_confidence = 1.0
         operation_rate_summary = gate_probs.new_zeros((len(operations),))
         operation_geometry_summary = gate_probs.new_zeros((len(operations),))
-        if len(local_rate_by_op) == len(operations):
+        if len(local_rate_by_op) == len(operations) and not autonomous:
             all_rate = torch.cat([local_rate_by_op[name] for name in operations])
             all_geometry = torch.cat([
                 local_geometry_by_op[name] for name in operations
@@ -7479,13 +7567,16 @@ class StructureRepairActuator(nn.Module):
                 (top_probability[0] - top_probability[1]).detach().cpu()
                 if int(top_probability.numel()) > 1 else top_probability[0].detach().cpu()
             )
-            for index in indices:
-                selected_where_residual_terms.append(
-                    network_terms[operation][index]
-                )
+            if autonomous:
+                selected_where_residual_terms.append(network_terms[operation].index_select(0,
+                    torch.as_tensor(indices, device=network_terms[operation].device, dtype=torch.long)))
+            else:
+                for index in indices:
+                    selected_where_residual_terms.append(network_terms[operation][index])
         where_residual_tensor = (
-            torch.stack(selected_where_residual_terms)
-            if selected_where_residual_terms
+            (torch.cat(selected_where_residual_terms) if autonomous
+             else torch.stack(selected_where_residual_terms))
+            if selected_where_residual_terms and (not autonomous or sum(selected_counts.values()) > 0)
             else action_ratio_stack.new_zeros((1,))
         )
         amount_delta_ratios = {
@@ -7601,12 +7692,14 @@ class StructureRepairActuator(nn.Module):
             ),
             "candidate_actual_encode_count": 0,
             "proposal_source": (
-                "den6_unordered_safe_pool_actor_critic"
+                "autonomous_spatial_legal_pool"
+                if autonomous else "den6_unordered_safe_pool_actor_critic"
                 if actual_residual_learning
                 else "den6_pool_confidence_bounded_network_residual"
             ),
             "performance_source": (
-                "geometry_joint_conditional_occupancy_actual_actor"
+                "autonomous_network_amount_where"
+                if autonomous else "geometry_joint_conditional_occupancy_actual_actor"
                 if geometry_joint else "exact_teacher_anchor"
                 if exact_anchor_active
                 else "network_actor_critic_no_rank_fusion"
@@ -8064,6 +8157,49 @@ class StructureRepairActuator(nn.Module):
         debug["plan_hash"] = hashlib.sha256(
             json.dumps(plan_hash_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        if autonomous:
+            from ..utils.training.autonomous_joint_learning import where_prefix_log_prob
+            joint_where_terms = {}
+            for name in operations:
+                joint_where_terms[name] = where_prefix_log_prob(
+                    combined_logits[name], torch.as_tensor(ordered_indices[name],
+                        device=combined_logits[name].device, dtype=torch.long),
+                    joint_attempted_counts[name], float(scheduled_exploration_multiplier), self.training)
+            joint_amount_lp = torch.stack(tuple(joint_amount['log_probs'].values())).sum()
+            joint_where_lp = torch.stack(tuple(joint_where_terms.values())).sum()
+            debug['_joint_policy_log_prob'] = joint_amount_lp + joint_where_lp
+            debug['_joint_entropy'] = joint_amount['entropy'] + policy_entropy
+            debug['autonomous_joint_policy'] = True
+            debug['autonomous_input_sha256'] = str(exact.get('input_sha256', exact.get('input_voxel_hash', '')))
+            debug['autonomous_codec_setting'] = json.dumps({key: exact.get(key) for key in (
+                'setting_id', 'codec_mode', 'checkpoint_identifier', 'voxel_size', 'pos_quantscale',
+                'scale_ae', 'scale_sr', 'scale_m')}, sort_keys=True)
+            debug['joint_amount_bins_by_operation'] = {
+                name: float(bin_tensor[index].detach().cpu())
+                for name, index in joint_amount['indices'].items()}
+            debug['joint_requested_ratios'] = {name: float(value.detach().cpu())
+                for name, value in sampled_ratio_tensors.items()}
+            debug['joint_where_attempted_counts'] = joint_attempted_counts
+            debug['joint_amount_log_prob'] = float(joint_amount_lp.detach().cpu())
+            debug['joint_where_log_prob'] = float(joint_where_lp.detach().cpu())
+            debug['joint_max_per_operation'] = maximum_per_operation
+            debug['factorized_exploration_group'] = 'all'
+            debug['action_policy_role'] = 'joint_independent_operation_amounts_and_where'
+            debug['amount_mode'] = 'joint_per_operation_categorical_plus_continuous'
+            debug['amount_bin_index'] = -1  # three independent classes, no single shared class
+            debug['learning_adaptive_exploration'] = False
+            debug['joint_where_selection_change_rates'] = {}
+            changed_top1 = {}
+            for name in operations:
+                order = ordered_indices[name]
+                deterministic = torch.argsort(combined_logits[name], descending=True).tolist()
+                k = min(requested_counts[name], len(order))
+                debug['joint_where_selection_change_rates'][name] = (
+                    1. - len(set(order[:k]) & set(deterministic[:k])) / float(k) if k else 0.)
+                changed_top1[name] = bool(order and order[0] != deterministic[0])
+            debug['exploration_top1_changed'] = changed_top1
+            debug['exploration_top1_changed_rate'] = sum(changed_top1.values()) / 3.
+            debug['exploration_selection_change_rates'] = dict(debug['joint_where_selection_change_rates'])
         # 訓練時のshadow Studentへ渡すのは、このStepで実際に選択・実行した
         # 1 planだけである。Pool全体や未実行候補は渡さず、推論時にも保持しない。
         selected_count_sum = max(sum(selected_counts.values()), 1)

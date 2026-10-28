@@ -26,6 +26,9 @@ method_com = "SparsePCGC"
 # method_com = "G-PCC"
 method_name = "Mine"
 
+# False: 現在のden6設計。True: 2026-10-27 14:07のAmount/Where自律探索実験。
+test_route = False
+
 model_name = "best_loss_joint"
 
 dataname = "8i"
@@ -3606,6 +3609,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--checkpoint_min_optimizer_step_ratio', default=0.20, type=float, help='この割合未満しかoptimizer更新できないepisodeはbest/guard対象外')
     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
     parser.add_argument('--sparsepcgc_matched_frame_repeats', default=2, type=int, choices=[1, 2], help='train_fixed_episode_frames=0の診断時だけSparsePCGC ana_den6学習を同一frameの2-viewへ拡張する。固定Episodeでは指定値によらず各frameを1回処理する')
+    parser.add_argument('--test_route', default=test_route, type=str2bool, help='実験用：dataset別den6 priorを使わず、合法近傍poolと絶対AmountをNetworkが選ぶ。Actual/幾何の非劣化確認前は標準方策へ昇格しない')
+    parser.add_argument('--test_route_max_operation_ratio', default=0.03, type=float, help='True専用：各Add/Prune/Adjustの探索上限。0.03は各操作3%%。合計への固定配分は行わない')
+    parser.add_argument('--test_route_frozen_cache_memory_mb', default=128, type=int, help='True専用：固定Encoder特徴の損失なし圧縮RAM cache上限MB。0で無効。学習対象特徴は保存しない')
+    parser.add_argument('--test_route_frozen_cache_max_entries', default=128, type=int, help='True専用：損失なし固定特徴RAM cacheの最大frame数')
+    parser.add_argument('--test_route_pool_cache_memory_mb', default=128, type=int, help='True専用：同一入力・座標順序・探索phaseの合法poolを損失なし圧縮でRAM再利用する上限MB。0で無効')
+    parser.add_argument('--test_route_amount_bins', default='0.0001,0.0003,0.0006,0.001,0.002,0.003,0.005,0.007,0.009,0.01,0.012,0.015,0.02,0.025,0.03', type=str, help='True専用：各操作が独立選択する正値Amount。既定15個＋No-op＝16候補。割合をカンマ区切りで指定。既存checkpoint再開時は保存時と同じ候補数・値を指定')
+    parser.add_argument('--sparsepcgc_autonomous_reference_json', default='', type=str, help='自律探索のbest昇格を判定する固定Validation実測JSON。入力SHA/Codec/幾何定義が一致し、各frameのActualと幾何が両方非劣化の場合だけbest.pthを保存。未指定時は候補checkpointだけ保存')
     parser.add_argument('--sparsepcgc_amount_exploration', default=False, type=str2bool,
                         help='実験用opt-in: SparsePCGC ana_den6だけcheckpoint基準の連続Amount残差と広い初期探索を有効化。短期Actual改善未確認のため標準OFF')
     parser.add_argument('--sparsepcgc_amount_joint_exploration', default=True, type=str2bool,
@@ -8089,4 +8099,7 @@ def parse_pugan_args(parser, file_day, file_time):
     if compress_key in {"gpcc", "octattention"}:
         from .geometry_codec import configure_geometry_codec
         args = configure_geometry_codec(args, _cli_option_was_provided)
+    if args.test_route:
+        from ..training.sparsepcgc_autonomous_policy import configure_autonomous_search
+        args = configure_autonomous_search(args)
     return args

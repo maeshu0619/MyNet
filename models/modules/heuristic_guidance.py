@@ -471,7 +471,8 @@ def _candidate_local_proxy_tensors(
 
 
 def _attach_candidate_local_proxy(
-    guidance: Dict[str, Any], exact: Mapping[str, Any], like: torch.Tensor, args: Any
+    guidance: Dict[str, Any], exact: Mapping[str, Any], like: torch.Tensor, args: Any,
+    *, reuse_verified_cache: bool = False,
 ) -> Dict[str, Any]:
     """Attach local-credit tensors to freshly built and legacy disk caches."""
     tensor_map = guidance.get("candidate_tensor_map")
@@ -481,9 +482,27 @@ def _attach_candidate_local_proxy(
         mapping = tensor_map.get(operation)
         if not isinstance(mapping, dict):
             continue
-        proxy = _candidate_local_proxy_tensors(exact, operation, like, args)
         rank_score = mapping.get("rank_score")
         expected = int(rank_score.numel()) if torch.is_tensor(rank_score) else 0
+        from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        reuse = bool(reuse_verified_cache and autonomous_search_enabled(args)
+                     and exact.get('autonomous_search') and expected > 0)
+        rate, geometry = mapping.get('local_rate_benefit'), mapping.get('local_geometry_risk')
+        if reuse and all(torch.is_tensor(v) and v.numel() == expected for v in (rate, geometry)):
+            # The caller verified the mapped-cache input/codec/pool signature
+            # and dtype. Reuse only immutable observations; RD weighting is
+            # recomputed, and every trainable Actor/Critic forward still runs.
+            def standardize(value):
+                if value.numel() <= 1:
+                    return torch.zeros_like(value)
+                centered = value-value.mean()
+                return centered/centered.square().mean().sqrt().clamp_min(torch.finfo(value.dtype).eps)
+            weight = max(float(getattr(args, 'compression_primary_aux_target_ratio', .25)), 0.) * max(
+                float(getattr(args, 'rd_geometry_weight_multiplier', 1.25)), 0.)
+            proxy = dict(local_rate_benefit=rate, local_geometry_risk=geometry,
+                         local_utility_target=standardize(rate)-weight*standardize(geometry))
+        else:
+            proxy = _candidate_local_proxy_tensors(exact, operation, like, args)
         actual = int(proxy["local_utility_target"].numel())
         if actual != expected:
             raise RuntimeError(
@@ -564,7 +583,7 @@ def _exact_den6_guidance(
             _EXACT_GUIDANCE_CPU_CACHE.move_to_end(cpu_cache_key)
             restored = _guidance_tensor_tree(cached_cpu, like.device)
             restored["exact_candidate_guidance"] = exact
-            restored = _attach_candidate_local_proxy(restored, exact, like, args)
+            restored = _attach_candidate_local_proxy(restored, exact, like, args, reuse_verified_cache=True)
             restored["cpu_tensor_cache_hit"] = True
             restored["disk_tensor_cache_hit"] = False
             _EXACT_GUIDANCE_CACHE[cache_key] = restored
@@ -580,7 +599,7 @@ def _exact_den6_guidance(
         )
         restored = _guidance_tensor_tree(disk_guidance, like.device)
         restored["exact_candidate_guidance"] = exact
-        restored = _attach_candidate_local_proxy(restored, exact, like, args)
+        restored = _attach_candidate_local_proxy(restored, exact, like, args, reuse_verified_cache=True)
         restored["cpu_tensor_cache_hit"] = False
         restored["disk_tensor_cache_hit"] = True
         _EXACT_GUIDANCE_CACHE[cache_key] = restored
@@ -966,6 +985,14 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
     like = structure.get("occupancy_nll_proxy") if isinstance(structure, Mapping) else None
     if not torch.is_tensor(like):
         return {"enabled": False, "reason": "occupancy_nll_proxy_missing"}
+
+    from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+    if autonomous_search_enabled(args):
+        exact = structure.get('ana_den6_ranked_candidate_guidance')
+        if not enabled or not isinstance(exact, Mapping) or not exact.get('autonomous_search'):
+            raise RuntimeError('autonomous policy requires its own current legal pool')
+        # Reuse coordinate mapping, not dataset profiles or cached rankings.
+        return _exact_den6_guidance(structure, args, like, exact)
 
     profile = resolve_profile(args)
     if not enabled:

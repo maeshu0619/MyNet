@@ -411,6 +411,12 @@ def setup_amp(model, args, writer):
 def clip_model_gradients(model, max_norm):
     """AMP/FP32の両経路で同じ勾配クリップを適用する。"""
     max_norm = max(float(max_norm), 0.0)
+    from .sparsepcgc_autonomous_policy import autonomous_search_enabled
+    base = model.module if hasattr(model, 'module') else model
+    if (autonomous_search_enabled(getattr(base, 'args', None)) and max_norm > 0.
+            and bool(getattr(base.args, 'repair_balance_operation_head_grads', True))):
+        from .autonomous_joint_learning import clip_joint_gradients
+        return clip_joint_gradients(model, max_norm)
     parameters = [
         parameter
         for parameter in model.parameters()

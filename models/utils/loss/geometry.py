@@ -324,19 +324,36 @@ class GeometryLossMixin:
         added_dist = gen_pts_f.new_empty((0,))
         added_nn_idx = torch.empty((0,), device=gen_pts_f.device, dtype=torch.long)
         removed_dist = gen_pts_f.new_empty((0,))
+        from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        autonomous = autonomous_search_enabled(args)
+        if autonomous:
+            from .autonomous_exact_geometry import nearest_squared
+            self.last_autonomous_geometry_nn = []
         if added_rows.numel() > 0:
             added_xyz = gen_pts_f[:, :, new_final_mask]
-            added_dist, _, added_nn_idx, _ = chamfer_dist(
-                added_xyz.transpose(1, 2).contiguous(),
-                initial_xyz.transpose(1, 2).contiguous(),
-            )
+            fast = nearest_squared(added_xyz.transpose(1, 2).contiguous(),
+                initial_xyz.transpose(1, 2).contiguous(), chamfer_dist,
+                self.last_autonomous_geometry_nn) if autonomous else None
+            if fast is None:
+                added_dist, _, added_nn_idx, _ = chamfer_dist(
+                    added_xyz.transpose(1, 2).contiguous(),
+                    initial_xyz.transpose(1, 2).contiguous(),
+                )
+            else:
+                added_dist, added_nn_idx = fast
             added_dist = added_dist.reshape(-1)
         if removed_rows.numel() > 0:
             removed_xyz = gt_pts_f[:, :, removed_mask]
-            removed_dist, _, _, _ = chamfer_dist(
-                removed_xyz.transpose(1, 2).contiguous(),
-                final_xyz.transpose(1, 2).contiguous(),
-            )
+            fast = nearest_squared(removed_xyz.transpose(1, 2).contiguous(),
+                final_xyz.transpose(1, 2).contiguous(), chamfer_dist,
+                self.last_autonomous_geometry_nn) if autonomous else None
+            if fast is None:
+                removed_dist, _, _, _ = chamfer_dist(
+                    removed_xyz.transpose(1, 2).contiguous(),
+                    final_xyz.transpose(1, 2).contiguous(),
+                )
+            else:
+                removed_dist = fast[0]
             removed_dist = removed_dist.reshape(-1)
 
         gen_count = max(int(final_rows.shape[0]), 1)
@@ -504,6 +521,14 @@ class GeometryLossMixin:
                 sparse_edit = self._exact_sparse_edit_chamfer(
                     args, gen_pts_f, gt_inlinear_f, final_w_f
                 ) if out_label is None else None
+                fast_terms = None
+                if sparse_edit is None and bool(getattr(args, 'test_route', False)):
+                    from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+                    if autonomous_search_enabled(args):
+                        from .autonomous_exact_geometry import chamfer_terms
+                        self.last_autonomous_geometry_nn = []
+                        fast_terms = chamfer_terms(gen_pts_f, gt_inlinear_f, final_w_f,
+                                                  chamfer_dist, self.last_autonomous_geometry_nn)
                 if sparse_edit is not None:
                     L_cd_hard = sparse_edit["hard"]
                     L_cd_surrogate = sparse_edit["surrogate"]
@@ -518,6 +543,15 @@ class GeometryLossMixin:
                     surrogate_cd = L_cd_surrogate.detach()
                     L_fit = sparse_edit["fit"]
                     mode_name = "exact_sparse_edit"
+                elif fast_terms is not None:
+                    L_cd_hard, L_cd_weighted, L_cd_surrogate = fast_terms
+                    L_cd = (self._compose_discrete_loss(L_cd_hard, L_cd_surrogate, args)
+                            if use_ste_hard else L_cd_weighted if use_weighted_forward else L_cd_hard)
+                    hard_cd = L_cd_hard.detach() if audit_enabled else L_cd.detach()
+                    weighted_cd = L_cd_weighted.detach() if audit_enabled else L_cd.detach()
+                    surrogate_cd = L_cd_surrogate.detach() if use_ste_hard else weighted_cd
+                    mode_name = 'ste_hard' if use_ste_hard else 'weighted_soft' if use_weighted_forward else 'hard'
+                    L_fit = self._fit_proxy_loss(gen_pts_f, gt_inlinear_f)
                 elif use_ste_hard:
                     L_cd_hard, L_cd_surrogate = chamfer_l2_loss_and_weight_surrogate(
                         gen_pts_f,

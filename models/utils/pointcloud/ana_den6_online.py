@@ -371,6 +371,10 @@ def _build_fast_unordered_teacher(
     context: Mapping[str, Any], args: Any, identity: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Generate a legal, unordered pool without codec calls or full ranking."""
+    from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+    if autonomous_search_enabled(args):
+        from .autonomous_proposals import build_autonomous_pool
+        return build_autonomous_pool(context, args, identity)
     started = time.perf_counter()
     coords = context.get("full_global_voxel_coords", context.get("global_voxel_coords"))
     if not torch.is_tensor(coords) or coords.ndim != 3 or coords.shape[0] != 1:
@@ -1061,7 +1065,10 @@ def attach_ana_den6_online_guidance(
         args, "heuristic_guidance_online_proposal_mode", "exact_den6"
     )).strip().lower()
     payload = None
-    if identity is not None and proposal_mode == "fast_unordered":
+    from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+    if autonomous_search_enabled(args) and identity is None:
+        raise RuntimeError('autonomous search needs an input fingerprint; den6 fallback is disabled')
+    if identity is not None and (proposal_mode == "fast_unordered" or autonomous_search_enabled(args)):
         payload = _build_fast_unordered_teacher(context, args, identity)
     elif identity is not None:
         payload = _load_exact_single_plan_teacher(args, identity)

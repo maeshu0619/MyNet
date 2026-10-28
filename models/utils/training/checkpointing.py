@@ -115,6 +115,15 @@ def save_episode_checkpoint(
     model_path = _save_state_dict(model, ckpt_dir, model_name, loss=loss)
 
     checkpoint_metrics = checkpoint_metrics or {}
+    from .sparsepcgc_autonomous_policy import autonomous_search_enabled, autonomous_checkpoint_status
+    autonomous_pending = False
+    if args is not None and autonomous_search_enabled(args):
+        promotion = autonomous_checkpoint_status(args)
+        autonomous_pending = not promotion['eligible']
+        writer.write('AutonomousPromotion: ' + str(promotion))
+        if autonomous_pending:
+            checkpoint_metrics = dict(checkpoint_metrics, checkpoint_eligible=False,
+                checkpoint_ineligible_reason=str(promotion['reason']))
     best_trackers = _ensure_best_trackers(best_trackers, best_loss)
     current_loss = _finite_float(checkpoint_metrics.get("total_loss"), None)
     if current_loss is None:
@@ -136,8 +145,9 @@ def save_episode_checkpoint(
     if current_loss < best_trackers["legacy_loss"]:
         best_trackers["legacy_loss"] = current_loss
         best_loss = current_loss
-        model_path = _save_state_dict(model, ckpt_dir, "best_loss_legacy.pth", loss=loss)
-        checkpoint_updates.append("best_loss_legacy")
+        legacy_filename = 'candidate_loss_legacy.pth' if autonomous_pending else 'best_loss_legacy.pth'
+        model_path = _save_state_dict(model, ckpt_dir, legacy_filename, loss=loss)
+        checkpoint_updates.append(legacy_filename.replace('.pth', ''))
         writer.write(
             f"New legacy loss best at episode {episode + 1}, "
             f"avg_epi_loss={current_loss:.6f}"
@@ -150,7 +160,7 @@ def save_episode_checkpoint(
     stage_loss_best = _finite_float(loss_by_stage.get(stage_name), float("inf"))
     if current_loss < stage_loss_best:
         loss_by_stage[stage_name] = current_loss
-        filename = f"best_loss_{stage_name}.pth"
+        filename = f"{'candidate' if autonomous_pending else 'best'}_loss_{stage_name}.pth"
         model_path = _save_state_dict(model, ckpt_dir, filename, loss=loss)
         checkpoint_updates.append(filename.replace(".pth", ""))
         writer.write(

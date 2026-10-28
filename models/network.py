@@ -314,11 +314,23 @@ class Network(nn.Module):
                 bins=str(self.args.heuristic_guidance_online_amount_bins),
                 prior_trust=float(getattr(self.args, '_geometry_octree_prior_trust', 1.)),
                 compression_baseline=getattr(self, '_geometry_policy_compression_baseline', OrderedDict()))
+        from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        if autonomous_search_enabled(self.args):
+            result['autonomous_action_space'] = dict(schema='joint_amount_where_v2',
+                bins=tuple(self.actuator._algorithmic_amount_bin_values_from_args(self.args)),
+                max_operation_ratio=float(self.args.test_route_max_operation_ratio))
         return result
 
     def load_actor_critic_runtime_state_dict(self, state):
         if not isinstance(state, dict):
             return False
+        from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        space = state.get('autonomous_action_space')
+        if autonomous_search_enabled(self.args) and space is not None:
+            if (space.get('schema') != 'joint_amount_where_v2'
+                    or tuple(space.get('bins', ())) != tuple(self.actuator._algorithmic_amount_bin_values_from_args(self.args))
+                    or space.get('max_operation_ratio') != float(self.args.test_route_max_operation_ratio)):
+                raise ValueError('autonomous Amount候補または操作上限が保存runtimeと異なります。同じargsで再開してください。')
         if is_geometry_octree(self.args) and getattr(self.args, 'geometry_octree_joint_policy', True):
             joint = state.get('geometry_joint', {})
             if joint.get('schema') != 'geometry_joint_v3':
@@ -399,6 +411,9 @@ class Network(nn.Module):
         if point_cache is not None:
             point_cache.clear()
         self._point_transformer_feature_cache_bytes = 0
+        compressed = getattr(self, '_autonomous_frozen_feature_ram', None)
+        if compressed is not None:
+            compressed.clear()
 
     def release_step_transient_state(self):
         """Release tensors that are only needed until the current optimizer step.
@@ -705,9 +720,40 @@ class Network(nn.Module):
         })
         self._point_transformer_feature_disk_writes += 1
 
+    def _autonomous_frozen_ram(self):
+        from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        if not autonomous_search_enabled(self.args) or not bool(getattr(self.args, 'encoder_0grad', True)):
+            return None
+        limits = (max(int(getattr(self.args, 'test_route_frozen_cache_memory_mb', 128)), 0)*1024**2,
+                  max(int(getattr(self.args, 'test_route_frozen_cache_max_entries', 128)), 0))
+        if not all(limits):
+            return None
+        versions = tuple((name, tensor.data_ptr(), tensor._version)
+                         for name, tensor in self.encoder.state_dict().items())
+        cache = getattr(self, '_autonomous_frozen_feature_ram', None)
+        if cache is None or limits != getattr(self, '_autonomous_frozen_ram_limits', None):
+            from .utils.cache.lossless_tensor_ram import LosslessTensorRAM
+            cache = LosslessTensorRAM(*limits)
+            self._autonomous_frozen_feature_ram = cache
+            self._autonomous_frozen_ram_limits = limits
+        if versions != getattr(self, '_autonomous_frozen_encoder_versions', None):
+            cache.clear()
+            self._point_transformer_encoder_state_sha256 = None
+            self._autonomous_frozen_encoder_versions = versions
+        return cache
+
     def _get_point_transformer_feature_cache(self, key, device):
         if not key or not bool(getattr(self.args, "point_transformer_feature_cache", True)):
             return None
+        compressed = self._autonomous_frozen_ram()
+        ram_key = (key, self._point_transformer_encoder_fingerprint()) if compressed is not None else None
+        if compressed is not None:
+            entry = compressed.get(ram_key)
+            if entry is not None:
+                self._point_transformer_feature_cache_hits += 1
+                return {'coarse_fused': entry['coarse_fused'].to(device=device),
+                        'full_to_coarse_idx': entry['full_to_coarse_idx'].to(device=device, dtype=torch.long),
+                        'coarse_count': int(entry['coarse_count'])}
         entry = self.point_transformer_feature_cache.get(key)
         if isinstance(entry, dict):
             self.point_transformer_feature_cache.move_to_end(key)
@@ -717,6 +763,9 @@ class Network(nn.Module):
             if not isinstance(entry, dict):
                 self._point_transformer_feature_cache_misses += 1
                 return None
+        if compressed is not None:
+            compressed.put(ram_key, {name: entry[name] for name in (
+                'coarse_fused', 'full_to_coarse_idx', 'coarse_count')})
         return {
             "coarse_fused": entry["coarse_fused"].to(device=device),
             "full_to_coarse_idx": entry["full_to_coarse_idx"].to(
@@ -754,6 +803,12 @@ class Network(nn.Module):
         self._write_point_transformer_feature_disk_cache(
             key, cached_feature, cached_index
         )
+        compressed = self._autonomous_frozen_ram()
+        if compressed is not None:
+            compressed.put((key, self._point_transformer_encoder_fingerprint()), dict(
+                coarse_fused=cached_feature, full_to_coarse_idx=cached_index,
+                coarse_count=int(coarse_fused.shape[-1])))
+            return
         max_entries = max(int(getattr(
             self.args, "point_transformer_feature_cache_max_entries", 16
         )), 0)
@@ -976,6 +1031,12 @@ class Network(nn.Module):
         entropy = state.get("den6_online_policy_entropy", None)
         if not torch.is_tensor(log_prob) or not log_prob.requires_grad:
             return reward.new_zeros(())
+        from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        if autonomous_search_enabled(self.args):
+            from .utils.training.autonomous_joint_learning import joint_actual_policy_loss
+            current_compression_value = float(reward.detach().float().mean().cpu())
+            current_geometry_value = float(geometry.detach().float().mean().cpu()) if torch.is_tensor(geometry) else 0.
+            return joint_actual_policy_loss(self, reward, geometry)
         objective = torch.nan_to_num(reward.float().mean(), nan=0.0, posinf=1e3, neginf=-1e3)
         selection_mode = str(getattr(
             self.args,
@@ -5228,6 +5289,8 @@ class Network(nn.Module):
             raise RuntimeError(
                 "network_only_codec_policy received forbidden den/teacher/oracle payload"
             )
+        if bool(getattr(self.args, 'test_route', False)):
+            setattr(self.args, '_autonomous_policy_training', bool(self.training))
         if bool(getattr(self.args, "heuristic_guidance_enabled", True)):
             if guidance_mode == "ana_den6_online":
                 if not isinstance(full_octree_context, dict):
@@ -5425,6 +5488,11 @@ class Network(nn.Module):
                 if is_geometry_octree(self.args):
                     full_octree_context = align_geometry_context(full_octree_context, node_voxel_input_state["voxel_coords"])
                     canonical_subtree_tree = align_geometry_context(canonical_subtree_tree, node_voxel_input_state["voxel_coords"])
+                else:
+                    from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled, align_autonomous_context
+                    if autonomous_search_enabled(self.args):
+                        full_octree_context = align_autonomous_context(full_octree_context, node_voxel_input_state['voxel_coords'])
+                        canonical_subtree_tree = align_autonomous_context(canonical_subtree_tree, node_voxel_input_state['voxel_coords'])
 
                 # ここで selection_mask を full cloud 用maskのまま使ってはいけない。
                 # pts_xyz はすでに subtree subset のnode_xyzになっているため、
