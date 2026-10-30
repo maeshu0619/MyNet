@@ -179,6 +179,9 @@ def _parse_args() -> argparse.Namespace:
         help="SparsePCGC内部でdecode/PSNRを計算する。学習時のbit教師では既定False",
     )
     parser.add_argument("--decode", action="store_true")
+    parser.add_argument('--exact-morton-stats', action='store_true')
+    parser.add_argument('--exact-unique-loader', action='store_true')
+    parser.add_argument('--exact-logical-rate', action='store_true')
     parser.add_argument(
         "--gpu-stats",
         action="store_true",
@@ -213,6 +216,15 @@ def _build_encoder(args: argparse.Namespace):
     _debug("importing encoder_multiple.SparsePCGCEncoder")
     import encoder_multiple
 
+    if (bool(getattr(args, 'exact_morton_stats', False))
+            and str(args.mode).lower() == 'dense_lossy' and not bool(args.decode)):
+        try:
+            from .autonomous_native_stats import install_pointcloud_stats
+        except ImportError:
+            from autonomous_native_stats import install_pointcloud_stats
+        installed = install_pointcloud_stats(encoder_multiple)
+        _debug('exact Morton pointcloud statistics: {}'.format(installed))
+
     if str(args.mode).strip().lower() == "dense_lossy":
         # ana_den6はLossyCoderDense.testが返すdecoder-complete logical bitsを
         # rateとして使う。一方encoder_multipleは表示用にfile_sizeを物理bin
@@ -237,6 +249,16 @@ def _build_encoder(args: argparse.Namespace):
                 normalize_args,
                 input_stats=input_stats,
             )
+            if bool(getattr(args, 'exact_logical_rate', False)):
+                try:
+                    from .autonomous_native_rate import exact_dense_logical_rate
+                except ImportError:
+                    from autonomous_native_rate import exact_dense_logical_rate
+                normalized.update(exact_dense_logical_rate(
+                    result, normalized, args.scale_sr, args.scale_ae))
+                normalized['bpp'] = normalized['file_size'] / max(int(normalized.get('point_count', 0)), 1)
+                normalized['rate_definition'] = 'native_main_plus_count_and_ae_once_v3'
+                return normalized
             main_bits = float(normalized.get("file_size", 0.0))
             # LossyCoderDense.test adds four decoder-side bits per downscale
             # stage.  Some encoder_multiple revisions expose only the packed
@@ -303,6 +325,14 @@ def _build_encoder(args: argparse.Namespace):
     )
     _debug(f"initializing SparsePCGCEncoder mode={encoder_args.mode} device={encoder_args.device}")
     encoder = SparsePCGCEncoder(encoder_args)
+    if (bool(getattr(args, 'exact_unique_loader', False))
+            and str(args.mode).lower() == 'dense_lossy' and not bool(args.decode)):
+        try:
+            from .autonomous_native_loader import install_exact_loader
+        except ImportError:
+            from autonomous_native_loader import install_exact_loader
+        installed = install_exact_loader(encoder)
+        _debug('exact lexicographic input unique: {}'.format(installed))
     encoder._persistent_cuda_allocator_cache = bool(
         _configure_persistent_cuda_allocator_cache(
             encoder, int(getattr(args, "cuda_cleanup_interval", 1))
@@ -364,6 +394,20 @@ def main() -> int:
             if bool(args.gpu_stats):
                 gpu_before = _collect_cuda_stats("sparsepcgc_worker_before")
 
+            context_output = request.get('native_context_output', '')
+            if context_output:
+                if not bool(getattr(args, 'exact_logical_rate', False)) or int(args.scale_ae) != 0:
+                    raise ValueError('Native context recording requires the autonomous dense AE=0 route')
+                recorder = getattr(encoder, '_autonomous_context_recorder', None)
+                if recorder is None:
+                    try:
+                        from .autonomous_codec_context import NativeOccupancyRecorder
+                    except ImportError:
+                        from autonomous_codec_context import NativeOccupancyRecorder
+                    recorder = NativeOccupancyRecorder(encoder)
+                    encoder._autonomous_context_recorder = recorder
+                recorder.begin(context_output, request['native_context_metadata'])
+
             with contextlib.redirect_stdout(sys.stderr):
                 result = encoder.encode_one(
                     input_file,
@@ -375,6 +419,8 @@ def main() -> int:
                     exact_teacher_uses_full_context=bool(request.get("exact_teacher_uses_full_context", False)),
                     exact_teacher_fallback_reason=str(request.get("exact_teacher_fallback_reason", "")),
                 )
+            if context_output:
+                result['native_context_file'] = recorder.finish()
 
             # 現行encoder_multipleはencode_one内部の_run_tracked終了時に
             # CUDA workspaceを既に解放し、その事実をcuda_after_cleanupで返す。
@@ -485,6 +531,9 @@ def main() -> int:
             if bool(request.get("exit_after_response", False)):
                 return 0
         except Exception as exc:
+            recorder = getattr(encoder, '_autonomous_context_recorder', None)
+            if recorder is not None:
+                recorder.cancel()
             cuda_oom = _is_cuda_oom(exc)
             if cuda_oom:
                 _recover_cuda_after_oom()

@@ -31,6 +31,13 @@ def configure_autonomous_search(args):
         return args
     if not autonomous_search_enabled(args):
         raise ValueError('test_route requires SparsePCGC ana_den6_online')
+    for name in ('test_route_amount_uniform_fraction', 'test_route_noop_recovery_probability'):
+        value = float(getattr(args, name, 0.))
+        if not math.isfinite(value) or not 0. <= value <= 1.:
+            raise ValueError(name+' must be finite in [0, 1]')
+    noise = float(getattr(args, 'test_route_structured_where_noise', 0.))
+    if not math.isfinite(noise) or noise < 0.:
+        raise ValueError('test_route_structured_where_noise must be finite and nonnegative')
     maximum = float(getattr(args, 'test_route_max_operation_ratio', .03))
     autonomous_amount_bins(maximum)  # validate the per-operation safety bound
     raw_bins = str(getattr(args, 'test_route_amount_bins', '')).strip()
@@ -95,7 +102,12 @@ def autonomous_pool_phase(args):
             # Reservoir rotation is exploration too. Do not keep changing
             # the action space after all explicit sampling noise has ended.
             step = min(step, max(int(math.ceil(total * fraction)) - 1, 0))
-    return step // (2 * episode_steps)
+    # Codec-visible alternatives cover the full GT coded context already.
+    # Keep the auxiliary spatial reservoir long enough to learn/replay real
+    # same-frame outcomes instead of invalidating it after only two visits.
+    from ..loss.autonomous_codec_context import codec_context_enabled
+    passes = max(int(getattr(args,'test_route_context_reservoir_passes',8)),2) if codec_context_enabled(args) else 2
+    return step // (passes * episode_steps)
 
 
 def align_autonomous_context(context, node_coords):

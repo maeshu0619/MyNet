@@ -26,6 +26,9 @@ def build_autonomous_pool(
 ) -> dict[str, Any]:
     from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled, autonomous_pool_phase
     capacity = max(int(getattr(args, 'test_route_pool_cache_memory_mb', 128)), 0)*1024**2
+    from ..loss.autonomous_codec_context import codec_context_enabled
+    if codec_context_enabled(args):
+        capacity = max(int(getattr(args, 'test_route_context_pool_cache_memory_mb', 384)), 0)*1024**2
     if (not autonomous_search_enabled(args) or not capacity
             or not bool(getattr(args, '_autonomous_policy_training', True))):
         return _build_autonomous_pool(context, args, identity)
@@ -45,6 +48,8 @@ def build_autonomous_pool(
         reserve=float(getattr(args, 'heuristic_guidance_online_fast_pool_reserve_factor', 2.)),
         cap=int(getattr(args, 'heuristic_guidance_online_fast_pool_max_per_operation', 8192)),
         resolution=int(getattr(args, 'sparsepcgc_native_resolution', 1023)))
+    if codec_context_enabled(args):
+        settings['native_context'] = str(getattr(args, '_autonomous_native_context_path', '')).rsplit('/',1)[-1]
     digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
     # Content AND order: source sampling depends on row indices. Do not trust
     # just a file path, timestamp, tensor pointer, or input voxel count.
@@ -238,6 +243,17 @@ def _build_autonomous_pool(
                 ),
             })
         pools[operation] = pool
+    from ..loss.autonomous_codec_context import codec_context_enabled
+    native_context_path = ''
+    context_diagnostics = {}
+    if codec_context_enabled(args):
+        native_context_path = str(getattr(args, '_autonomous_native_context_path', ''))
+        if not native_context_path:
+            raise RuntimeError('Prepare the current GT native codec context before autonomous Network.forward')
+        from .autonomous_context_proposals import context_proposals
+        pools, context_diagnostics = context_proposals(rows.detach().cpu().numpy(), native_context_path,
+            max(budgets.values()), int(str(identity['input_sha256'])[:16],16)&0x7fffffff,
+            random_pools=pools)
     if any(not pools[name] for name in ("Add", "Prune", "Adjust")):
         raise RuntimeError("fast unordered proposal produced an empty operation pool")
     serialization_finished = time.perf_counter()
@@ -247,6 +263,7 @@ def _build_autonomous_pool(
         FAST_UNORDERED_SOURCE, str(identity["input_sha256"]),
         str(identity["setting_id"]), str(reserve), str(configured_cap),
         *(('autonomous', str(seed), str(budgets)) if autonomous else ()),
+        *((native_context_path.rsplit('/',1)[-1],) if native_context_path else ()),
     )).encode("utf-8")).hexdigest()
     return {
         **dict(identity),
@@ -293,6 +310,8 @@ def _build_autonomous_pool(
         "contains_candidate_actual": False,
         "contains_heuristic_ranking": False,
         "autonomous_search": autonomous,
+        "native_codec_context": bool(native_context_path),
+        "native_context_diagnostics": context_diagnostics,
         "pool_phase": autonomous_pool_phase(args) if autonomous else 0,
     }
 

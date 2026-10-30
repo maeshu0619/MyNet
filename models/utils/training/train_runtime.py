@@ -6659,6 +6659,9 @@ def run_episode_full_cloud_validation(
                     input_pcd = prepare_full_cloud_input_pcd(pts, use_cuda)
                     input_xyz = input_pcd[:, :3, :]
                     input_attr = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None
+                    from models.utils.loss.autonomous_codec_context import codec_context_enabled, prepare_codec_context
+                    if codec_context_enabled(args):
+                        prepare_codec_context(args, loss, input_xyz, cache_key)
                     autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
                     with torch.no_grad(), autocast_ctx:
                         full_octree_context = _episode_input_common_cache_fetch(

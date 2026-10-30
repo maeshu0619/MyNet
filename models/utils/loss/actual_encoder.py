@@ -496,6 +496,20 @@ class _SparsePCGCActualEncoder:
             cmd.append("--test-d2")
         if not bool(getattr(self.args, "sparsepcgc_skip_decode", True)):
             cmd.append("--decode")
+        from .autonomous_native_rate import autonomous_rate_schema
+        if autonomous_rate_schema(self.args) is not None:
+            cmd.append('--exact-logical-rate')
+        from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        if (autonomous_search_enabled(self.args)
+                and bool(getattr(self.args, 'test_route_native_morton_stats', True))
+                and str(getattr(self.args, 'sparsepcgc_mode', '')).lower() == 'dense_lossy'
+                and bool(getattr(self.args, 'sparsepcgc_skip_decode', True))):
+            cmd.append('--exact-morton-stats')
+        if (autonomous_search_enabled(self.args)
+                and bool(getattr(self.args, 'test_route_native_exact_loader', True))
+                and str(getattr(self.args, 'sparsepcgc_mode', '')).lower() == 'dense_lossy'
+                and bool(getattr(self.args, 'sparsepcgc_skip_decode', True))):
+            cmd.append('--exact-unique-loader')
         return cmd, root
 
     def _direct_env_prefix(self, cmd):
@@ -1043,6 +1057,10 @@ class _SparsePCGCActualEncoder:
             "dense_scale_sr_list": str(getattr(self.args, "sparsepcgc_dense_scale_sr_list", "")),
             "checkpoints": checkpoints,
         }
+        from .autonomous_native_rate import autonomous_rate_schema
+        schema = autonomous_rate_schema(self.args)
+        if schema is not None:
+            payload['rate_semantics'] = schema
         self._codec_fingerprint = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -1214,6 +1232,10 @@ class _SparsePCGCActualEncoder:
                     )
                 ),
             }
+            from .autonomous_codec_context import codec_context_enabled
+            if codec_context_enabled(self.args) and getattr(self.args, '_native_codec_context_output', ''):
+                request['native_context_output'] = str(self.args._native_codec_context_output)
+                request['native_context_metadata'] = dict(self.args._native_codec_context_metadata)
             response, worker_roundtrip_time, gpu_admission = (
                 self._send_worker_request_with_oom_retry(request, output_dir)
             )

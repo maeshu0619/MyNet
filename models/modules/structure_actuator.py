@@ -327,6 +327,13 @@ class StructureRepairActuator(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(actor_hidden, 1),
         )
+        from ..utils.loss.autonomous_codec_context import codec_context_enabled
+        if codec_context_enabled(self.args):
+            # A shared, learned native-bit preference; zero is neutral.  It
+            # belongs to the Actor optimizer/clip/checkpoint role.  Its sampled
+            # direction is credited once for the COMPLETE measured plan.
+            self.den6_candidate_actor.register_parameter(
+                'native_context_preference', nn.Parameter(torch.zeros(())))
         self.den6_candidate_critic = nn.Sequential(
             nn.Linear(7, actor_hidden),
             nn.SiLU(inplace=True),
@@ -4387,6 +4394,8 @@ class StructureRepairActuator(nn.Module):
         base_feature = self._den6_standardize_candidate_feature(
             base_network_score
         )
+        from ..utils.loss.autonomous_codec_context import codec_context_enabled
+        native_context_actor = codec_context_enabled(self.args)
         operation_one_hot = base_network_score.new_zeros((count, 3))
         operation_one_hot[:, int(operation_index)] = 1.0
         critic_features = torch.cat((
@@ -4404,7 +4413,7 @@ class StructureRepairActuator(nn.Module):
             rank_feature.reshape(-1, 1),
             rate_feature.reshape(-1, 1) * float(getattr(
                 self.args, "heuristic_guidance_online_actor_rate_proxy_scale", 0.0
-            )),
+            ) if not native_context_actor else 0.),
             geometry_feature.reshape(-1, 1) * float(getattr(
                 self.args, "heuristic_guidance_online_actor_geometry_proxy_scale", 0.25
             )),
@@ -5416,7 +5425,24 @@ class StructureRepairActuator(nn.Module):
                 # from decreasing together when every edited plan is costly.
                 gate_logits_den6 / float(gate_logit_scale), bin_tensor, maximum_per_operation,
                 float(scheduled_exploration_multiplier), self.training,
-                float(getattr(self.args, 'sparsepcgc_amount_exploration_log_sigma', .30)))
+                float(getattr(self.args, 'sparsepcgc_amount_exploration_log_sigma', .30)),
+                uniform_fraction=float(getattr(self.args, 'test_route_amount_uniform_fraction', .0))
+                *float(scheduled_exploration_multiplier))
+            autonomous_noop_recovery = False
+            if (self.training and scheduled_exploration_multiplier <= 0.
+                    and all(float(v.detach().cpu()) == 0. for v in joint_amount['ratios'].values())
+                    and float(getattr(self.args, 'test_route_noop_recovery_probability', 0.)) > 0.
+                    and float(torch.rand((), device=bin_tensor.device)) < float(
+                        self.args.test_route_noop_recovery_probability)):
+                # A collapsed greedy no-op is not evidence of a learned
+                # optimum. Occasionally run one ordinary simultaneous probe;
+                # no edit/amount is forced and eval remains deterministic.
+                autonomous_noop_recovery = True
+                scheduled_exploration_multiplier = exploration_multiplier = 1.
+                joint_amount = sample_joint_amounts(network_amount_logits, operation_fine_policy_means,
+                    gate_logits_den6/float(gate_logit_scale), bin_tensor, maximum_per_operation,
+                    1., True, float(getattr(self.args,'sparsepcgc_amount_exploration_log_sigma',.30)),
+                    uniform_fraction=max(float(getattr(self.args,'test_route_amount_uniform_fraction',.25)),.25))
             sampled_ratio_tensors = joint_amount['ratios']
             hard_total = sum(sampled_ratio_tensors.values()).detach()
             no_op_selected = all(float(v.detach().cpu()) == 0. for v in sampled_ratio_tensors.values())
@@ -5716,6 +5742,22 @@ class StructureRepairActuator(nn.Module):
         candidate_proposal_logits = {}
         candidate_proposal_masks = {}
         candidate_actor_features = {}
+        joint_replay_logits = {}
+        joint_structured_coefficients = {}
+        native_preference = getattr(self.den6_candidate_actor, 'native_context_preference', None)
+        clean_amount_trial = False
+        native_sample = native_preference
+        native_sample_lp = None
+        if autonomous and native_preference is not None and self.training and scheduled_exploration_multiplier > 0.:
+            # Amount is evaluated against the current clean Where half the
+            # time. Bad randomized locations must not teach Amount=no-op.
+            clean_amount_trial = bool(torch.rand((), device=native_preference.device) < .5)
+            if not clean_amount_trial:
+                sigma = max(float(getattr(self.args, 'test_route_structured_where_noise', 4.))
+                            *float(scheduled_exploration_multiplier), .02)
+                distribution = torch.distributions.Normal(native_preference, sigma)
+                native_sample = distribution.sample()
+                native_sample_lp = distribution.log_prob(native_sample)
         candidate_critic_features = {}
         exploration_added_indices = {name: [] for name in operations}
         exploration_heuristic_rank_bands = {
@@ -5810,6 +5852,27 @@ class StructureRepairActuator(nn.Module):
                     if autonomous:
                         proposal_centered = proposal_logit - proposal_logit.mean()
                         logits = logits + 2. * torch.nn.functional.softsign(proposal_centered / 2.)
+                        if native_preference is not None:
+                            native_bits = mapping['local_rate_benefit'].detach().to(logits)
+                            # No fixed sign or heuristic ranking: the shared
+                            # coefficient starts at zero and learns from Actual.
+                            logits = logits + native_preference * native_bits
+                        joint_replay_logits[operation] = logits
+                        from ..utils.loss.autonomous_codec_context import codec_context_enabled
+                        if native_sample_lp is not None:
+                            logits = logits + (native_sample.detach()-native_preference)*native_bits
+                            joint_structured_coefficients[operation] = float(native_sample.detach().cpu())
+                        elif native_preference is None and codec_context_enabled(self.args) and self.training and scheduled_exploration_multiplier > 0.:
+                            # Zero-mean shared feature perturbations explore
+                            # coherent configurations; they are conditioned-on
+                            # random inputs, never fixed native-score fusion.
+                            fields = torch.stack((
+                                self._den6_standardize_candidate_feature(mapping['local_rate_benefit']),
+                                self._den6_standardize_candidate_feature(mapping['local_geometry_risk'])),dim=1).clamp(-6.,6.)
+                            coefficients = torch.randn(2,device=logits.device,dtype=logits.dtype)*float(
+                                getattr(self.args,'test_route_structured_where_noise',0.))*float(scheduled_exploration_multiplier)
+                            logits = logits+(fields*coefficients).sum(1)
+                            joint_structured_coefficients[operation] = coefficients.detach().cpu().tolist()
                         network_term = logits
                 else:
                     actual_authority = self._den6_actual_residual_authority(
@@ -6719,7 +6782,7 @@ class StructureRepairActuator(nn.Module):
             if autonomous:
                 from ..utils.training.autonomous_joint_learning import sample_where_order
                 order_tensor = sample_where_order(policy_logits,
-                    float(scheduled_exploration_multiplier), self.training)
+                    0. if clean_amount_trial else float(scheduled_exploration_multiplier), self.training)
                 ordered_indices[operation] = order_tensor.cpu().tolist()
                 gumbel_scales.append(float(scheduled_exploration_multiplier))
 
@@ -8164,16 +8227,37 @@ class StructureRepairActuator(nn.Module):
                 joint_where_terms[name] = where_prefix_log_prob(
                     combined_logits[name], torch.as_tensor(ordered_indices[name],
                         device=combined_logits[name].device, dtype=torch.long),
-                    joint_attempted_counts[name], float(scheduled_exploration_multiplier), self.training)
+                    joint_attempted_counts[name], 0. if clean_amount_trial else float(scheduled_exploration_multiplier), self.training)
             joint_amount_lp = torch.stack(tuple(joint_amount['log_probs'].values())).sum()
             joint_where_lp = torch.stack(tuple(joint_where_terms.values())).sum()
-            debug['_joint_policy_log_prob'] = joint_amount_lp + joint_where_lp
+            if native_sample_lp is not None and sum(selected_counts.values()) > 0:
+                joint_where_lp = joint_where_lp + native_sample_lp
+            split_credit = native_preference is not None and self.training and scheduled_exploration_multiplier > 0.
+            debug['_joint_policy_log_prob'] = (
+                joint_amount_lp if split_credit and clean_amount_trial else
+                joint_where_lp if split_credit else joint_amount_lp + joint_where_lp)
+            debug['joint_credit_family'] = ('amount_clean_where' if clean_amount_trial else
+                'where_sampled' if split_credit else 'joint')
+            debug['_joint_amount_logits'] = joint_amount['logits']
+            debug['_joint_amount_means'] = joint_amount['means']
+            debug['_joint_replay_logits'] = {op:joint_replay_logits.get(op,combined_logits[op]).masked_fill(
+                ~torch.isfinite(combined_logits[op]),float('-inf')) for op in operations}
+            debug['_joint_candidate_ids'] = {op:tuple(str(c['candidate_id']) for c in pools[op]) for op in operations}
+            debug['_joint_action'] = dict(
+                amount_indices={op:int(v.detach().cpu()) for op,v in joint_amount['indices'].items()},
+                fine_samples={op:float(v.detach().cpu()) for op,v in joint_amount['samples'].items()},
+                where_prefix_ids={op:[str(pools[op][i]['candidate_id'])
+                    for i in ordered_indices[op][:joint_attempted_counts[op]]] for op in operations})
+            debug['autonomous_noop_recovery'] = autonomous_noop_recovery
+            debug['joint_amount_uniform_fraction'] = joint_amount['epsilon']
+            debug['structured_where_coefficients'] = joint_structured_coefficients
             debug['_joint_entropy'] = joint_amount['entropy'] + policy_entropy
             debug['autonomous_joint_policy'] = True
             debug['autonomous_input_sha256'] = str(exact.get('input_sha256', exact.get('input_voxel_hash', '')))
-            debug['autonomous_codec_setting'] = json.dumps({key: exact.get(key) for key in (
+            debug['autonomous_codec_setting'] = json.dumps(dict({key: exact.get(key) for key in (
                 'setting_id', 'codec_mode', 'checkpoint_identifier', 'voxel_size', 'pos_quantscale',
-                'scale_ae', 'scale_sr', 'scale_m')}, sort_keys=True)
+                'scale_ae', 'scale_sr', 'scale_m')},
+                    native_context_file=str(getattr(self.args,'_autonomous_native_context_path','')).rsplit('/',1)[-1]), sort_keys=True)
             debug['joint_amount_bins_by_operation'] = {
                 name: float(bin_tensor[index].detach().cpu())
                 for name, index in joint_amount['indices'].items()}

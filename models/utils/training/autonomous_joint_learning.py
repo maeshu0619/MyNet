@@ -14,7 +14,7 @@ OPERATIONS = ('Add', 'Prune', 'Adjust')
 
 
 def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
-                         training, fine_sigma=.30):
+                         training, fine_sigma=.30, uniform_fraction=0.):
     """Three independent categorical+lognormal actions; no fixed total/share.
 
     The sampled latent action's exact likelihood is used even when a ratio
@@ -28,6 +28,8 @@ def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
     basis = bins / float(maximum)
     ratios, log_probs, indices, logits_by_op = {}, {}, {}, {}
     entropies = []
+    samples = {}
+    epsilon = min(max(float(uniform_fraction), 0.), 1.) if stochastic else 0.
     for i, name in enumerate(OPERATIONS):
         logits = selector + means[name] * basis
         edit_mask = (bins > 0.).to(logits)
@@ -36,22 +38,36 @@ def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
         if stochastic:
             uniform = torch.rand_like(logits).clamp_(1e-7, 1. - 1e-7)
             index = torch.argmax(logits - temperature * torch.log(-torch.log(uniform)))
-            sample = (means[name] + sigma * torch.randn_like(means[name])
+            broad = epsilon > 0. and bool(torch.rand((), device=logits.device) < epsilon)
+            if broad:
+                index = torch.randint(len(bins), (), device=logits.device)
+            sample_mean = means[name] * 0. if broad and sigma > 0. else means[name]
+            sample = (sample_mean + sigma * torch.randn_like(means[name])
                       if sigma > 0. else means[name])
             # Evaluate the detached sampled action, not a reparameterized
             # sample whose mean derivative would cancel the score function.
             fine_lp = (torch.distributions.Normal(means[name], sigma).log_prob(sample.detach())
                        if sigma > 0. else means[name] * 0.)
             lp = log_probs_all[index] + torch.where(bins[index] > 0., fine_lp, fine_lp * 0.)
+            if epsilon > 0.:
+                broad_fine_lp = (torch.distributions.Normal(means[name]*0., sigma).log_prob(sample.detach())
+                                 if sigma > 0. else fine_lp*0.)
+                broad_lp = logits.sum()*0.-math.log(len(bins)) + torch.where(
+                    bins[index] > 0., broad_fine_lp, broad_fine_lp*0.)
+                lp = (broad_lp if epsilon == 1. else torch.logaddexp(
+                    lp + math.log1p(-epsilon), broad_lp + math.log(epsilon)))
         else:
             index = torch.argmax(logits)
             sample = means[name]
             lp = logits.sum() * 0.
         ratios[name] = (bins[index] * sample.exp()).clamp(max=float(maximum))
+        samples[name] = sample
         log_probs[name], indices[name], logits_by_op[name] = lp, index, logits
-        entropies.append(-(log_probs_all.exp() * log_probs_all).sum())
+        probabilities = (1.-epsilon)*log_probs_all.exp()+epsilon/len(bins)
+        entropies.append(-(probabilities * probabilities.clamp_min(1e-20).log()).sum())
     return dict(ratios=ratios, log_probs=log_probs, indices=indices,
                 logits=logits_by_op, entropy=torch.stack(entropies).sum(),
+                samples=samples, means=means, epsilon=epsilon,
                 temperature=temperature if stochastic else 0., stochastic=stochastic)
 
 
@@ -145,14 +161,24 @@ def joint_actual_policy_loss(model, compression, geometry):
     critic_feature = feature.detach() + mask * (feature - feature.detach())
     prediction = model.actuator.den6_plan_critic(critic_feature.unsqueeze(0))[0, 0]
     rd = wc * c + wg * penalty
+    from .autonomous_actual_replay import measured_plan_replay, bound_replay_memory
+    replay, replacement, replay_debug = measured_plan_replay(debug, previous, c, g, args)
+    if previous is not None and previous.get('best_action'):
+        memory[key]['best_action'] = previous['best_action']
+    if replacement is not None:
+        memory[key]['best_action'] = replacement
+    replay_bytes = bound_replay_memory(memory, max(int(getattr(
+        args, 'test_route_actual_plan_replay_memory_mb', 32)), 0)*1024**2)
+    replay = replay/scale*policy_weight
     critic = F.smooth_l1_loss(prediction, rd, beta=1.) / scale * float(getattr(
         args, 'heuristic_guidance_online_plan_critic_weight', .10))
     phase = float(debug['exploration_multiplier'])
     entropy = -float(getattr(args, 'heuristic_guidance_online_entropy_weight', .001)) * phase * debug['_joint_entropy'] / scale
-    loss = compression_policy + geometry_policy + efficiency + critic + entropy
+    loss = compression_policy + geometry_policy + efficiency + critic + entropy + replay
     model._den6_policy_source_losses = dict(
         actual_compression_policy=compression_policy + critic,
-        geometry=geometry_policy, proxy=zero, efficiency=efficiency, entropy=entropy)
+        geometry=geometry_policy, proxy=zero, efficiency=efficiency, entropy=entropy,
+        actual_joint_replay=replay)
     model.last_discrete_policy_debug = dict(
         joint_policy=True, actual_group_pair_available=False,
         joint_frame_baseline_available=previous is not None,
@@ -161,7 +187,9 @@ def joint_actual_policy_loss(model, compression, geometry):
         current_geometry_value=float(g), actor_rd_target=float(rd),
         efficiency_guard_passed=guarded, efficiency_operation_ratio=ratio,
         baseline=float(wc * bc + wg * bg), advantage=float(wc * (bc - c) + wg * (bg - penalty)),
-        policy_loss=float(loss.detach()), actual_teacher_scope='complete_joint_plan_cost')
+        policy_loss=float(loss.detach()), actual_teacher_scope='complete_joint_plan_cost',
+        actual_plan_replay=replay_debug, actual_plan_replay_bytes=replay_bytes,
+        actual_plan_replay_loss=float(replay.detach()))
     return loss.to(compression.dtype)
 
 

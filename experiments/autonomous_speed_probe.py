@@ -26,6 +26,12 @@ def main():
                         help='Optional cProfile of a single full forward/backward update')
     parser.add_argument('--read-only-tensor-cache', action='store_true',
                         help='Read existing seed tensors on misses, write only private cache')
+    parser.add_argument('--native-stream-audit', action='store_true',
+                        help='Record real stream SHA256 and native scalar metrics for parity')
+    parser.add_argument('--native-morton-stats', choices=['true', 'false'])
+    parser.add_argument('--native-exact-loader', choices=['true', 'false'])
+    parser.add_argument('--native-worker-trim-interval', type=int,
+                        help='Private benchmark allocator lifetime; use same value in both runs')
     options = parser.parse_args()
     if options.test_route != 'true':
         parser.error('This synchronized timing wrapper supports True only; use autonomous_search_probe.py for legacy async False regression.')
@@ -106,8 +112,11 @@ def main():
         original_forward = model.forward
 
         def forward(*args, **kwargs):
+            if not model.training:
+                return original_forward(*args, **kwargs)
             state['step'] += 1
             state['times'].clear()
+            state['native_calls'] = []
             runtime.set_seed(options.seed * 1000003 + state['step'] - 1, deterministic=False)
             torch.cuda.reset_peak_memory_stats()
             if state['step'] == options.cpu_profile_step:
@@ -128,6 +137,40 @@ def main():
         obj.get_compression_loss = timed('compression_loss', obj.get_compression_loss, 'surrogate_backward')
         obj.get_geometry_loss = timed('geometry_loss', obj.get_geometry_loss)
         obj._encode_actual_batch = timed('actual_encode', obj._encode_actual_batch)
+        if options.native_stream_audit:
+            original_get = obj._get_actual_encoder
+            def get_encoder(settings):
+                encoder = original_get(settings)
+                if not getattr(encoder, '_speed_stream_audit', False):
+                    encoder._speed_stream_audit = True
+                    original_encode = encoder.encode_bits
+                    original_send = encoder._send_worker_request_with_oom_retry
+                    def send(*positional, **named):
+                        result = original_send(*positional, **named)
+                        state['latest_native_response'] = {k: v for k, v in result[0].get('result', {}).items()
+                            if k in ('point_count', 'node_count', 'single_child_count', 'stats_time',
+                                     'wall_time_seconds', 'enc_time', 'all_enc_time', 'file_size')}
+                        return result
+                    encoder._send_worker_request_with_oom_retry = send
+                    def encode(*positional, **named):
+                        import hashlib
+                        state['latest_native_response'] = {}
+                        result = original_encode(*positional, **named)
+                        streams = []
+                        workspace = getattr(encoder, '_workspace_dir', None)
+                        if workspace and not result.get('sparsepcgc_actual_result_cache_hit', False):
+                            folder = Path(workspace)/'encoded'
+                            for path in sorted(folder.rglob('*.bin')):
+                                content = path.read_bytes()
+                                streams.append(dict(file=str(path.relative_to(folder)), bits=8*len(content),
+                                                    sha256=hashlib.sha256(content).hexdigest()))
+                        state.setdefault('native_calls', []).append(dict(
+                            metrics={k: result.get(k) for k in ('bit', 'point_count', 'node', 'single', 'sparsepcgc_point_sha256')},
+                            worker=dict(state['latest_native_response']), streams=streams))
+                        return result
+                    encoder.encode_bits = encode
+                return encoder
+            obj._get_actual_encoder = get_encoder
         return obj
 
     training.Loss = loss
@@ -175,6 +218,8 @@ def main():
         pool_cache = getattr(proposals, '_POOL_RAM', None)
         if pool_cache is not None:
             row['pool_ram_cache'] = pool_cache.stats()
+        if options.native_stream_audit:
+            row['native_calls'] = state.get('native_calls', [])
         with (out/'steps.jsonl').open('a') as stream:
             stream.write(json.dumps(row, default=str)+'\n')
         torch.save(dict(gradients=gradients,
@@ -193,6 +238,11 @@ def main():
         '--log_root', str(out/'log'), '--out_path', str(out/'checkpoints'),
         '--surrogate_pretrained_root', str(out/'registry'), '--debug_timing', 'true',
         '--profile_interval', '1']
+    for value, flag in ((options.native_morton_stats, 'test_route_native_morton_stats'),
+                        (options.native_exact_loader, 'test_route_native_exact_loader'),
+                        (options.native_worker_trim_interval, 'sparsepcgc_worker_cpu_trim_interval')):
+        if value is not None:
+            sys.argv += ['--'+flag, str(value)]
     for flag, folder in (
         ('point_transformer_feature_disk_cache_dir', 'features'),
         ('sparsepcgc_actual_gt_disk_cache_dir', 'actual_gt'), ('exact_teacher_cache_root', 'exact'),

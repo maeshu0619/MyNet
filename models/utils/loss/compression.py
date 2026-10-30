@@ -710,9 +710,15 @@ class CompressionLossMixin:
             source_identity = f"{source_stat.st_size}:{source_stat.st_mtime_ns}"
         except OSError:
             source_identity = "missing"
+        from .autonomous_native_rate import autonomous_rate_schema
+        rate_schema = autonomous_rate_schema(args)
+        if rate_schema is not None:
+            rate_schema += '|' + self._get_actual_encoder(args)._codec_cache_fingerprint()
+        else:
+            rate_schema = "den6_decoder_complete_logical_bits_v2"
         return "|".join(
             [
-                "den6_decoder_complete_logical_bits_v2",
+                rate_schema,
                 str(cache_key),
                 source_identity,
                 str(getattr(args, "sparsepcgc_mode", "dense_lossy")),

@@ -319,6 +319,9 @@ class Network(nn.Module):
             result['autonomous_action_space'] = dict(schema='joint_amount_where_v2',
                 bins=tuple(self.actuator._algorithmic_amount_bin_values_from_args(self.args)),
                 max_operation_ratio=float(self.args.test_route_max_operation_ratio))
+            from .utils.loss.autonomous_codec_context import codec_context_enabled
+            if codec_context_enabled(self.args):
+                result['autonomous_action_space']['codec_context'] = 'native_cdf_context_shared_actor_v2'
         return result
 
     def load_actor_critic_runtime_state_dict(self, state):
@@ -327,6 +330,10 @@ class Network(nn.Module):
         from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
         space = state.get('autonomous_action_space')
         if autonomous_search_enabled(self.args) and space is not None:
+            from .utils.loss.autonomous_codec_context import codec_context_enabled
+            expected_context = 'native_cdf_context_shared_actor_v2' if codec_context_enabled(self.args) else None
+            if space.get('codec_context') != expected_context:
+                raise ValueError('Native contextの候補・Actor入力定義が保存runtimeと異なります。新規学習するか、旧モデルには--test_route_codec_context falseを指定してください。')
             if (space.get('schema') != 'joint_amount_where_v2'
                     or tuple(space.get('bins', ())) != tuple(self.actuator._algorithmic_amount_bin_values_from_args(self.args))
                     or space.get('max_operation_ratio') != float(self.args.test_route_max_operation_ratio)):

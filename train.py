@@ -923,6 +923,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                             ),
                         )
 
+                        from models.utils.loss.autonomous_codec_context import codec_context_enabled, prepare_codec_context
+                        if codec_context_enabled(args):
+                            prepare_codec_context(args, loss, input_xyz, cache_key)
                         with grad_ctx, autocast_ctx, model_saved_tensor_ctx: # 全体点群をno-gradでモデルに入力し、teacher更新用の出力だけ得る
                             """モデルの実行"""
                             # Step冒頭で作った full cloud canonical context をそのまま使う。
@@ -4999,7 +5002,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                             case_float(L_geom, 0.), getattr(args, '_geometry_noop_chamfer', None),
                             getattr(args, '_geometry_rd_voxel_scale', None),
                             case_float(geometry_penalty(L_geom.detach(), args), 0.)))
+                    from models.utils.training.autonomous_audit import compact_autonomous_audit
                     writer.write(
+                        compact_autonomous_audit(args, audit_plan, audit_compression, time.time()-st_step)
+                        if audit_plan.get('autonomous_joint_policy') and bool(getattr(args,'test_route_compact_audit',True)) else
                         "Den6OnlineAudit: "
                         f"cache={dict(cache_stats) if isinstance(cache_stats, dict) else {}}, "
                         f"proposal_timing={dict((getattr(args, '_ana_den6_online_last_timing', {}) or {}).get('proposal_timing', {}) or {})}, "
@@ -6472,6 +6478,8 @@ def main():
     parser = argparse.ArgumentParser(description='Training Arguments')
     parser.add_argument('--trainORtest', default="train", type=str, help='date')
     args = parse_pugan_args(parser, file_day, file_time)
+    from models.utils.training.autonomous_cpu import configure_autonomous_cpu
+    configure_autonomous_cpu(args)
     # Network/optimizer生成前にseedを固定する。従来のtrain()冒頭だけでは
     # 初期重みがrunごとに変わり、最適化前後の数値比較が成立しなかった。
     set_seed(args.seed, deterministic=getattr(args, "deterministic", False))
