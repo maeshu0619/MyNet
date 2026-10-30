@@ -102,11 +102,13 @@ def main():
             rollback_amount=('actuator.algorithmic_amount_selector_head.','actuator.add_amount_head.',
                 'actuator.drop_amount_head.','actuator.move_amount_head.','actuator.operation_gate_head.'))
         for mode in o.modes.split(','):
-            if mode not in ('full','initial','fixed_amount','initial_where_fixed_amount',*blocks):raise ValueError(mode)
+            if mode not in ('full','initial','fixed_amount','initial_where_fixed_amount','zero_native_preference',*blocks):raise ValueError(mode)
             weights=copy.deepcopy(initial if mode=='initial' else final)
             for name in weights:
                 prefixes=blocks['rollback_where'] if mode=='initial_where_fixed_amount' else blocks.get(mode,())
                 if name.startswith(prefixes):weights[name]=initial[name].clone()
+                if mode=='zero_native_preference' and name.endswith('.native_context_preference'):
+                    weights[name].zero_()
             model.load_state_dict(weights,strict=True)
             state['mode']=mode;args._global_train_step=o.step
             result=runtime.run_episode_full_cloud_validation(model=model,args=args,loss=loss,writer=writer,

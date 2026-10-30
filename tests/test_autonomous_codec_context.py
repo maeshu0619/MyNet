@@ -14,6 +14,38 @@ from models.utils.pointcloud.autonomous_context_proposals import canonical_voxel
 
 
 class AutonomousRecoveryTest(unittest.TestCase):
+    def test_native_preference_is_neutral_actor_parameter_and_actual_replay_can_learn_it(self):
+        from models.modules.structure_actuator import StructureRepairActuator
+        from models.utils.training.autonomous_actual_replay import measured_plan_replay
+        args=SimpleNamespace(test_route=True,compress='SparsePCGC',
+            heuristic_guidance_mode='ana_den6_online',test_route_codec_context=True,
+            sparsepcgc_mode='dense_lossy')
+        actuator=StructureRepairActuator(8,8,args)
+        preference=actuator.den6_candidate_actor.native_context_preference
+        self.assertEqual(float(preference),0.)
+        self.assertIn('native_context_preference',dict(actuator.den6_candidate_actor.named_parameters()))
+        mapping=dict(local_rate_benefit=torch.tensor([16.,-16.]),
+                     local_geometry_risk=torch.zeros(2))
+        scores=torch.tensor([-.2,.2],requires_grad=True)
+        first=actuator._den6_actor_critic_candidate_values(mapping,scores,0)
+        mapping['local_rate_benefit']=-mapping['local_rate_benefit']
+        second=actuator._den6_actor_critic_candidate_values(mapping,scores,0)
+        # The residual MLP has no random native-rate bias at initialization.
+        self.assertTrue(torch.equal(first[0],second[0]))
+        self.assertTrue(torch.equal(first[3],second[3]))
+        self.assertTrue(torch.equal(first[4][:,2],torch.zeros(2)))
+        debug,previous,replay_args=self.fixture()
+        debug['_joint_replay_logits']={op:values+preference*torch.tensor([2.,-2.])
+                                      for op,values in debug['_joint_replay_logits'].items()}
+        optimizer=torch.optim.Adam(actuator.den6_candidate_actor.parameters(),lr=1e-4)
+        loss,_,report=measured_plan_replay(debug,previous,0.,0.,replay_args)
+        self.assertTrue(report['used']);loss.backward()
+        self.assertLess(float(preference.grad),0.)
+        optimizer.step();self.assertGreater(float(preference),0.)
+        args.test_route=False
+        legacy=StructureRepairActuator(8,8,args)
+        self.assertFalse(hasattr(legacy.den6_candidate_actor,'native_context_preference'))
+
     def test_context_reservoir_survives_eight_passes_and_stops_rotating_after_exploration(self):
         from models.utils.training.sparsepcgc_autonomous_policy import autonomous_pool_phase
         args=SimpleNamespace(test_route=True,compress='SparsePCGC',heuristic_guidance_mode='ana_den6_online',

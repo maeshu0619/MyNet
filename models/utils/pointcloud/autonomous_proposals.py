@@ -28,7 +28,7 @@ def build_autonomous_pool(
     capacity = max(int(getattr(args, 'test_route_pool_cache_memory_mb', 128)), 0)*1024**2
     from ..loss.autonomous_codec_context import codec_context_enabled
     if codec_context_enabled(args):
-        capacity = max(int(getattr(args, 'test_route_context_pool_cache_memory_mb', 384)), 0)*1024**2
+        capacity = max(int(getattr(args, 'test_route_context_pool_cache_memory_mb', 768)), 0)*1024**2
     if (not autonomous_search_enabled(args) or not capacity
             or not bool(getattr(args, '_autonomous_policy_training', True))):
         return _build_autonomous_pool(context, args, identity)

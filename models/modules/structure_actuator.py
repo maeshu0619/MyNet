@@ -5744,7 +5744,8 @@ class StructureRepairActuator(nn.Module):
         candidate_actor_features = {}
         joint_replay_logits = {}
         joint_structured_coefficients = {}
-        native_preference = getattr(self.den6_candidate_actor, 'native_context_preference', None)
+        native_preference = (getattr(getattr(self, 'den6_candidate_actor', None),
+                                     'native_context_preference', None) if autonomous else None)
         clean_amount_trial = False
         native_sample = native_preference
         native_sample_lp = None
@@ -5754,7 +5755,7 @@ class StructureRepairActuator(nn.Module):
             clean_amount_trial = bool(torch.rand((), device=native_preference.device) < .5)
             if not clean_amount_trial:
                 sigma = max(float(getattr(self.args, 'test_route_structured_where_noise', 4.))
-                            *float(scheduled_exploration_multiplier), .02)
+                            *float(scheduled_exploration_multiplier), 1e-6)
                 distribution = torch.distributions.Normal(native_preference, sigma)
                 native_sample = distribution.sample()
                 native_sample_lp = distribution.log_prob(native_sample)
@@ -6784,7 +6785,7 @@ class StructureRepairActuator(nn.Module):
                 order_tensor = sample_where_order(policy_logits,
                     0. if clean_amount_trial else float(scheduled_exploration_multiplier), self.training)
                 ordered_indices[operation] = order_tensor.cpu().tolist()
-                gumbel_scales.append(float(scheduled_exploration_multiplier))
+                gumbel_scales.append(0. if clean_amount_trial else float(scheduled_exploration_multiplier))
 
         candidate_local_loss = (
             torch.stack(candidate_local_losses).mean()
@@ -8238,6 +8239,8 @@ class StructureRepairActuator(nn.Module):
                 joint_where_lp if split_credit else joint_amount_lp + joint_where_lp)
             debug['joint_credit_family'] = ('amount_clean_where' if clean_amount_trial else
                 'where_sampled' if split_credit else 'joint')
+            debug['native_context_preference'] = (float(native_preference.detach().cpu())
+                if native_preference is not None else None)
             debug['_joint_amount_logits'] = joint_amount['logits']
             debug['_joint_amount_means'] = joint_amount['means']
             debug['_joint_replay_logits'] = {op:joint_replay_logits.get(op,combined_logits[op]).masked_fill(

@@ -24,6 +24,7 @@ def main():
     parser.add_argument('--diagnostic-recovery-probability',type=float)
     parser.add_argument('--final-validation',type=int,default=0)
     parser.add_argument('--balanced-validation',action='store_true')
+    parser.add_argument('--diagnostic-gradients',action='store_true')
     options, remainder = parser.parse_known_args()
     out = Path(remainder[remainder.index('--out')+1])
     captures = {int(x) for x in options.capture_steps.split(',') if x}
@@ -40,9 +41,15 @@ def main():
             value.test_route_actual_plan_replay=False
         if options.diagnostic_recovery_probability is not None:
             value.test_route_noop_recovery_probability=options.diagnostic_recovery_probability
+        if options.diagnostic_gradients:
+            value.heuristic_guidance_online_source_grad_probe=True
+            value.heuristic_guidance_online_source_grad_probe_interval=1
         value.train_full_cloud_val_frames=options.final_validation
         return value
     training.parse_pugan_args=settings
+    if options.diagnostic_gradients:
+        from experiments.autonomous_gradient_observer import install_observers
+        install_observers(training,out)
     validation_arguments={}
     if options.final_validation:
         from models.utils.training import train_runtime as runtime
