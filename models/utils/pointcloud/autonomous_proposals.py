@@ -40,8 +40,10 @@ def build_autonomous_pool(
     phase = autonomous_pool_phase(args)
     global _POOL_RAM, _POOL_RAM_CONTEXT
     if _POOL_RAM is None or _POOL_RAM_CONTEXT != (capacity, phase):
-        from ..cache.lossless_tensor_ram import LosslessObjectRAM
-        _POOL_RAM = LosslessObjectRAM(capacity)
+        from ..cache.autonomous_pool_ram import AutonomousPoolRAM
+        if _POOL_RAM is not None:
+            _POOL_RAM.close()
+        _POOL_RAM = AutonomousPoolRAM(capacity)
         _POOL_RAM_CONTEXT = (capacity, phase)
     settings = dict(identity=identity, phase=phase,
         maximum=float(getattr(args, 'test_route_max_operation_ratio', .03)),
@@ -58,8 +60,10 @@ def build_autonomous_pool(
     payload = _POOL_RAM.get(key)
     hit = payload is not None
     if not hit:
-        payload = _build_autonomous_pool(context, args, identity, rows)
-        _POOL_RAM.put(key, payload)
+        from ..cache.autonomous_pool_ram import batch_pool_collection
+        with batch_pool_collection():
+            payload = _build_autonomous_pool(context, args, identity, rows)
+            _POOL_RAM.put(key, payload)
     elapsed = time.perf_counter()-started
     payload['autonomous_pool_cache_hit'] = hit
     payload['autonomous_pool_cache_stats'] = _POOL_RAM.stats()
@@ -71,6 +75,13 @@ def build_autonomous_pool(
     else:
         payload['proposal_timing']['total'] = elapsed
     return payload
+
+
+def prefetch_autonomous_pool(args):
+    """CPU-only overlap with a submitted native codec request; True training."""
+    if _POOL_RAM is not None and bool(getattr(args, '_autonomous_policy_training', False)):
+        return _POOL_RAM.prefetch_next()
+    return None
 
 
 def _build_autonomous_pool(

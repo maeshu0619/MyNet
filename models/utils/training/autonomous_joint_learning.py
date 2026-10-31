@@ -193,6 +193,18 @@ def joint_actual_policy_loss(model, compression, geometry):
     return loss.to(compression.dtype)
 
 
+def _host_scalars(values):
+    """Transfer diagnostics once per device, preserving scalar/order arithmetic."""
+    result, devices = [None] * len(values), {}
+    for index, value in enumerate(values):
+        devices.setdefault(value.device, []).append((index, value))
+    for entries in devices.values():
+        numbers = torch.stack([value for _, value in entries]).detach().cpu().tolist()
+        for (index, _), number in zip(entries, numbers):
+            result[index] = number
+    return result
+
+
 def clip_joint_gradients(model, max_norm):
     """Clip disjoint roles without letting one role shrink all other roles.
 
@@ -210,7 +222,8 @@ def clip_joint_gradients(model, max_norm):
         amount_coarse=('algorithmic_amount_selector_head',), gate=('operation_gate_head',),
         critic=('den6_candidate_critic', 'den6_candidate_proxy_critic', 'den6_plan_critic'))
     parameters = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-    total_before = math.sqrt(sum(float(p.grad.detach().double().square().sum()) for p in parameters))
+    total_before = math.sqrt(sum(_host_scalars([
+        p.grad.detach().double().square().sum() for p in parameters])))
     seen, groups = set(), {}
     for role, names in roles.items():
         params = []
@@ -224,12 +237,22 @@ def clip_joint_gradients(model, max_norm):
                     seen.add(id(p))
         groups[role] = (params, limit if limit > 0. else float(max_norm))
     groups['backbone'] = ([p for p in parameters if id(p) not in seen], float(max_norm))
-    report, applied = {}, False
+    measurements = []
     for role, (params, bound) in groups.items():
         if not params:
             continue
-        before = float(torch.nn.utils.clip_grad_norm_(params, bound)) if bound > 0. else 0.
-        after = math.sqrt(sum(float(p.grad.detach().double().square().sum()) for p in params))
+        before = torch.nn.utils.clip_grad_norm_(params, bound) if bound > 0. else params[0].grad.new_zeros(())
+        measurements.append((role, params, bound, before))
+    # The clipping operations and their order are unchanged. Only reporting
+    # transfers are batched; double per-parameter sums and Python summation
+    # order match the original diagnostics.
+    before_values = _host_scalars([value for _, _, _, value in measurements])
+    after_values = iter(_host_scalars([
+        p.grad.detach().double().square().sum()
+        for _, params, _, _ in measurements for p in params]))
+    report, applied = {}, False
+    for (role, params, bound, _), before in zip(measurements, before_values):
+        after = math.sqrt(sum(next(after_values) for _ in params))
         report[role] = dict(before=before, after=after, bound=bound)
         applied |= before > bound > 0.
     return dict(train_grad_clip_max_norm=float(max_norm),

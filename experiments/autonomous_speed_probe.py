@@ -24,6 +24,8 @@ def main():
                         help='Read-only import replay for matched pre-optimization timings')
     parser.add_argument('--cpu-profile-step', type=int, default=0,
                         help='Optional cProfile of a single full forward/backward update')
+    parser.add_argument('--profile-full-step', action='store_true',
+                        help='Continue the profile past optimizer/logging until the next forward')
     parser.add_argument('--read-only-tensor-cache', action='store_true',
                         help='Read existing seed tensors on misses, write only private cache')
     parser.add_argument('--native-stream-audit', action='store_true',
@@ -32,9 +34,13 @@ def main():
     parser.add_argument('--native-exact-loader', choices=['true', 'false'])
     parser.add_argument('--native-worker-trim-interval', type=int,
                         help='Private benchmark allocator lifetime; use same value in both runs')
+    parser.add_argument('--episode-frames',type=int,default=4)
+    parser.add_argument('--readonly-den6-cache',type=Path,
+                        help='Read existing immutable den6 teachers on a private-cache miss')
+    parser.add_argument('--keep-training-rng',action='store_true',help='Keep normal continuous training RNG rather than per-step diagnostic seeds')
+    parser.add_argument('--lightweight', action='store_true',
+                        help='Measure normal wall time without forced CUDA syncs or per-step tensor dumps')
     options = parser.parse_args()
-    if options.test_route != 'true':
-        parser.error('This synchronized timing wrapper supports True only; use autonomous_search_probe.py for legacy async False regression.')
     out = options.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     from experiments.sparsepcgc_direction.common import source_hashes
@@ -59,6 +65,18 @@ def main():
     import train as training
     from models.utils.training import train_runtime as runtime
     from models.utils.pointcloud import autonomous_proposals as proposals
+    if options.readonly_den6_cache:
+        import copy
+        from models.utils.pointcloud import ana_den6_online
+        original_teacher=ana_den6_online._load_exact_single_plan_teacher
+        def readonly_teacher(settings,identity):
+            teacher=original_teacher(settings,identity)
+            if teacher is None:
+                readonly=copy.copy(settings)
+                readonly.heuristic_guidance_online_cache_dir=str(options.readonly_den6_cache)
+                teacher=original_teacher(readonly,identity)
+            return teacher
+        ana_den6_online._load_exact_single_plan_teacher=readonly_teacher
     if options.read_only_tensor_cache:
         import copy
         from models.modules import heuristic_guidance
@@ -82,7 +100,7 @@ def main():
     training.parse_pugan_args = parse
 
     def sync():
-        if torch.cuda.is_available():
+        if not options.lightweight and torch.cuda.is_available():
             torch.cuda.synchronize()
 
     def timed(label, function, phase=None):
@@ -114,10 +132,15 @@ def main():
         def forward(*args, **kwargs):
             if not model.training:
                 return original_forward(*args, **kwargs)
+            if options.profile_full_step and state.get('cpu_profiler') is not None:
+                previous_profiler = state.pop('cpu_profiler')
+                previous_profiler.disable()
+                previous_profiler.dump_stats(str(out/'cpu_profile.pstats'))
             state['step'] += 1
             state['times'].clear()
             state['native_calls'] = []
-            runtime.set_seed(options.seed * 1000003 + state['step'] - 1, deterministic=False)
+            if not options.keep_training_rng:
+                runtime.set_seed(options.seed * 1000003 + state['step'] - 1, deterministic=False)
             torch.cuda.reset_peak_memory_stats()
             if state['step'] == options.cpu_profile_step:
                 import cProfile
@@ -186,7 +209,8 @@ def main():
 
     def build(model, args, writer):
         (out/'effective_args.json').write_text(json.dumps(vars(args), indent=2, default=str))
-        torch.save({k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, str(out/'initial.pth'))
+        if not options.lightweight:
+            torch.save({k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, str(out/'initial.pth'))
         return original_build(model, args, writer)
 
     training.build_optimizer_and_scheduler = build
@@ -198,10 +222,11 @@ def main():
         is_main = any(id(p) in ids for group in optimizer.param_groups for p in group['params'])
         if not is_main:
             return original_step(optimizer, *args, **kwargs)
-        gradients = {n: p.grad.detach().cpu().clone() if p.grad is not None else None
-                     for n, p in model.named_parameters() if p.requires_grad}
+        gradients = ({n: p.grad.detach().cpu().clone() if p.grad is not None else None
+                      for n, p in model.named_parameters() if p.requires_grad}
+                     if not options.lightweight else {})
         result = timed('optimizer', original_step)(optimizer, *args, **kwargs)
-        profiler = state.pop('cpu_profiler', None)
+        profiler = state.pop('cpu_profiler', None) if not options.profile_full_step else None
         if profiler is not None:
             profiler.disable()
             profiler.dump_stats(str(out/'cpu_profile.pstats'))
@@ -222,16 +247,17 @@ def main():
             row['native_calls'] = state.get('native_calls', [])
         with (out/'steps.jsonl').open('a') as stream:
             stream.write(json.dumps(row, default=str)+'\n')
-        torch.save(dict(gradients=gradients,
-            model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()}),
-            str(out/('step_%03d.pth' % state['step'])))
+        if not options.lightweight:
+            torch.save(dict(gradients=gradients,
+                model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()}),
+                str(out/('step_%03d.pth' % state['step'])))
         return result
 
     torch.optim.Adam.step = step
     sys.argv = ['train.py', '--test_route', options.test_route,
         '--test_route_amount_bins', options.bins, '--compression', 'SparsePCGC',
         '--seed', str(options.seed), '--more_training', 'false', '--mail_notify', 'false',
-        '--train_fixed_episode_frames', '4', '--max_train_steps', str(options.steps),
+        '--train_fixed_episode_frames', str(options.episode_frames), '--max_train_steps', str(options.steps),
         '--train_full_cloud_val_frames', '0', '--sparsepcgc_device', options.teacher_device,
         '--heuristic_guidance_online_grad_audit', 'false',
         '--heuristic_guidance_online_source_grad_probe', 'false',

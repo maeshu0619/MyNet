@@ -34,6 +34,20 @@ def summarize(directory, stdout=None):
 
 def compare(before, after):
     old, new = rows(before), rows(after)
+    def measured(directory, row):
+        policy = row['policy']
+        if 'current_compression_value' in policy:
+            return policy['current_compression_value'], policy['current_geometry_value'], 'full_precision'
+        # Original-route diagnostics do not populate the autonomous policy.
+        # Use measured codec bits and explicitly label rounded log geometry.
+        calls = row.get('native_calls', [])
+        actual = None
+        if len(calls) >= 2 and calls[0]['metrics'].get('bit', 0.) > 0.:
+            actual = 100. * (calls[-1]['metrics']['bit']/calls[0]['metrics']['bit']-1.)
+        logs = list((directory/'log').rglob('*.txt'))
+        values = re.findall(r'StepLoss .*?raw\[geom=([-+\d.eE]+)', logs[0].read_text()) if logs else []
+        geometry = float(values[row['step']-1]) if len(values) >= row['step'] else None
+        return actual, geometry, 'rounded_log_4_decimals' if geometry is not None else 'not_measured'
     result = []
     for a, b in zip(old, new):
         i = a['step']
@@ -58,11 +72,13 @@ def compare(before, after):
             differences[group] = dict(max_absolute=maximum, difference_l2=norm**.5,
                 reference_l2=reference_norm**.5, relative_l2=(norm/reference_norm)**.5 if reference_norm else None,
                 equal_tensors=equal, tensors=total, missing_gradient_mismatches=missing)
+        ac, ag, precision = measured(before, a)
+        bc, bg, _ = measured(after, b)
         result.append(dict(step=i, plan_equal=a['plan']==b['plan'],
-            actual_equal=a['policy']['current_compression_value']==b['policy']['current_compression_value'],
-            geometry_equal=a['policy']['current_geometry_value']==b['policy']['current_geometry_value'],
-            actual_percent=a['policy']['current_compression_value'],
-            geometry=a['policy']['current_geometry_value'], differences=differences))
+            actual_equal=ac==bc if ac is not None and bc is not None else None,
+            geometry_equal=ag==bg if ag is not None and bg is not None else None,
+            actual_percent=ac, actual_percent_after=bc,
+            geometry=ag, geometry_after=bg, geometry_precision=precision, differences=differences))
     return result
 
 

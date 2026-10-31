@@ -52,8 +52,26 @@ def main():
             assert expected == actual, (dataset, step)
             assert torch.equal(rng, torch.get_rng_state())
             pools.append(dict(dataset=dataset, step=step, equal=True, rng_equal=True))
-    options.out.write_text(json.dumps(dict(settings=checks, pools=pools), indent=2))
-    print('PASS: original False arguments, 9 pools and RNG')
+    from models.utils.loss.actual_encoder import _SparsePCGCActualEncoder
+    old_encoder = load(options.before, 'models/utils/loss/actual_encoder.py', 'models.utils.loss._false_pipeline_snapshot')
+    commands = []
+    for dataset in ('8i', 'MVUB', 'UVG'):
+        expected_args = parse(old, ['--compression', 'SparsePCGC', '--dataname', dataset])
+        actual_args = parse(current, ['--compression', 'SparsePCGC', '--dataname', dataset, '--test_route', 'false'])
+        configure_autonomous_search(actual_args)
+        for mode in ('dense_lossy', 'dense_lossless'):
+            for decode in (False, True):
+                for settings in (expected_args, actual_args):
+                    settings.sparsepcgc_mode = mode
+                    settings.sparsepcgc_skip_decode = not decode
+                expected = old_encoder._SparsePCGCActualEncoder(expected_args)
+                actual = _SparsePCGCActualEncoder(actual_args)
+                assert expected._worker_args() == actual._worker_args()
+                assert expected._codec_cache_fingerprint() == actual._codec_cache_fingerprint()
+                commands.append(dict(dataset=dataset, mode=mode, decode=decode,
+                                     command_equal=True, fingerprint_equal=True))
+    options.out.write_text(json.dumps(dict(settings=checks, pools=pools, worker_commands=commands), indent=2))
+    print('PASS: original False arguments, 9 pools, RNG, 12 worker commands/fingerprints')
 
 
 if __name__ == '__main__':

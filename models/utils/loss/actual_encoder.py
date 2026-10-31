@@ -922,9 +922,21 @@ class _SparsePCGCActualEncoder:
         start = time.time()
         self._proc.stdin.write(json.dumps(request, sort_keys=True) + "\n")
         self._proc.stdin.flush()
-        response = self._read_worker_json(self.timeout)
-        while response.get("request_id") not in {None, self._request_id}:
+        pool_prefetch = None
+        if bool(getattr(self.args, 'test_route', False)):
+            from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+            if autonomous_search_enabled(self.args):
+                from ..pointcloud.autonomous_proposals import prefetch_autonomous_pool
+                pool_prefetch = prefetch_autonomous_pool(self.args)
+        try:
             response = self._read_worker_json(self.timeout)
+            while response.get("request_id") not in {None, self._request_id}:
+                response = self._read_worker_json(self.timeout)
+        finally:
+            if pool_prefetch is not None:
+                # GC batching is process-global. Finish and restore it before
+                # any model/loss work resumes, also on codec timeout/error.
+                pool_prefetch.result()
         if bool(request.get("exit_after_response", False)) and response.get("status") == "ok":
             proc = self._proc
             if proc is not None:
