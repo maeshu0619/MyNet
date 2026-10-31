@@ -1,4 +1,8 @@
-"""ana_den6のexact候補順位をmyNetのWhere・Amount・Actionへ接続する。
+"""候補の座標写像と旧den6互換guidance。
+
+SparsePCGCのtest_route=Trueはden6 profile/cacheを読まず、現在のGTから
+生成した無順位poolだけを共通の座標写像へ渡す。Amountの旧priorは実行時に
+独立な学習方策で置き換える。以下のden6 rank/anchorの説明は互換ルート用。
 
 ``ana_den6_residual`` ではmyNet proxyによる近似再計算を禁止し、
 ana_den5/ana_den6が生成した順位付きEditCandidate poolを唯一の探索空間とする。
@@ -618,6 +622,31 @@ def _exact_den6_guidance(
         pools = exact.get("ranked_candidate_pools")
     if not isinstance(pools, Mapping):
         raise RuntimeError("ana_den6 exact guidanceに局所候補shortlistが無い")
+    from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+    if autonomous_search_enabled(args) and exact.get('autonomous_search'):
+        from ..utils.pointcloud.autonomous_guidance_mapping import map_single_voxel_candidates
+        fields=map_single_voxel_candidates(pools,coords,like,_NEIGHBOR_OFFSETS_26,coordinate_indices)
+        if fields is not None:
+            raw_shares=exact.get('operation_shares') or {}
+            shares={op:max(float(raw_shares.get(op,0.)),0.) for op in ('Add','Prune','Adjust')}
+            total=sum(shares.values())
+            if total<=0.:raise RuntimeError('ana_den6 exact guidanceのoperation share合計が0である')
+            shares={op:value/total for op,value in shares.items()}
+            ratio=max(float(exact.get('total_ratio',0.)),0.)
+            guidance=dict(fields,enabled=True,profile_source=str(exact['source']),
+                dataset=_dataset_key(exact.get('dataset',getattr(args,'dataname','8i'))),
+                scale_m=int(exact.get('scale_m',getattr(args,'sparsepcgc_scale_m',8))),
+                total_ratio=ratio,operation_shares=shares,
+                operation_heuristics=dict(exact.get('operation_heuristics') or {}),
+                amount_prior={op:ratio*value for op,value in shares.items()},
+                action_gate_prior={op:float(.50+.50*value/max(max(shares.values()),1e-9)) for op,value in shares.items()},
+                where_prior_mean={},formula_basis=str(exact['source']),exact_candidate_guidance=exact,
+                cpu_tensor_cache_hit=False,disk_tensor_cache_hit=False)
+            guidance=_attach_candidate_local_proxy(guidance,exact,like,args)
+            cpu_guidance=_store_exact_guidance_cpu(cpu_cache_key,guidance,exact,args)
+            _store_exact_guidance_disk(args,cpu_cache_key,cpu_guidance)
+            _EXACT_GUIDANCE_CACHE[cache_key]=guidance
+            return guidance
     B, _, N = coords.shape
     # 候補poolが実際に参照する座標だけを疎joinする。従来は100万Voxel全部を
     # CPU list/dictへ変換していたが、候補に無関係な座標はlookupへ不要である。

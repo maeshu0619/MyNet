@@ -193,7 +193,15 @@ def _build_autonomous_pool(
     prune_rows = rows.index_select(0, prune_indices)
     prune_degree = (neighbour_count[interior][:int(prune_indices.numel())].float()
                     if autonomous else neighbour_count[:int(prune_indices.numel())].float())
-    pools["Prune"] = [
+    from ..loss.autonomous_codec_context import codec_context_enabled
+    native_arrays=codec_context_enabled(args)
+    if native_arrays:
+        from .autonomous_context_arrays import SpatialCandidates,first_rows
+        source_array=prune_rows.detach().cpu().numpy()
+        pools['Prune']=SpatialCandidates(np.concatenate((source_array,np.zeros_like(source_array)),1),
+            prune_degree.detach().cpu().numpy().astype(np.float64)/26.)
+    else:
+        pools["Prune"] = [
         {
             "candidate_id": f"fast:Prune:{x}:{y}:{z}",
             "operation": "Prune", "pool_rank": index, "rank_score": 0.0,
@@ -206,11 +214,22 @@ def _build_autonomous_pool(
         for index, ((x, y, z), degree) in enumerate(
             zip(prune_rows.cpu().tolist(), prune_degree.cpu().tolist())
         )
-    ]
+        ]
     for operation, phase in (("Add", seed + 17), ("Adjust", seed + 43)):
         direction_index, source, target, degree = choose_pairs(
             budgets[operation], phase, protect_source=(autonomous and operation == 'Adjust')
         )
+        if native_arrays:
+            source_array=source.detach().cpu().numpy()
+            target_array=target.detach().cpu().numpy()
+            # The original spatial generator deduplicates TARGETS, even for
+            # Adjust. Preserve the first source/direction for each target.
+            keep=first_rows(target_array)
+            geo=degree.detach().cpu().numpy().astype(np.float64)
+            geo=(26.-geo)/26. if operation=='Add' else geo/26.
+            remove=source_array if operation=='Adjust' else np.zeros_like(target_array)
+            pools[operation]=SpatialCandidates(np.concatenate((remove,target_array),1)[keep],geo[keep])
+            continue
         pool = []
         seen_targets = set()
         for source_row, target_row, local_degree, direction in zip(
@@ -243,7 +262,6 @@ def _build_autonomous_pool(
                 ),
             })
         pools[operation] = pool
-    from ..loss.autonomous_codec_context import codec_context_enabled
     native_context_path = ''
     context_diagnostics = {}
     if codec_context_enabled(args):

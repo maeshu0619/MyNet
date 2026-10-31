@@ -34,6 +34,13 @@ def canonical_voxel_sha(rows):
 
 
 def context_proposals(source, context_path, budget, seed=0, random_pools=None):
+    if int(budget)<=0:
+        return _context_proposals_reference(source,context_path,budget,seed,random_pools)
+    from .autonomous_context_arrays import context_proposals_arrays
+    return context_proposals_arrays(source,context_path,budget,seed,random_pools)
+
+
+def _context_proposals_reference(source, context_path, budget, seed=0, random_pools=None):
     from scipy.spatial import cKDTree
     from ..loss.autonomous_native_loader import lexicographic_unique_rows
     source = np.asarray(source, dtype=np.int64)
