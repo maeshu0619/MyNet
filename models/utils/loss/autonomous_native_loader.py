@@ -1,14 +1,52 @@
-"""Exact worker-local acceleration of a native loader's unique(axis=0).
+"""Exact worker-local acceleration of native input preparation.
 
-The native loader's function code, reader, coordinate ordering, quantization
-result, sparse collation and Minkowski construction are retained. Local
-functions use injective unique keys and bypass provably identity unit
-quantization of integer arrays.
+The native loader's function code, coordinate ordering, quantization result,
+sparse collation and Minkowski construction are retained. The worker's own
+binary PLY layout has a direct reader with a native fallback. Local functions
+also use injective unique keys and bypass identity unit quantization.
 """
 import functools
+import os
 import types
 
 import numpy as np
+
+
+def make_exact_binary_reader(reference):
+    """Read the worker's own XYZ float32 PLY without Open3D allocation.
+
+    Match read_ply_o3d's default int32 conversion *before* quantization.
+    Any other header/layout/value range delegates to that original reader.
+    No input is cached between requests.
+    """
+    def read_coords(path):
+        if not str(path).endswith('.ply'):
+            return reference(path)
+        points = None
+        try:
+            with open(path, 'rb') as stream:
+                lines = [stream.readline(256) for _ in range(7)]
+                expected = [b'ply\n', b'format binary_little_endian 1.0\n', None,
+                            b'property float x\n', b'property float y\n',
+                            b'property float z\n', b'end_header\n']
+                if all(want is None or got == want for got, want in zip(lines, expected)):
+                    words = lines[2].split()
+                    if len(words) == 3 and words[:2] == [b'element', b'vertex']:
+                        count = int(words[2])
+                        size = os.fstat(stream.fileno()).st_size-stream.tell()
+                        if count >= 0 and size == count*12:
+                            values = np.fromfile(stream, dtype='<f4', count=count*3).reshape(-1, 3)
+                            # Native double -> int32 truncation equals float32
+                            # -> int32 for finite, representable values only.
+                            if (values.size == count*3 and np.isfinite(values).all()
+                                    and (not count or (values.min() >= -(2.**31)
+                                                       and values.max() < 2.**31))):
+                                points = values.astype(np.int32)
+        except (OSError, ValueError, OverflowError):
+            pass
+        return reference(path) if points is None else points
+    read_coords._mynet_native_reader = reference
+    return read_coords
 
 
 def lexicographic_unique_rows(array):
@@ -49,6 +87,9 @@ def make_exact_loader(loader):
         return loader
     environment = dict(loader.__globals__)
     environment['np'] = _ExactUniqueNumpy(environment['np'])
+    reader = environment.get('read_coords')
+    if callable(reader):
+        environment['read_coords'] = make_exact_binary_reader(reader)
     quantize = environment.get('quantize_precision')
     if callable(quantize):
         def exact_identity_quantize(points, precision=.001, quant_mode='round', return_offset=False):

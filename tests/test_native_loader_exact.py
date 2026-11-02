@@ -1,10 +1,13 @@
 import unittest
 import types
+import tempfile
+from pathlib import Path
+from unittest.mock import Mock
 from types import SimpleNamespace
 
 import numpy as np
 
-from models.utils.loss.autonomous_native_loader import lexicographic_unique_rows, make_exact_loader, install_exact_loader
+from models.utils.loss.autonomous_native_loader import lexicographic_unique_rows, make_exact_loader, install_exact_loader, make_exact_binary_reader
 
 
 def _native_like_loader(points, factor=1.):
@@ -13,6 +16,25 @@ def _native_like_loader(points, factor=1.):
 
 
 class ExactNativeLoaderTest(unittest.TestCase):
+    def test_binary_reader_preserves_native_truncation_order_and_uses_fallback(self):
+        header = b'ply\nformat binary_little_endian 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\nend_header\n'
+        points = np.array([[-1.9, 0., 2.9], [1.5, -2.5, 0.], [-1.9, 0., 2.9]], dtype='<f4')
+        reference = Mock(return_value='fallback')
+        reader = make_exact_binary_reader(reference)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'input.ply'
+            path.write_bytes(header+points.tobytes())
+            self.assertTrue(np.array_equal(reader(str(path)), points.astype(np.float64).astype(np.int32)))
+            reference.assert_not_called()
+            for raw in (header+points.tobytes()[:-1], header+points.tobytes()+b'x',
+                        header.replace(b'float x',b'int x')+points.tobytes(),
+                        header+np.full((3,3),np.nan,dtype='<f4').tobytes(),
+                        header+np.full((3,3),2.**31,dtype='<f4').tobytes()):
+                path.write_bytes(raw)
+                self.assertEqual(reader(str(path)), 'fallback')
+            self.assertEqual(reader(Path(directory)/'absent.ply'), 'fallback')
+            self.assertEqual(reader('cloud.h5'), 'fallback')
+
     def test_installation_changes_only_the_worker_coder_namespace(self):
         def caller(self, points):
             return load_sparse_tensor(points)
