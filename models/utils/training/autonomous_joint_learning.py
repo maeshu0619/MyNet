@@ -154,6 +154,16 @@ def joint_actual_policy_loss(model, compression, geometry):
     # train.py's pre-existing backward-only scale is canceled exactly once.
     compression_policy = -policy_weight * (wc * (float(bc) - c)) * lp / scale
     geometry_policy = -policy_weight * (wg * (float(bg) - penalty)) * lp / scale
+    alpha = float(getattr(args, 'heuristic_guidance_online_reward_ema', .1))
+    from .autonomous_conditional_baseline import conditional_where_baseline
+    (where_bc, where_bg), where_control = conditional_where_baseline(
+        debug, previous, args, c, penalty, (bc, bg), alpha)
+    if where_control['enabled']:
+        # Keep the Native Normal score's family baseline unchanged. Only the
+        # conditional permutation score gets the action-independent baseline.
+        where_lp = debug['_joint_where_position_log_prob']
+        compression_policy = compression_policy + policy_weight*wc*(bc-where_bc)*where_lp/scale
+        geometry_policy = geometry_policy + policy_weight*wg*(bg-where_bg)*where_lp/scale
     ratio = float(debug['_actor_critic_selected_operation_ratio'].detach().cpu())
     efficiency = zero
     guarded = False
@@ -166,7 +176,6 @@ def joint_actual_policy_loss(model, compression, geometry):
             advantage = min(max((previous['operation_ratio'] - ratio)
                                 / max(previous['operation_ratio'], 1e-8), -.25), .25)
             efficiency = -float(getattr(args, 'heuristic_guidance_online_efficiency_policy_weight', .25)) * advantage * lp / scale
-    alpha = float(getattr(args, 'heuristic_guidance_online_reward_ema', .1))
     memory[key] = dict(compression=float(c), geometry=float(g), operation_ratio=ratio,
                        ema_c=(1. - alpha) * global_bc + alpha * float(c) if previous else float(c),
                        ema_g=(1. - alpha) * global_bg + alpha * float(penalty) if previous else float(penalty))
@@ -175,6 +184,11 @@ def joint_actual_policy_loss(model, compression, geometry):
             c=(1.-alpha)*bc+alpha*float(c) if family_previous else float(c),
             g=(1.-alpha)*bg+alpha*float(penalty) if family_previous else float(penalty))
         memory[key]['credit_family_ema'] = family_history
+    if where_control['history'] is not None:
+        memory[key]['where_native_condition_ema'] = where_control['history']
+    elif previous and previous.get('where_native_condition_ema'):
+        # Clean Amount trials must not erase the separate Where history.
+        memory[key]['where_native_condition_ema'] = previous['where_native_condition_ema']
     memory.move_to_end(key)
     while len(memory) > 4096:
         memory.popitem(last=False)
@@ -218,6 +232,8 @@ def joint_actual_policy_loss(model, compression, geometry):
         baseline=float(wc * bc + wg * bg), advantage=float(wc * (bc - c) + wg * (bg - penalty)),
         policy_loss=float(loss.detach()), actual_teacher_scope='complete_joint_plan_cost',
         actual_plan_replay=replay_debug, actual_plan_replay_bytes=replay_bytes,
+        where_control_variate={k:v for k,v in where_control.items() if k!='history'},
+        where_baseline=float(wc*where_bc+wg*where_bg),
         actual_plan_replay_loss=float(replay.detach()))
     return loss.to(compression.dtype)
 

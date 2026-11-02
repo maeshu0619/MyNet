@@ -8245,7 +8245,10 @@ class StructureRepairActuator(nn.Module):
                     temperature_override=joint_search_controls['where_temperature'] if joint_search_controls is not None else None)
             joint_amount_lp = torch.stack(tuple(joint_amount['log_probs'].values())).sum()
             joint_where_lp = torch.stack(tuple(joint_where_terms.values())).sum()
+            joint_where_position_lp = joint_where_lp
+            joint_native_lp = joint_where_lp * 0.
             if native_sample_lp is not None and sum(selected_counts.values()) > 0:
+                joint_native_lp = native_sample_lp
                 joint_where_lp = joint_where_lp + native_sample_lp
             split_credit = native_preference is not None and self.training and scheduled_exploration_multiplier > 0.
             debug['_joint_policy_log_prob'] = (
@@ -8253,6 +8256,8 @@ class StructureRepairActuator(nn.Module):
                 joint_where_lp if split_credit else joint_amount_lp + joint_where_lp)
             debug['joint_credit_family'] = ('amount_clean_where' if clean_amount_trial else
                 'where_sampled' if split_credit else 'joint')
+            debug['_joint_where_position_log_prob'] = joint_where_position_lp
+            debug['_joint_native_sample_log_prob'] = joint_native_lp
             debug['native_context_preference'] = (float(native_preference.detach().cpu())
                 if native_preference is not None else None)
             debug['_joint_amount_logits'] = joint_amount['logits']

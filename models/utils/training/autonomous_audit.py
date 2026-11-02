@@ -4,7 +4,8 @@ import json
 
 def compact_autonomous_audit(args, plan, compression, elapsed):
     fields = ('current_compression_value','current_geometry_value','advantage',
-              'actual_plan_replay','actual_plan_replay_bytes','actual_plan_replay_loss')
+              'actual_plan_replay','actual_plan_replay_bytes','actual_plan_replay_loss',
+              'where_control_variate','where_baseline')
     policy = {key:compression.get('den6_online_policy_'+key) for key in fields}
     row = dict(schema='autonomous_joint_context_v3',
         frame=str(getattr(args,'_current_input_file','')),
