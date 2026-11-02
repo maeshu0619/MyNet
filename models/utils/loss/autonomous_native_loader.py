@@ -1,8 +1,9 @@
 """Exact worker-local acceleration of a native loader's unique(axis=0).
 
-The native loader's function code, reader, rounding, sparse collation, and
-Minkowski construction are retained. Only its local NumPy unique operation
-uses a one-dimensional key when injective packing is safe.
+The native loader's function code, reader, coordinate ordering, quantization
+result, sparse collation and Minkowski construction are retained. Local
+functions use injective unique keys and bypass provably identity unit
+quantization of integer arrays.
 """
 import functools
 import types
@@ -48,6 +49,18 @@ def make_exact_loader(loader):
         return loader
     environment = dict(loader.__globals__)
     environment['np'] = _ExactUniqueNumpy(environment['np'])
+    quantize = environment.get('quantize_precision')
+    if callable(quantize):
+        def exact_identity_quantize(points, precision=.001, quant_mode='round', return_offset=False):
+            if (type(points) is np.ndarray and points.dtype.kind in 'iu'
+                    and points.dtype.itemsize <= 4 and precision == 1
+                    and quant_mode in ('round', 'floor') and not return_offset):
+                # Every int32/uint32 is exactly representable in float64.
+                # Native float64 division by 1 and round/floor are identity.
+                return points.astype('int')
+            return quantize(points, precision=precision, quant_mode=quant_mode,
+                            return_offset=return_offset)
+        environment['quantize_precision'] = exact_identity_quantize
     wrapper = types.FunctionType(loader.__code__, environment, loader.__name__,
                                  loader.__defaults__, loader.__closure__)
     wrapper.__kwdefaults__ = loader.__kwdefaults__

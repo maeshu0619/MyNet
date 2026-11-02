@@ -283,6 +283,8 @@ def _build_autonomous_pool(
         pools, context_diagnostics = context_proposals(rows.detach().cpu().numpy(), native_context_path,
             max(budgets.values()), int(str(identity['input_sha256'])[:16],16)&0x7fffffff,
             random_pools=pools)
+        from ..cache.autonomous_candidate_layout import immutable_candidate_coordinates
+        immutable_candidate_coordinates(pools)
     if any(not pools[name] for name in ("Add", "Prune", "Adjust")):
         raise RuntimeError("fast unordered proposal produced an empty operation pool")
     serialization_finished = time.perf_counter()

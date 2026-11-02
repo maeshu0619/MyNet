@@ -40,6 +40,10 @@ def main():
     parser.add_argument('--keep-training-rng',action='store_true',help='Keep normal continuous training RNG rather than per-step diagnostic seeds')
     parser.add_argument('--lightweight', action='store_true',
                         help='Measure normal wall time without forced CUDA syncs or per-step tensor dumps')
+    parser.add_argument('--native-profile', action='store_true')
+    parser.add_argument('--native-source-snapshot', type=Path)
+    parser.add_argument('--allocator-audit', action='store_true')
+    parser.add_argument('--gc-audit', action='store_true')
     options = parser.parse_args()
     out = options.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -90,6 +94,48 @@ def main():
             return result
         heuristic_guidance._load_exact_guidance_disk = load_with_readonly_seed
     state = dict(step=0, times=defaultdict(float), phase='other_backward')
+    allocator_events, gc_events, gc_started = [], [], {}
+    if options.native_profile or options.native_source_snapshot:
+        import os
+        from models.utils.loss.actual_encoder import _SparsePCGCActualEncoder
+        original_worker_args = _SparsePCGCActualEncoder._worker_args
+        os.environ['MYNET_NATIVE_PROFILE_DIR'] = str(out/'native_profile')
+        os.environ['MYNET_NATIVE_PROFILE_ENABLED'] = '1' if options.native_profile else '0'
+        if options.native_source_snapshot:
+            os.environ['MYNET_NATIVE_SOURCE_SNAPSHOT'] = str(options.native_source_snapshot.resolve())
+            import hashlib
+            source = options.native_source_snapshot/'models/utils/loss/autonomous_native_loader.py'
+            (out/'native_source_snapshot.json').write_text(json.dumps(dict(
+                path=str(source.resolve()), sha256=hashlib.sha256(source.read_bytes()).hexdigest())))
+        def worker_args(encoder):
+            command, cwd = original_worker_args(encoder)
+            command[1] = str(ROOT/'experiments/profile_native_worker.py')
+            return command, cwd
+        _SparsePCGCActualEncoder._worker_args = worker_args
+    if options.allocator_audit:
+        original_empty = torch.cuda.empty_cache
+        def empty_cache():
+            frame = sys._getframe(1)
+            before = dict(allocated=torch.cuda.memory_allocated(), reserved=torch.cuda.memory_reserved())
+            started = time.perf_counter()
+            result = original_empty()
+            allocator_events.append(dict(step=state['step'], phase=state['phase'],
+                caller=frame.f_code.co_filename, function=frame.f_code.co_name, line=frame.f_lineno,
+                elapsed=time.perf_counter()-started, before=before,
+                after=dict(allocated=torch.cuda.memory_allocated(),reserved=torch.cuda.memory_reserved())))
+            return result
+        torch.cuda.empty_cache = empty_cache
+    if options.gc_audit:
+        import gc
+        import threading
+        def gc_event(event, info):
+            key = (threading.get_ident(), info['generation'])
+            if event == 'start':
+                gc_started[key] = time.perf_counter()
+            elif key in gc_started:
+                gc_events.append(dict(step=state['step'], phase=state['phase'],
+                    thread=key[0], generation=key[1], elapsed=time.perf_counter()-gc_started.pop(key)))
+        gc.callbacks.append(gc_event)
     original_parse = training.parse_pugan_args
 
     def parse(*args, **kwargs):
@@ -281,6 +327,11 @@ def main():
         training.main()
         (out/'completed.json').write_text(json.dumps(dict(updates=state['step'])))
     finally:
+        if options.gc_audit:
+            gc.callbacks.remove(gc_event)
+            (out/'gc_events.json').write_text(json.dumps(gc_events))
+        if options.allocator_audit:
+            (out/'allocator_events.json').write_text(json.dumps(allocator_events, indent=2))
         current = source_hashes()
         changed = [p for p, h in initial_sources.items() if current.get(p) != h]
         (out/'integrity.json').write_text(json.dumps(dict(source_changes=changed)))

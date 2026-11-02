@@ -566,6 +566,22 @@ class Network(nn.Module):
         max_entries, max_bytes = self._input_cache_limits()
         if not key or max_entries <= 0 or max_bytes <= 0:
             return
+        from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        if autonomous_search_enabled(self.args):
+            from .utils.cache.autonomous_static_admission import static_clone_bytes
+            predicted_bytes = (static_clone_bytes(state)
+                if bool(getattr(self.args, 'static_node_cache_cpu', True))
+                else self._input_cache_value_bytes(state))
+            if predicted_bytes > max_bytes:
+                return
+            expected = max(int(getattr(self, 'expected_input_cache_entries', 0)), 0)
+            capacity = min(int(max_entries), int(max_bytes // max(predicted_bytes, 1)))
+            if expected > 0 and capacity < expected:
+                self._input_cache_working_set_bypassed = int(getattr(
+                    self, '_input_cache_working_set_bypassed', 0)) + 1
+                if self.input_cache:
+                    self.clear_input_cache()
+                return
         cached_state = (
             self._clone_static_cache_value(state, torch.device("cpu"))
             if bool(getattr(self.args, "static_node_cache_cpu", True))
@@ -3131,9 +3147,16 @@ class Network(nn.Module):
         voxel_coords = state.get("initial_voxel_coords") if isinstance(state, dict) else None
         if not isinstance(terms, dict) or not torch.is_tensor(voxel_coords):
             raise RuntimeError("Single-Plan Student forward結果がない")
-        value, metrics = self.single_plan_distillation_loss_module(
-            terms, voxel_coords, teacher
-        )
+        from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
+        if autonomous_search_enabled(self.args):
+            from .utils.cache.autonomous_pool_ram import batch_pool_collection
+            with batch_pool_collection():
+                value, metrics = self.single_plan_distillation_loss_module(
+                    terms, voxel_coords, teacher, compact_metrics=True)
+        else:
+            value, metrics = self.single_plan_distillation_loss_module(
+                terms, voxel_coords, teacher
+            )
         weight = max(float(getattr(
             self.args, "single_plan_distillation_weight", 1.0
         )), 0.0)

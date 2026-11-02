@@ -11,6 +11,10 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
+from collections import OrderedDict
+
+_CANONICAL_SHA_CACHE = OrderedDict()
+_CANONICAL_SHA_CACHE_LIMIT = 256
 
 
 def cell_counts(rows):
@@ -26,11 +30,26 @@ def cell_counts(rows):
 
 def canonical_voxel_sha(rows):
     from ..loss.autonomous_native_loader import lexicographic_unique_rows
-    rows = np.asarray(rows, dtype=np.int64)
+    rows = np.ascontiguousarray(rows, dtype=np.int64)
+    # Verify the complete current contents and row order, not a tensor pointer
+    # or filename. Keep only small digests, never the raw cloud bytes/arrays.
+    ordered = hashlib.sha256()
+    ordered.update(str(rows.shape).encode('ascii'))
+    if rows.size:
+        ordered.update(memoryview(rows).cast('B'))
+    key = ordered.digest()
+    cached = _CANONICAL_SHA_CACHE.get(key)
+    if cached is not None:
+        _CANONICAL_SHA_CACHE.move_to_end(key)
+        return cached
     unique = lexicographic_unique_rows(rows)
     if unique is None:
         unique = np.unique(rows, axis=0)
-    return hashlib.sha256(unique.tobytes()).hexdigest()
+    value = hashlib.sha256(unique.tobytes()).hexdigest()
+    _CANONICAL_SHA_CACHE[key] = value
+    if len(_CANONICAL_SHA_CACHE) > _CANONICAL_SHA_CACHE_LIMIT:
+        _CANONICAL_SHA_CACHE.popitem(last=False)
+    return value
 
 
 def context_proposals(source, context_path, budget, seed=0, random_pools=None):

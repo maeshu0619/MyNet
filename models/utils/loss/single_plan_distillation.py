@@ -344,6 +344,7 @@ class SinglePlanDistillationLoss(nn.Module):
         terms: Mapping[str, torch.Tensor],
         voxel_coords: torch.Tensor,
         teacher: Mapping[str, object],
+        *, compact_metrics: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
         coords = self._coords(voxel_coords)
         where = terms["base_where_logits"][0]
@@ -750,24 +751,33 @@ class SinglePlanDistillationLoss(nn.Module):
                     recalls[name] = float(
                         (coordinate_indices(expected, predicted) >= 0).float().mean().detach().cpu()
                     )
-            teacher_adjust_pairs = {
-                (tuple(map(int, row["remove_coords"][0])), tuple(map(int, row["add_coords"][0])))
-                for row in by_operation["Adjust"]
-                if row.get("remove_coords") and row.get("add_coords")
-            }
-            adjust_mask = executable.accepted_mask[0, 0, 2]
-            student_adjust_pairs = {
-                (tuple(map(int, source)), tuple(map(int, target)))
-                for source, target in zip(
-                    executable.source_coord[0, 0, 2][adjust_mask].detach().cpu().tolist(),
-                    executable.target_coord[0, 0, 2][adjust_mask].detach().cpu().tolist(),
-                )
-            }
-            if teacher_adjust_pairs:
-                recalls["adjust_direction_recall"] = float(
-                    len(teacher_adjust_pairs & student_adjust_pairs)
-                    / float(len(teacher_adjust_pairs))
-                )
+            if compact_metrics:
+                from .autonomous_shadow_metrics import adjust_pair_recall
+                adjust_mask = executable.accepted_mask[0, 0, 2]
+                recall = adjust_pair_recall(by_operation['Adjust'],
+                    executable.source_coord[0, 0, 2][adjust_mask].detach().cpu().numpy(),
+                    executable.target_coord[0, 0, 2][adjust_mask].detach().cpu().numpy())
+                if recall is not None:
+                    recalls['adjust_direction_recall'] = recall
+            else:
+                teacher_adjust_pairs = {
+                    (tuple(map(int, row["remove_coords"][0])), tuple(map(int, row["add_coords"][0])))
+                    for row in by_operation["Adjust"]
+                    if row.get("remove_coords") and row.get("add_coords")
+                }
+                adjust_mask = executable.accepted_mask[0, 0, 2]
+                student_adjust_pairs = {
+                    (tuple(map(int, source)), tuple(map(int, target)))
+                    for source, target in zip(
+                        executable.source_coord[0, 0, 2][adjust_mask].detach().cpu().tolist(),
+                        executable.target_coord[0, 0, 2][adjust_mask].detach().cpu().tolist(),
+                    )
+                }
+                if teacher_adjust_pairs:
+                    recalls["adjust_direction_recall"] = float(
+                        len(teacher_adjust_pairs & student_adjust_pairs)
+                        / float(len(teacher_adjust_pairs))
+                    )
         metrics = {
             "prune_source_loss": float(prune_loss.detach()),
             "add_target_loss": float(add_target_loss.detach()),
