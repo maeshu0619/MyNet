@@ -17,6 +17,7 @@ def compact_autonomous_audit(args, plan, compression, elapsed):
         structured_where=plan.get('structured_where_coefficients'),
         credit_family=plan.get('joint_credit_family'),
         native_context_preference=plan.get('native_context_preference'),
+        learned_exploration=plan.get('joint_learned_exploration'),
         amount_log_prob=plan.get('joint_amount_log_prob'),where_log_prob=plan.get('joint_where_log_prob'),
         decision_capture_l2=compression.get('den6_policy_only_capture_grad_norm'),
         context=getattr(args,'_autonomous_native_context_debug',None),

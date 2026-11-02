@@ -1,0 +1,22 @@
+{
+  "train.py": {
+    "same_at_launch_commit": true,
+    "current_sha256": "937da368d8a4fb55b1d2399c4608b4618e3030f3af1affa45cc8e0261a3c93a4"
+  },
+  "models/utils/config/args.py": {
+    "same_at_launch_commit": true,
+    "current_sha256": "26cb34eb2272e11ecb877263380677487b67a4f9265d59bd80e40ab5c253c972"
+  },
+  "models/modules/structure_actuator.py": {
+    "same_at_launch_commit": true,
+    "current_sha256": "f86d178e42156a5d29cea1946a047d77a9243c14a329ab904cdc9d2525d02146"
+  },
+  "models/utils/training/sparsepcgc_autonomous_policy.py": {
+    "same_at_launch_commit": true,
+    "current_sha256": "76667b68694a929d92885ec69036792c92bce8ce7af25874d58f80c9dbd03474"
+  },
+  "models/utils/training/autonomous_actual_replay.py": {
+    "same_at_launch_commit": true,
+    "current_sha256": "7df1f2d834da2452e403a747bac556c628180466aecaafcfd859d8115b16d593"
+  }
+}

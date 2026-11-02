@@ -179,6 +179,10 @@ def train(model, args, loss, writer, plot, notifier=None):
             f"per_operation_max={float(args.test_route_max_operation_ratio)}, "
             f"positive_bins={args.heuristic_guidance_online_amount_bins}, noop=per_operation"
         )
+        if bool(getattr(args, 'test_route_learned_exploration', False)):
+            writer.write("AutonomousExploration: mode=actual_learned, "
+                "episode_noise_cutoff=disabled, initial_broad_search=preserved, "
+                "eval=greedy, new_actual_policy_credit=all_training_steps")
     elif str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
         writer.write(
             "TrainingPerformanceContract: heuristic_role=candidate_pool_and_safety_prior, "

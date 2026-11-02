@@ -14,7 +14,8 @@ OPERATIONS = ('Add', 'Prune', 'Adjust')
 
 
 def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
-                         training, fine_sigma=.30, uniform_fraction=0.):
+                         training, fine_sigma=.30, uniform_fraction=0.,
+                         temperature_override=None, fine_std_override=None):
     """Three independent categorical+lognormal actions; no fixed total/share.
 
     The sampled latent action's exact likelihood is used even when a ratio
@@ -22,14 +23,17 @@ def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
     used in the likelihood. Evaluation and phase=0 use deterministic actions.
     """
     stochastic = bool(training and phase > 0.)
-    temperature = max(2. * float(phase), .05)
-    sigma = (max(float(fine_sigma) * float(phase), .02)
+    temperature = (temperature_override if stochastic and temperature_override is not None
+                   else max(2. * float(phase), .05))
+    sigma = (fine_std_override if stochastic and fine_std_override is not None else
+             max(float(fine_sigma) * float(phase), .02)
              if stochastic and fine_sigma > 0. else 0.)
     basis = bins / float(maximum)
     ratios, log_probs, indices, logits_by_op = {}, {}, {}, {}
     entropies = []
     samples = {}
-    epsilon = min(max(float(uniform_fraction), 0.), 1.) if stochastic else 0.
+    epsilon = (uniform_fraction.clamp(0., 1.) if torch.is_tensor(uniform_fraction)
+               else min(max(float(uniform_fraction), 0.), 1.)) if stochastic else 0.
     for i, name in enumerate(OPERATIONS):
         logits = selector + means[name] * basis
         edit_mask = (bins > 0.).to(logits)
@@ -54,8 +58,12 @@ def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
                                  if sigma > 0. else fine_lp*0.)
                 broad_lp = logits.sum()*0.-math.log(len(bins)) + torch.where(
                     bins[index] > 0., broad_fine_lp, broad_fine_lp*0.)
-                lp = (broad_lp if epsilon == 1. else torch.logaddexp(
-                    lp + math.log1p(-epsilon), broad_lp + math.log(epsilon)))
+                if epsilon == 1.:
+                    lp = broad_lp
+                else:
+                    log_policy = torch.log1p(-epsilon) if torch.is_tensor(epsilon) else math.log1p(-epsilon)
+                    log_broad = epsilon.log() if torch.is_tensor(epsilon) else math.log(epsilon)
+                    lp = torch.logaddexp(lp + log_policy, broad_lp + log_broad)
         else:
             index = torch.argmax(logits)
             sample = means[name]
@@ -71,18 +79,18 @@ def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
                 temperature=temperature if stochastic else 0., stochastic=stochastic)
 
 
-def sample_where_order(logits, phase, training):
+def sample_where_order(logits, phase, training, temperature_override=None):
     """Gumbel top-k gives a Plackett-Luce permutation on the legal pool."""
     valid = torch.nonzero(torch.isfinite(logits), as_tuple=False).reshape(-1)
     score = logits.index_select(0, valid)
     if training and phase > 0.:
-        temperature = max(float(phase), .05)
+        temperature = temperature_override if temperature_override is not None else max(float(phase), .05)
         uniform = torch.rand_like(score).clamp_(1e-7, 1. - 1e-7)
         score = score - temperature * torch.log(-torch.log(uniform))
     return valid[torch.argsort(score, descending=True)]
 
 
-def where_prefix_log_prob(logits, order, attempted, phase, training):
+def where_prefix_log_prob(logits, order, attempted, phase, training, temperature_override=None):
     """Exact log probability of the attempted prefix, including rejections.
 
     Conflict resolution is a deterministic function of sampled permutations.
@@ -91,7 +99,8 @@ def where_prefix_log_prob(logits, order, attempted, phase, training):
     """
     if not training or phase <= 0. or attempted <= 0:
         return logits[torch.isfinite(logits)].sum() * 0.
-    weights = logits.index_select(0, order) / max(float(phase), .05)
+    temperature = temperature_override if temperature_override is not None else max(float(phase), .05)
+    weights = logits.index_select(0, order) / temperature
     denominators = torch.logcumsumexp(weights.flip(0), dim=0).flip(0)
     return (weights[:attempted] - denominators[:attempted]).sum()
 
@@ -127,6 +136,19 @@ def joint_actual_policy_loss(model, compression, geometry):
         model._den6_online_efficiency_baseline = memory
     previous = memory.get(key)
     bc, bg = ((previous['ema_c'], previous['ema_g']) if previous is not None else (0., 0.))
+    global_bc, global_bg = bc, bg
+    from .autonomous_exploration import learned_exploration_enabled
+    conditional_baseline = learned_exploration_enabled(args)
+    family = str(debug.get('joint_credit_family', 'joint'))
+    family_history = dict(previous.get('credit_family_ema', {})) if previous else {}
+    family_previous = family_history.get(family)
+    if conditional_baseline:
+        # The clean-Where Amount trial and sampled-Where trial have very
+        # different cost distributions. The independent family coin is drawn
+        # before the credited actions: its own past EMA is a valid baseline,
+        # and avoids mixing expensive Where trials into Amount advantages.
+        bc, bg = ((family_previous['c'], family_previous['g'])
+                  if family_previous is not None else (0., 0.))
     scale = max(float(getattr(args, 'heuristic_guidance_online_policy_backward_scale', 1.)), 1.)
     policy_weight = max(float(getattr(args, 'heuristic_guidance_online_policy_weight', 1.)), 0.)
     # train.py's pre-existing backward-only scale is canceled exactly once.
@@ -146,8 +168,13 @@ def joint_actual_policy_loss(model, compression, geometry):
             efficiency = -float(getattr(args, 'heuristic_guidance_online_efficiency_policy_weight', .25)) * advantage * lp / scale
     alpha = float(getattr(args, 'heuristic_guidance_online_reward_ema', .1))
     memory[key] = dict(compression=float(c), geometry=float(g), operation_ratio=ratio,
-                       ema_c=(1. - alpha) * bc + alpha * float(c) if previous else float(c),
-                       ema_g=(1. - alpha) * bg + alpha * float(penalty) if previous else float(penalty))
+                       ema_c=(1. - alpha) * global_bc + alpha * float(c) if previous else float(c),
+                       ema_g=(1. - alpha) * global_bg + alpha * float(penalty) if previous else float(penalty))
+    if conditional_baseline:
+        family_history[family] = dict(
+            c=(1.-alpha)*bc+alpha*float(c) if family_previous else float(c),
+            g=(1.-alpha)*bg+alpha*float(penalty) if family_previous else float(penalty))
+        memory[key]['credit_family_ema'] = family_history
     memory.move_to_end(key)
     while len(memory) > 4096:
         memory.popitem(last=False)
@@ -182,7 +209,9 @@ def joint_actual_policy_loss(model, compression, geometry):
     model.last_discrete_policy_debug = dict(
         joint_policy=True, actual_group_pair_available=False,
         joint_frame_baseline_available=previous is not None,
-        objective_baseline_source='same_frame_ema' if previous else 'zero_control_variate_not_measurement',
+        objective_baseline_source=(('same_frame_credit_family_ema' if family_previous else
+            'zero_family_control_variate_not_measurement') if conditional_baseline else
+            'same_frame_ema' if previous else 'zero_control_variate_not_measurement'),
         objective_baseline_factorized_group='all', current_compression_value=float(c),
         current_geometry_value=float(g), actor_rd_target=float(rd),
         efficiency_guard_passed=guarded, efficiency_operation_ratio=ratio,
@@ -225,6 +254,20 @@ def clip_joint_gradients(model, max_norm):
     total_before = math.sqrt(sum(_host_scalars([
         p.grad.detach().double().square().sum() for p in parameters])))
     seen, groups = set(), {}
+    from .autonomous_exploration import exploration_parameter
+    exploration = exploration_parameter(model)
+    exploration_report = None
+    if exploration is not None and exploration.grad is not None:
+        # These five coordinates control different sampling distributions.
+        # Bound each scalar independently so a long Where prefix cannot
+        # suppress the Native/Fine scale updates. No gradient is amplified.
+        seen.add(id(exploration))
+        control_bound = limit if limit > 0. else float(max_norm)
+        control_before = exploration.grad.detach().clone()
+        if control_bound > 0.:
+            exploration.grad.clamp_(min=-control_bound, max=control_bound)
+        exploration_report = dict(before=control_before.cpu().tolist(),
+            after=exploration.grad.detach().cpu().tolist(), bound_per_coordinate=control_bound)
     for role, names in roles.items():
         params = []
         for name in names:
@@ -250,7 +293,8 @@ def clip_joint_gradients(model, max_norm):
     after_values = iter(_host_scalars([
         p.grad.detach().double().square().sum()
         for _, params, _, _ in measurements for p in params]))
-    report, applied = {}, False
+    report, applied = {}, bool(exploration_report and
+        exploration_report['before'] != exploration_report['after'])
     for (role, params, bound, _), before in zip(measurements, before_values):
         after = math.sqrt(sum(next(after_values) for _ in params))
         report[role] = dict(before=before, after=after, bound=bound)
@@ -259,4 +303,5 @@ def clip_joint_gradients(model, max_norm):
                 train_grad_clip_parameter_count=len(parameters),
                 train_grad_clip_applied=applied,
                 train_grad_total_norm_before_clip=total_before,
-                autonomous_gradient_groups=report)
+                autonomous_gradient_groups=report,
+                autonomous_exploration_clip=exploration_report)

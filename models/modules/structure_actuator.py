@@ -334,6 +334,8 @@ class StructureRepairActuator(nn.Module):
             # direction is credited once for the COMPLETE measured plan.
             self.den6_candidate_actor.register_parameter(
                 'native_context_preference', nn.Parameter(torch.zeros(())))
+        from ..utils.training.autonomous_exploration import install_learned_exploration
+        install_learned_exploration(self.den6_candidate_actor, self.args)
         self.den6_candidate_critic = nn.Sequential(
             nn.Linear(7, actor_hidden),
             nn.SiLU(inplace=True),
@@ -4885,6 +4887,12 @@ class StructureRepairActuator(nn.Module):
             annealed_phase=annealed_phase,
         )
         scheduled_exploration_multiplier = float(exploration_multiplier)
+        from ..utils.training.autonomous_exploration import exploration_controls
+        joint_search_controls = exploration_controls(self.den6_candidate_actor, self.args) if autonomous else None
+        if joint_search_controls is not None:
+            # The sampling distribution learns its own uncertainty. The
+            # legacy Episode envelope must not silently disable its credit.
+            scheduled_exploration_multiplier = exploration_multiplier = float(module_is_training)
         post_window_exploration = False
         post_window_learning_need = 0.0
         # The first 25% remains the broad exploration envelope.  Afterwards,
@@ -5426,8 +5434,10 @@ class StructureRepairActuator(nn.Module):
                 gate_logits_den6 / float(gate_logit_scale), bin_tensor, maximum_per_operation,
                 float(scheduled_exploration_multiplier), self.training,
                 float(getattr(self.args, 'sparsepcgc_amount_exploration_log_sigma', .30)),
-                uniform_fraction=float(getattr(self.args, 'test_route_amount_uniform_fraction', .0))
-                *float(scheduled_exploration_multiplier))
+                uniform_fraction=(joint_search_controls['uniform_fraction'] if joint_search_controls is not None else
+                    float(getattr(self.args, 'test_route_amount_uniform_fraction', .0))*float(scheduled_exploration_multiplier)),
+                temperature_override=joint_search_controls['amount_temperature'] if joint_search_controls is not None else None,
+                fine_std_override=joint_search_controls['fine_std'] if joint_search_controls is not None else None)
             autonomous_noop_recovery = False
             if (self.training and scheduled_exploration_multiplier <= 0.
                     and all(float(v.detach().cpu()) == 0. for v in joint_amount['ratios'].values())
@@ -5754,8 +5764,10 @@ class StructureRepairActuator(nn.Module):
             # time. Bad randomized locations must not teach Amount=no-op.
             clean_amount_trial = bool(torch.rand((), device=native_preference.device) < .5)
             if not clean_amount_trial:
-                sigma = max(float(getattr(self.args, 'test_route_structured_where_noise', 4.))
-                            *float(scheduled_exploration_multiplier), 1e-6)
+                sigma = (joint_search_controls['native_std'] if joint_search_controls is not None else
+                    max(float(getattr(self.args, 'test_route_structured_where_noise', 4.))
+                        *float(scheduled_exploration_multiplier), 1e-6))
+                sigma = torch.as_tensor(sigma, device=native_preference.device).clamp_min(1e-6)
                 distribution = torch.distributions.Normal(native_preference, sigma)
                 native_sample = distribution.sample()
                 native_sample_lp = distribution.log_prob(native_sample)
@@ -6783,7 +6795,8 @@ class StructureRepairActuator(nn.Module):
             if autonomous:
                 from ..utils.training.autonomous_joint_learning import sample_where_order
                 order_tensor = sample_where_order(policy_logits,
-                    0. if clean_amount_trial else float(scheduled_exploration_multiplier), self.training)
+                    0. if clean_amount_trial else float(scheduled_exploration_multiplier), self.training,
+                    temperature_override=joint_search_controls['where_temperature'] if joint_search_controls is not None else None)
                 ordered_indices[operation] = order_tensor.cpu().tolist()
                 gumbel_scales.append(0. if clean_amount_trial else float(scheduled_exploration_multiplier))
 
@@ -8228,7 +8241,8 @@ class StructureRepairActuator(nn.Module):
                 joint_where_terms[name] = where_prefix_log_prob(
                     combined_logits[name], torch.as_tensor(ordered_indices[name],
                         device=combined_logits[name].device, dtype=torch.long),
-                    joint_attempted_counts[name], 0. if clean_amount_trial else float(scheduled_exploration_multiplier), self.training)
+                    joint_attempted_counts[name], 0. if clean_amount_trial else float(scheduled_exploration_multiplier), self.training,
+                    temperature_override=joint_search_controls['where_temperature'] if joint_search_controls is not None else None)
             joint_amount_lp = torch.stack(tuple(joint_amount['log_probs'].values())).sum()
             joint_where_lp = torch.stack(tuple(joint_where_terms.values())).sum()
             if native_sample_lp is not None and sum(selected_counts.values()) > 0:
@@ -8252,7 +8266,10 @@ class StructureRepairActuator(nn.Module):
                 where_prefix_ids={op:[str(pools[op][i]['candidate_id'])
                     for i in ordered_indices[op][:joint_attempted_counts[op]]] for op in operations})
             debug['autonomous_noop_recovery'] = autonomous_noop_recovery
-            debug['joint_amount_uniform_fraction'] = joint_amount['epsilon']
+            debug['joint_amount_uniform_fraction'] = float(joint_amount['epsilon'])
+            if joint_search_controls is not None:
+                debug['joint_learned_exploration'] = {key:float(value.detach().cpu())
+                    for key,value in joint_search_controls.items()}
             debug['structured_where_coefficients'] = joint_structured_coefficients
             debug['_joint_entropy'] = joint_amount['entropy'] + policy_entropy
             debug['autonomous_joint_policy'] = True
@@ -8274,7 +8291,7 @@ class StructureRepairActuator(nn.Module):
             debug['action_policy_role'] = 'joint_independent_operation_amounts_and_where'
             debug['amount_mode'] = 'joint_per_operation_categorical_plus_continuous'
             debug['amount_bin_index'] = -1  # three independent classes, no single shared class
-            debug['learning_adaptive_exploration'] = False
+            debug['learning_adaptive_exploration'] = joint_search_controls is not None
             debug['joint_where_selection_change_rates'] = {}
             changed_top1 = {}
             for name in operations:

@@ -22,6 +22,9 @@ def measured_plan_replay(debug, previous, compression, geometry, args):
     tau = float(getattr(args, 'cp_tau_geom', 0.))
     best = json.loads(zlib.decompress(previous['best_action'])) if previous and previous.get('best_action') else None
     best_rd = wc*best['compression']+wg*max(best['geometry']-tau, 0.) if best else float('inf')
+    current_rd = wc*float(compression)+wg*max(float(geometry)-tau, 0.)
+    from .autonomous_exploration import learned_exploration_enabled
+    comparative = learned_exploration_enabled(args)
     loss, used, reason = zero, False, 'no_profitable_measurement'
     teacher_available = True
     if best is not None and best_rd < 0. and best['compression'] < 0.:
@@ -63,8 +66,11 @@ def measured_plan_replay(debug, previous, compression, geometry, args):
             where = torch.stack(where_terms).mean() if where_terms else zero
             # A bounded measured RD advantage over no-op is an importance
             # weight for self-imitation, not a multiplier for zero gradients.
-            loss = min(-best_rd, 1.)*(amount+where)
-            used, reason = True, 'same_gt_codec_measured_profitable_joint_plan'
+            advantage = current_rd-best_rd if comparative else -best_rd
+            loss = min(max(advantage, 0.), 1.)*(amount+where)
+            used = advantage > 0.
+            reason = ('same_gt_codec_measured_profitable_joint_plan' if used
+                      else 'current_measured_rd_not_worse_than_teacher')
         else:
             teacher_available = False
             reason = 'stored_action_not_in_current_candidate_space'
@@ -78,6 +84,7 @@ def measured_plan_replay(debug, previous, compression, geometry, args):
     return loss, replacement, dict(used=used,reason=reason,
         teacher_compression=best['compression'] if best else None,
         teacher_geometry=best['geometry'] if best else None,
+        measured_rd_advantage=current_rd-best_rd if best else None,
         stored_new_profitable_plan=replacement is not None)
 
 
