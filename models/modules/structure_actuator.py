@@ -4745,19 +4745,27 @@ class StructureRepairActuator(nn.Module):
         from ..utils.pointcloud.geometry_octree import is_geometry_octree
         from ..utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
         autonomous = autonomous_search_enabled(self.args)
+        local_neighbourhood = None
         geometry_joint = bool(is_geometry_octree(self.args) and getattr(
             self.args, 'geometry_octree_joint_policy', True))
         if any(not isinstance(pools.get(name), list) or not pools.get(name) for name in operations):
             return None
-        pool_identity_payload = json.dumps({
+        pool_candidate_ids = {
             name: tuple(
                 str(candidate.get("candidate_id", "")) for candidate in pools[name]
             )
             for name in operations
-        }, sort_keys=True, separators=(",", ":"))
+        }
+        pool_identity_payload = json.dumps(pool_candidate_ids, sort_keys=True, separators=(",", ":"))
         candidate_pool_identity_hash = hashlib.sha256(
             pool_identity_payload.encode("utf-8")
         ).hexdigest()
+        if autonomous:
+            from ..utils.training.autonomous_local_search import prepare_neighbourhood
+            if any(not name for names in pool_candidate_ids.values() for name in names):
+                raise ValueError('Autonomous candidates require stable nonempty IDs')
+            local_neighbourhood = prepare_neighbourhood(self.args, exact,
+                getattr(self, '_autonomous_joint_memory', None), self.training, pool_candidate_ids)
 
         point_count = int(voxel_coords.shape[-1])
         if point_count <= 0:
@@ -4889,6 +4897,9 @@ class StructureRepairActuator(nn.Module):
         scheduled_exploration_multiplier = float(exploration_multiplier)
         from ..utils.training.autonomous_exploration import exploration_controls
         joint_search_controls = exploration_controls(self.den6_candidate_actor, self.args) if autonomous else None
+        if joint_search_controls is not None:
+            from ..utils.training.autonomous_local_search import neighbourhood_controls
+            joint_search_controls = neighbourhood_controls(joint_search_controls, local_neighbourhood)
         if joint_search_controls is not None:
             # The sampling distribution learns its own uncertainty. The
             # legacy Episode envelope must not silently disable its credit.
@@ -5437,7 +5448,8 @@ class StructureRepairActuator(nn.Module):
                 uniform_fraction=(joint_search_controls['uniform_fraction'] if joint_search_controls is not None else
                     float(getattr(self.args, 'test_route_amount_uniform_fraction', .0))*float(scheduled_exploration_multiplier)),
                 temperature_override=joint_search_controls['amount_temperature'] if joint_search_controls is not None else None,
-                fine_std_override=joint_search_controls['fine_std'] if joint_search_controls is not None else None)
+                fine_std_override=joint_search_controls['fine_std'] if joint_search_controls is not None else None,
+                neighbourhood=local_neighbourhood)
             autonomous_noop_recovery = False
             if (self.training and scheduled_exploration_multiplier <= 0.
                     and all(float(v.detach().cpu()) == 0. for v in joint_amount['ratios'].values())
@@ -6335,6 +6347,10 @@ class StructureRepairActuator(nn.Module):
                                 candidate_utility_audit[operation]["pairwise_accuracy"] = float(
                                     predicted_gap.gt(0.0).float().mean().cpu()
                                 )
+            if autonomous:
+                from ..utils.training.autonomous_local_search import where_neighbourhood
+                policy_logits = where_neighbourhood(policy_logits, operation, local_neighbourhood,
+                    joint_search_controls['where_temperature'] if joint_search_controls is not None else 1.)
             combined_logits[operation] = policy_logits
             valid_for_top1 = torch.isfinite(policy_logits)
             heuristic_for_top1 = heuristic_term.masked_fill(
@@ -8264,7 +8280,7 @@ class StructureRepairActuator(nn.Module):
             debug['_joint_amount_means'] = joint_amount['means']
             debug['_joint_replay_logits'] = {op:joint_replay_logits.get(op,combined_logits[op]).masked_fill(
                 ~torch.isfinite(combined_logits[op]),float('-inf')) for op in operations}
-            debug['_joint_candidate_ids'] = {op:tuple(str(c['candidate_id']) for c in pools[op]) for op in operations}
+            debug['_joint_candidate_ids'] = pool_candidate_ids
             debug['_joint_action'] = dict(
                 amount_indices={op:int(v.detach().cpu()) for op,v in joint_amount['indices'].items()},
                 fine_samples={op:float(v.detach().cpu()) for op,v in joint_amount['samples'].items()},
@@ -8278,11 +8294,9 @@ class StructureRepairActuator(nn.Module):
             debug['structured_where_coefficients'] = joint_structured_coefficients
             debug['_joint_entropy'] = joint_amount['entropy'] + policy_entropy
             debug['autonomous_joint_policy'] = True
-            debug['autonomous_input_sha256'] = str(exact.get('input_sha256', exact.get('input_voxel_hash', '')))
-            debug['autonomous_codec_setting'] = json.dumps(dict({key: exact.get(key) for key in (
-                'setting_id', 'codec_mode', 'checkpoint_identifier', 'voxel_size', 'pos_quantscale',
-                'scale_ae', 'scale_sr', 'scale_m')},
-                    native_context_file=str(getattr(self.args,'_autonomous_native_context_path','')).rsplit('/',1)[-1]), sort_keys=True)
+            from ..utils.training.autonomous_local_search import policy_identity, neighbourhood_audit
+            debug.update(policy_identity(self.args, exact))
+            debug['autonomous_local_search'] = neighbourhood_audit(local_neighbourhood)
             debug['joint_amount_bins_by_operation'] = {
                 name: float(bin_tensor[index].detach().cpu())
                 for name, index in joint_amount['indices'].items()}

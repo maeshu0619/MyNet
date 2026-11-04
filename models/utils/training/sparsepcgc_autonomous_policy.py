@@ -31,6 +31,11 @@ def configure_autonomous_search(args):
         return args
     if not autonomous_search_enabled(args):
         raise ValueError('test_route requires SparsePCGC ana_den6_online')
+    if bool(getattr(args, 'test_route_phased_exploration', False)):
+        if int(getattr(args, 'test_route_broad_search_episodes', 60)) < 0:
+            raise ValueError('test_route_broad_search_episodes must be nonnegative')
+        if int(getattr(args, 'test_route_local_search_episodes', 120)) <= 0:
+            raise ValueError('test_route_local_search_episodes must be positive')
     for name in ('test_route_amount_uniform_fraction', 'test_route_noop_recovery_probability'):
         value = float(getattr(args, name, 0.))
         if not math.isfinite(value) or not 0. <= value <= 1.:
@@ -94,6 +99,12 @@ def autonomous_pool_phase(args):
     # can finish before expanding coverage to another set of source voxels.
     episode_steps = max(int(getattr(args, '_fixed_episode_steps', 100)), 1)
     step = max(int(getattr(args, '_global_train_step', 0)), 0)
+    from .autonomous_local_search import phased_search_enabled
+    if phased_search_enabled(args):
+        # Keep the final broad-search reservoir: rotating it later would
+        # invalidate self-discovered prefixes during local refinement.
+        step = min(step, max(int(getattr(args, 'test_route_broad_search_episodes', 60))
+                             * episode_steps - 1, 0))
     if str(getattr(args, 'repair_policy_exploration_mode', 'annealed')) == 'annealed':
         total = int(getattr(args, '_exploration_schedule_steps_estimate',
                             getattr(args, '_total_train_steps_estimate', 0)))

@@ -6477,6 +6477,12 @@ class Network(nn.Module):
                 "executable_plan"
             )
 
+        from .utils.training.autonomous_local_search import phased_search_enabled
+        if phased_search_enabled(self.args):
+            # A read-only reference, including restored runtime memory. This
+            # does not duplicate plans or add persistent model parameters.
+            self.actuator._autonomous_joint_memory = getattr(
+                self, '_den6_online_efficiency_baseline', None)
         with saved_tensor_context:
             pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
                 pts_xyz=pts_xyz,

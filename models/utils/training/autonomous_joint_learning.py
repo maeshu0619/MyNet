@@ -4,7 +4,6 @@ Scores are trained from measured COMPLETE plans. A plan's gain is never
 presented as the isolated Actual gain of each selected candidate.
 """
 import math
-import json
 from collections import OrderedDict
 
 import torch
@@ -15,7 +14,7 @@ OPERATIONS = ('Add', 'Prune', 'Adjust')
 
 def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
                          training, fine_sigma=.30, uniform_fraction=0.,
-                         temperature_override=None, fine_std_override=None):
+                         temperature_override=None, fine_std_override=None, neighbourhood=None):
     """Three independent categorical+lognormal actions; no fixed total/share.
 
     The sampled latent action's exact likelihood is used even when a ratio
@@ -38,19 +37,24 @@ def sample_joint_amounts(selector, means, gate_logits, bins, maximum, phase,
         logits = selector + means[name] * basis
         edit_mask = (bins > 0.).to(logits)
         logits = logits + gate_logits[i] * edit_mask
-        log_probs_all = F.log_softmax(logits / temperature if stochastic else logits, dim=0)
+        behaviour_logits, behaviour_mean = logits, means[name]
+        if stochastic and neighbourhood and neighbourhood['active']:
+            from .autonomous_local_search import amount_neighbourhood
+            behaviour_logits, behaviour_mean = amount_neighbourhood(
+                logits, means[name], bins, name, neighbourhood, temperature)
+        log_probs_all = F.log_softmax(behaviour_logits / temperature if stochastic else logits, dim=0)
         if stochastic:
             uniform = torch.rand_like(logits).clamp_(1e-7, 1. - 1e-7)
-            index = torch.argmax(logits - temperature * torch.log(-torch.log(uniform)))
+            index = torch.argmax(behaviour_logits - temperature * torch.log(-torch.log(uniform)))
             broad = epsilon > 0. and bool(torch.rand((), device=logits.device) < epsilon)
             if broad:
                 index = torch.randint(len(bins), (), device=logits.device)
-            sample_mean = means[name] * 0. if broad and sigma > 0. else means[name]
+            sample_mean = behaviour_mean * 0. if broad and sigma > 0. else behaviour_mean
             sample = (sample_mean + sigma * torch.randn_like(means[name])
                       if sigma > 0. else means[name])
             # Evaluate the detached sampled action, not a reparameterized
             # sample whose mean derivative would cancel the score function.
-            fine_lp = (torch.distributions.Normal(means[name], sigma).log_prob(sample.detach())
+            fine_lp = (torch.distributions.Normal(behaviour_mean, sigma).log_prob(sample.detach())
                        if sigma > 0. else means[name] * 0.)
             lp = log_probs_all[index] + torch.where(bins[index] > 0., fine_lp, fine_lp * 0.)
             if epsilon > 0.:
@@ -122,14 +126,8 @@ def joint_actual_policy_loss(model, compression, geometry):
         raise ValueError('Non-finite measured joint Actual/geometry target')
     penalty = torch.relu(g - float(getattr(args, 'cp_tau_geom', 0.)))
     wc, wg = float(getattr(args, 'w_com', 1.)), float(getattr(args, 'cp_lambda_geom', 1.))
-    key = '|'.join(str(v) for v in (
-        'autonomous_joint_v2', getattr(args, '_current_input_file', ''),
-        debug['autonomous_input_sha256'], debug.get('autonomous_codec_setting', ''),
-        json.dumps({k: v for k, v in vars(args).items() if k.startswith(('geometry_', 'geom_'))
-                    or k in ('loss_type', 'discrete_loss_mode', 'cp_tau_geom')}, sort_keys=True, default=str),
-        getattr(args, 'sparsepcgc_scale_ae', 0),
-        getattr(args, 'sparsepcgc_scale_sr', 2), getattr(args, 'sparsepcgc_scale_m', 8),
-        getattr(args, 'sparsepcgc_voxel_size', 1.), getattr(args, 'sparsepcgc_pos_quantscale', 1)))
+    from .autonomous_local_search import policy_memory_key
+    key = policy_memory_key(args, debug)
     memory = getattr(model, '_den6_online_efficiency_baseline', None)
     if memory is None:
         memory = OrderedDict()

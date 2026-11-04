@@ -183,6 +183,12 @@ def train(model, args, loss, writer, plot, notifier=None):
             writer.write("AutonomousExploration: mode=actual_learned, "
                 "episode_noise_cutoff=disabled, initial_broad_search=preserved, "
                 "eval=greedy, new_actual_policy_credit=all_training_steps")
+            if bool(getattr(args, 'test_route_phased_exploration', False)):
+                writer.write("AutonomousLocalSearch: "
+                    f"broad_episodes={args.test_route_broad_search_episodes}, "
+                    f"refinement_episodes={args.test_route_local_search_episodes}, "
+                    "reference=past_same_frame_codec_actual_plan, "
+                    "missing_reference=keep_broad, residual_exploration=nonzero, eval=greedy")
     elif str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
         writer.write(
             "TrainingPerformanceContract: heuristic_role=candidate_pool_and_safety_prior, "
