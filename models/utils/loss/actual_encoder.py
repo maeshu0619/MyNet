@@ -656,6 +656,9 @@ class _SparsePCGCActualEncoder:
         return float("inf")
 
     def _wait_for_host_capacity(self, reason):
+        from .host_memory_admission import host_recovery_enabled, wait_for_host_capacity
+        if host_recovery_enabled(self.args):
+            return wait_for_host_capacity(self, reason)
         configured_minimum_mb = max(int(getattr(
             self.args, "sparsepcgc_host_min_available_mb", 8192
         )), 0)
@@ -923,7 +926,7 @@ class _SparsePCGCActualEncoder:
         self._proc.stdin.write(json.dumps(request, sort_keys=True) + "\n")
         self._proc.stdin.flush()
         pool_prefetch = None
-        if bool(getattr(self.args, 'test_route', False)):
+        if request.get('command', 'encode') == 'encode' and bool(getattr(self.args, 'test_route', False)):
             from ..training.sparsepcgc_autonomous_policy import autonomous_search_enabled
             if autonomous_search_enabled(self.args):
                 from ..pointcloud.autonomous_proposals import prefetch_autonomous_pool

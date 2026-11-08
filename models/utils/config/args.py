@@ -31,8 +31,8 @@ test_route = False
 
 model_name = "best_loss_joint"
 
-dataname = "8i"
-# dataname = "MVUB"
+# dataname = "8i"
+dataname = "MVUB"
 # dataname = "UVG"
 
 dataset_name = "longdress"
@@ -2133,7 +2133,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_worker_cuda_cleanup_interval', default=1, type=int, help='CUDA teacherのallocator cacheを完全解放するrequest間隔。既定値1は各request終了時に解放し、符号化前の重複解放だけを省く（0でworker終了まで完全解放なし）')
     parser.add_argument('--sparsepcgc_gpu_min_free_mb', default=4096, type=int, help='CUDA teacherへrequestを送るために必要なGPU全体の空き容量MB。競合時は値を変えず待機する')
     parser.add_argument('--sparsepcgc_host_min_available_mb', default=8192, type=int, help='SparsePCGC workerの起動・encode前に必要なホストMemAvailable(MB)。共有hostのOOM killを避ける')
-    parser.add_argument('--sparsepcgc_host_wait_timeout', default=600.0, type=float, help='SparsePCGC workerのホスト空きメモリ待機上限秒')
+    parser.add_argument('--sparsepcgc_host_wait_timeout', default=600.0, type=float, help='SparsePCGC workerのホスト空きメモリ待機上限秒。True専用のpressure recovery有効時は継続待機の通知・再解放間隔')
+    parser.add_argument('--sparsepcgc_host_pressure_recovery', default=True, type=str2bool, help='SparsePCGC test_route True専用：RAM不足時は自processの不要メモリを解放し、同じStep・閾値を維持して回復まで待つ。Falseは従来のtimeout例外')
     parser.add_argument(
         '--sparsepcgc_auto_cpu_fallback',
         default=True,
@@ -5776,6 +5777,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_host_wait_timeout = max(float(getattr(
         args, "sparsepcgc_host_wait_timeout", 600.0
     )), 0.0)
+    args.sparsepcgc_host_pressure_recovery = bool(getattr(
+        args, 'sparsepcgc_host_pressure_recovery', True
+    ))
     args.sparsepcgc_auto_cpu_fallback = bool(
         getattr(args, "sparsepcgc_auto_cpu_fallback", True)
     )

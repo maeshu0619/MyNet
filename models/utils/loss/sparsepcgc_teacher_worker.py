@@ -113,6 +113,30 @@ def _recover_cuda_after_oom() -> None:
         pass
 
 
+def _release_idle_runtime_memory(encoder) -> dict[str, Any]:
+    """Release request-local/allocator garbage, retaining codec model weights."""
+    def rss_mb():
+        try:
+            with open('/proc/self/status', encoding='utf-8') as stream:
+                for line in stream:
+                    if line.startswith('VmRSS:'):
+                        return float(line.split()[1]) / 1024.
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+
+    before = rss_mb()
+    cleanup = getattr(encoder, '_full_cleanup_runtime_cache', None)
+    if not callable(cleanup):
+        cleanup = getattr(encoder, '_cleanup_runtime_cache', None)
+    if callable(cleanup):
+        cleanup()
+    gc.collect()
+    if _LIBC_MALLOC_TRIM is not None:
+        _LIBC_MALLOC_TRIM(0)
+    return dict(rss_before_mb=before, rss_after_mb=rss_mb())
+
+
 def _configure_persistent_cuda_allocator_cache(encoder, cleanup_interval: int) -> bool:
     """Reuse allocator blocks while clearing request-local ME coordinates.
 
@@ -386,6 +410,15 @@ def main() -> int:
         if request.get("command") == "shutdown":
             _emit({"status": "bye", "request_id": request_id})
             return 0
+
+        if request.get('command') == 'release_runtime_cache':
+            try:
+                with contextlib.redirect_stdout(sys.stderr):
+                    result = _release_idle_runtime_memory(encoder)
+                _emit(dict(status='ok', request_id=request_id, result=result))
+            except Exception as exc:
+                _emit(dict(status='error', request_id=request_id, message=str(exc)))
+            continue
 
         try:
             input_file = Path(str(request["input_file"])).expanduser().resolve()
