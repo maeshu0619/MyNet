@@ -170,8 +170,11 @@ def main():
     def network(*args, **kwargs):
         model = original_network(*args, **kwargs)
         state['model'] = model
-        model.actuator._build_exact_den6_residual_plan = timed(
-            'plan_selection', model.actuator._build_exact_den6_residual_plan)
+        plan_method = ('build_joint_voxel_edit_plan'
+                       if hasattr(model.actuator, 'build_joint_voxel_edit_plan')
+                       else '_build_exact_den6_residual_plan')
+        setattr(model.actuator, plan_method, timed(
+            'plan_selection', getattr(model.actuator, plan_method)))
         model.actuator.forward = timed('actuator_forward', model.actuator.forward)
         original_forward = model.forward
 
@@ -243,8 +246,11 @@ def main():
         return obj
 
     training.Loss = loss
-    original_capture = training._capture_den6_policy_only_gradients
-    training._capture_den6_policy_only_gradients = timed('policy_capture', original_capture, 'capture_backward')
+    capture_name = ('capture_joint_policy_gradients'
+                    if hasattr(training, 'capture_joint_policy_gradients')
+                    else '_capture_den6_policy_only_gradients')
+    original_capture = getattr(training, capture_name)
+    setattr(training, capture_name, timed('policy_capture', original_capture, 'capture_backward'))
     original_backward = torch.Tensor.backward
 
     def backward(tensor, *args, **kwargs):

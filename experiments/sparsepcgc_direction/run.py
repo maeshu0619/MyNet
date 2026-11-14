@@ -124,7 +124,9 @@ def main():
                     state.setdefault('amount_raw',{})[op]=dict(min=float(value.min().cpu()),
                         max=float(value.max().cpu()),mean=float(value.mean().cpu()))
                 head.register_forward_hook(amount_observe)
-        original_build=model.actuator._build_exact_den6_residual_plan
+        plan_method = ('build_joint_voxel_edit_plan' if hasattr(model.actuator, 'build_joint_voxel_edit_plan')
+                       else '_build_exact_den6_residual_plan')
+        original_build=getattr(model.actuator, plan_method)
         code=original_build.__func__.__code__
         def build(*a,**kw):
             capture={}
@@ -185,7 +187,7 @@ def main():
                 final_hash=digest(canonical_points(plan['final'])),candidate=candidate_stats,
                 counts=plan['counts'],debug=plan['debug'],plan_q=plan['plan_q']))
             return result
-        model.actuator._build_exact_den6_residual_plan=build
+        setattr(model.actuator, plan_method, build)
         original_forward=model.forward
         if hasattr(model,'point_transformer_feature_adapter'):
             def adapter_observe(module,inputs,output):

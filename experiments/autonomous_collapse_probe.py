@@ -103,7 +103,9 @@ def main():
             model.load_actor_critic_runtime_state_dict(torch.load(str(options.diagnostic_runtime),map_location='cpu'))
         if options.diagnostic_phase is not None:
             model.actuator._exploration_phase = lambda: options.diagnostic_phase
-        build = model.actuator._build_exact_den6_residual_plan
+        plan_method = ('build_joint_voxel_edit_plan' if hasattr(model.actuator, 'build_joint_voxel_edit_plan')
+                       else '_build_exact_den6_residual_plan')
+        build = getattr(model.actuator, plan_method)
         code = build.__func__.__code__
         count = [0]
 
@@ -134,7 +136,7 @@ def main():
                 out/('captured_%03d.pth' % count[0]))
             return result
 
-        model.actuator._build_exact_den6_residual_plan = observed
+        setattr(model.actuator, plan_method, observed)
         forward = model.forward
 
         def observed_forward(*positional, **named):

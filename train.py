@@ -1,4 +1,19 @@
-"""MyNetの訓練エントリポイント。"""
+"""MyNetの訓練を、入力から目的関数・更新・固定検証まで実行する。
+
+1 Stepの読解順序:
+    GT読込 -> Network.forward -> Geometry/Actual評価
+    -> build_compression_primary_lossで L_total を構成
+    -> Actual共同方策loss（表示値0の勾配項）
+    -> decision head勾配の保存 -> 本backward -> 保存勾配の復元
+    -> 役割別clip -> optimizer.step -> ログ
+
+lossの式: models/utils/training/compression_primary_loss.py
+離散共同方策: models/utils/training/joint_voxel_policy.py
+登録moduleの接続: models/network.py
+
+ログ列・CLI・checkpoint内の旧キーは互換契約として維持する。
+L_totalの表示値、Actual圧縮率、Surrogate予測は別の数値である。
+"""
 
 from models.utils.training.train_runtime import *
 from models.utils.training.sparsepcgc_actual_credit import (
@@ -290,7 +305,7 @@ def train(model, args, loss, writer, plot, notifier=None):
         den6_prefetch_lookahead = 0
     if seq_datasets and den6_prefetch_lookahead > 0 and not k_all_actual_enabled:
         first_files = list(getattr(seq_datasets[0][1], "files", ()))[:den6_prefetch_lookahead]
-        prefetch_state = prefetch_ana_den6_online_guidance(args, first_files)
+        prefetch_state = prefetch_voxel_candidate_guidance(args, first_files)
         if int(prefetch_state.get("submitted", 0)) > 0:
             writer.write(
                 "Den6OnlinePrefetch: "
@@ -620,7 +635,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 f"signature={getattr(active_dataset, 'active_window_signature', '')}"
             )
             if den6_prefetch_lookahead > 0:
-                prefetch_ana_den6_online_guidance(args, active_files[:den6_prefetch_lookahead])
+                prefetch_voxel_candidate_guidance(args, active_files[:den6_prefetch_lookahead])
             epoch_has_optimizer_step = False
             _record_memory(
                 "epoch_loader_ready",
@@ -636,7 +651,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if den6_prefetch_lookahead > 0:
                     next_prefetch_index = step + den6_prefetch_lookahead
                     if next_prefetch_index < len(active_files):
-                        prefetch_ana_den6_online_guidance(
+                        prefetch_voxel_candidate_guidance(
                             args, (active_files[next_prefetch_index],)
                         )
                 optimizer.zero_grad(set_to_none=True) # 前Stepの勾配を必ず消し、条件分岐による勾配蓄積を防ぐ
@@ -1725,14 +1740,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                 """属性/方策/操作損失を合成"""
                 legacy_L_total = ( legacy_L_downstream + stage_factors["attr"] * args.w_attr * L_attr + stage_factors["policy"] * args.w_policy * L_policy + stage_factors["repair"] * args.w_actuator * L_actuator)
 
-                """損失の合成"""
-                L = legacy_L_total
+                # ---- 目的関数: L_total（Forward表示）と更新用の勾配 ----
+                # legacy初期式の後、compression_primaryなら下のbuilderで置き換える。
+                # Actual方策のscore-function lossは後段でgradient-onlyとして追加する。
+                L_total = legacy_L_total
                 L_downstream = legacy_L_downstream
-                L_discrete_policy = L.new_zeros(())
+                L_discrete_policy = L_total.new_zeros(())
                 cp_debug = {} # compression primaryモード用のdebug情報を空辞書で初期化
                 compression_support_anchor = L_com_objective
                 if compression_primary_mode and not network_only_full_cloud: # legacy圧縮優先経路
-                    L, L_com_objective, cp_debug = build_compression_primary_loss(
+                    L_total, L_com_objective, cp_debug = build_compression_primary_loss(
                         args,
                         terms=terms,
                         L_com=L_com,
@@ -2105,7 +2122,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # そのため、実際に backward される L にも同じ差分を足す。
                     # 差分のforward値は0なので、損失値そのものは変わらない。
                     if torch.is_tensor(compression_extra_grad_delta) and compression_extra_grad_delta.requires_grad:
-                        L = L + compression_extra_grad_delta
+                        L_total = L_total + compression_extra_grad_delta
 
                     prune_where_direct_weight = float(
                         getattr(args, "compression_soft_prune_logit_direct_grad_weight", 0.01)
@@ -2168,7 +2185,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             # そのため、drop_headへ返すgradient-only項をL_totalにも明示的に足す。
                             # forward値は0なので、損失値そのものは変わらない。
                             # ============================================================
-                            L = L + prune_where_grad_delta
+                            L_total = L_total + prune_where_grad_delta
 
                             if isinstance(cp_debug, dict):
                                 cp_debug["prune_where_direct_anchor_used"] = True
@@ -2296,7 +2313,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                             # 実際にbackwardされるLにも足す。
                             # forward値は0なので、損失値は変わらない。
-                            L = L + prune_amount_grad_delta
+                            L_total = L_total + prune_amount_grad_delta
 
                             if isinstance(cp_debug, dict):
                                 cp_debug["prune_amount_anchor_used"] = True
@@ -2358,7 +2375,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                             # 実際にbackwardされるLにも足す。
                             # forward値は0なので、損失値は変わらない。
-                            L = L + prune_amount_bias_delta
+                            L_total = L_total + prune_amount_bias_delta
 
                             if isinstance(cp_debug, dict):
                                 cp_debug["prune_amount_bias_anchor_used"] = True
@@ -2373,7 +2390,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     tail_support_raw = tail_attr_block + tail_policy_block + tail_actuator_block
                     tail_balance = _compression_primary_support_balance(
                         args,
-                        compression_support_anchor if torch.is_tensor(compression_support_anchor) else L,
+                        compression_support_anchor if torch.is_tensor(compression_support_anchor) else L_total,
                         tail_support_raw,
                         enabled=uses_actual_total_bit_objective(args),
                         target_ratio_name="compression_primary_tail_target_ratio",
@@ -2400,7 +2417,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     )
                     total_support_balance = _compression_primary_remaining_support_balance(
                         args,
-                        compression_support_anchor if torch.is_tensor(compression_support_anchor) else L,
+                        compression_support_anchor if torch.is_tensor(compression_support_anchor) else L_total,
                         abs(float(cp_debug.get("cp_aux_block_scaled", 0.0)))
                         if isinstance(cp_debug, dict) else 0.0,
                         tail_support_scale * tail_support_raw,
@@ -2408,7 +2425,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     )
                     tail_support_scale *= float(total_support_balance["scale"])
                     tail_support_scaled = tail_support_scale * tail_support_raw
-                    L = L + tail_support_scaled
+                    L_total = L_total + tail_support_scaled
 
                     if isinstance(cp_debug, dict):
                         cp_debug["cp_support_tail_attr_raw"] = case_float(tail_attr_block, float("nan"))
@@ -2474,7 +2491,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if abs(main_block_value) + 1e-12 >= abs(support_total_scaled)
                             else "support"
                         )
-                    L_discrete_policy = L.new_zeros(())
+                    L_discrete_policy = L_total.new_zeros(())
                 elif (
                     compression_primary_mode
                     and heuristic_mode == "single_plan_student"
@@ -2482,9 +2499,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                 ):
                     # Cache-only StageではActual/Surrogate forward値を要求しない。
                     # 後段で加えるTeacher蒸留lossだけがStudentを更新する。
-                    L = L_geom.new_zeros(())
-                    L_downstream = L
-                    L_discrete_policy = L
+                    L_total = L_geom.new_zeros(())
+                    L_downstream = L_total
+                    L_discrete_policy = L_total
                     L_attr = L_attr.detach()
                     L_policy = L_policy.detach()
                     L_actuator = L_actuator.detach()
@@ -2535,12 +2552,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 # 微分可能proxyが正例として押し戻さないようにする。
                                 if selected_actual_percent >= 0.0:
                                     compression_weight = 0.0
-                    L = (
+                    L_total = (
                         geometry_weight * L_geom
                         + stage_factors["com"] * compression_weight * L_com_objective
                     )
                     L_downstream = L_com_objective
-                    L_discrete_policy = L.new_zeros(())
+                    L_discrete_policy = L_total.new_zeros(())
                     L_attr = L_attr.detach()
                     L_policy = L_policy.detach()
                     L_actuator = L_actuator.detach()
@@ -2555,7 +2572,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     policy_loss_fn = getattr(model, "discrete_policy_loss", None) # モデルが保持しているHard離散方策用の損失関数を取得する
                     if callable(policy_loss_fn):
                         L_discrete_policy = policy_loss_fn(L_downstream.detach())
-                        L = L + L_discrete_policy
+                        L_total = L_total + L_discrete_policy
 
                 # ana_den6 onlineではcompression_primaryでもPolicy Gradientを必ず加える。
                 # actual codecの結果は微分不能なので、Where/Amount/Actionのsample log-probへ
@@ -2650,7 +2667,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             # path (Surrogate/STE).  It is kept separate from
                             # the score-function Actual source above.
                             source_losses["surrogate_compression"] = L_downstream
-                            source_grad_probe = _probe_den6_policy_source_gradients(
+                            source_grad_probe = probe_voxel_policy_source_gradients(
                                 model, source_losses
                             )
                             for probe_name, probe_value in source_grad_probe.items():
@@ -2668,7 +2685,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         # pathwise勾配は対応しない。Actual score-function項だけを
                         # decision head用に保存し、joint backward後に復元する。
                         den6_policy_only_grad_snapshot = (
-                            _capture_den6_policy_only_gradients(
+                            capture_joint_policy_gradients(
                                 online_policy_loss, model
                             )
                         )
@@ -2744,9 +2761,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     loss.last_compression_debug = latest_compression_debug
                     # hard分岐で既に足している場合の二重加算を避ける。
                     if _discrete_loss_mode_value(args) == "hard" and not compression_primary_mode:
-                        L = L - L_discrete_policy
+                        L_total = L_total - L_discrete_policy
                     L_discrete_policy = online_policy_loss
-                    L = L + L_discrete_policy
+                    L_total = L_total + L_discrete_policy
                     if heuristic_mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
                         plan_gain_loss_fn = getattr(
                             base_model_for_policy, "network_only_plan_gain_loss", None
@@ -2756,7 +2773,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         L_plan_gain = plan_gain_loss_fn(online_policy_objective)
                         if not torch.is_tensor(L_plan_gain) or not L_plan_gain.requires_grad:
                             raise RuntimeError("network-only plan gain loss has no gradient")
-                        L = L + L_plan_gain
+                        L_total = L_total + L_plan_gain
                         compression_debug_terms["network_only_plan_gain_loss"] = float(
                             L_plan_gain.detach().cpu()
                         )
@@ -2827,7 +2844,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             weighted_offline_total = offline_losses["total"] * offline_weight
                             if not weighted_offline_total.requires_grad:
                                 raise RuntimeError("K proposal offline set loss has no gradient")
-                            L = L + weighted_offline_total
+                            L_total = L_total + weighted_offline_total
                             compression_debug_terms.update({
                                 "k_proposal_offline_state_id": offline_state_id,
                                 "k_proposal_offline_loss": float(weighted_offline_total.detach().cpu()),
@@ -2943,7 +2960,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         single_distill = distill_fn(teacher_record)
                         if not single_distill.requires_grad:
                             raise RuntimeError("Single-Plan蒸留lossの勾配が切れている")
-                        L = L + single_distill
+                        L_total = L_total + single_distill
                         compression_debug_terms.update({
                             "single_plan_teacher_state_id": teacher_state_id,
                             "single_plan_teacher_plan_key": str(teacher_record["plan_key"]),
@@ -3173,7 +3190,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             bootstrap_loss = bootstrap_losses["total"] * bootstrap_weight
                             if not bootstrap_loss.requires_grad:
                                 raise RuntimeError("163候補bootstrap lossの勾配が切れている")
-                            L = L + bootstrap_loss
+                            L_total = L_total + bootstrap_loss
                             compression_debug_terms.update({
                                 "k_all_actual_offline_bootstrap_active": True,
                                 "k_all_actual_offline_bootstrap_state_id": bootstrap_state_id,
@@ -3235,7 +3252,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     )
                     if not torch.is_tensor(L_k_all_actual) or not L_k_all_actual.requires_grad:
                         raise RuntimeError("K all-Actual policy lossの勾配が切れている")
-                    L = L + L_k_all_actual
+                    L_total = L_total + L_k_all_actual
                     L_discrete_policy = L_k_all_actual
                     k_actual_debug = dict(
                         getattr(base_model_for_policy, "last_k_all_actual_debug", {}) or {}
@@ -3280,7 +3297,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     }
 
                 if full_cloud_amount_mode and torch.is_tensor(L_full_cloud_amount):
-                    L = L + L_full_cloud_amount
+                    L_total = L_total + L_full_cloud_amount
                     if isinstance(full_cloud_amount_debug, dict):
                         full_cloud_amount_debug["full_cloud_amount_loss_added_to_total"] = True
                         full_cloud_amount_debug["full_cloud_amount_loss_requires_grad"] = bool(
@@ -3984,7 +4001,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             comp_debug,
                             structure_debug,
                             train_edit_stats,
-                            L=L,
+                            L=L_total,
                             L_geom=L_geom,
                             L_com=L_com,
                             L_com_objective=L_com_objective,
@@ -3998,7 +4015,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             step_completed=None,
                         )
                     else:
-                        log_step_loss( writer, step, num_steps, L, L_geom, L_com, L_com_objective, L_attr, L_policy, L_actuator, Lp_out, La_fit, La_rep, L_discrete_policy, loss_bit, loss_single, loss_nodes)
+                        log_step_loss( writer, step, num_steps, L_total, L_geom, L_com, L_com_objective, L_attr, L_policy, L_actuator, Lp_out, La_fit, La_rep, L_discrete_policy, loss_bit, loss_single, loss_nodes)
                         if cp_debug and bool(getattr(args, "cp_log_grad_terms", True)):
                             log_compression_primary_terms(writer, step, num_steps, cp_debug)
                         log_compression_stats( writer, step, num_steps, comp_debug)
@@ -4016,7 +4033,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """勾配確認"""
                 step_grad_loss_items = [
-                    ("L_total", L),
+                    ("L_total", L_total),
                     ("L_downstream", L_downstream),
                     ("L_geom", L_geom),
                     ("L_com", L_com),
@@ -4173,7 +4190,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     })
                     loss.last_compression_debug = comp_debug
                 step_completed = False # Optimizer更新が成功したかのフラグ
-                total_loss_finite = bool(torch.isfinite(L.detach()).all().item()) and skip_optimizer_reason is None # LがNanなどでないか否かの判定
+                total_loss_finite = bool(torch.isfinite(L_total.detach()).all().item()) and skip_optimizer_reason is None # LがNanなどでないか否かの判定
                 param_update_snapshots = None # 更新前パラメータの記録を見作成で初期化
                 network_only_param_before = None
                 network_only_head_audit_due = bool(
@@ -4241,16 +4258,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                     skip_optimizer_reason = "non_finite_total_loss"
                     comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
                     loss.last_compression_debug = comp_debug
-                    writer.write( f"Skip Optimizing!!! reason=non_finite_total_loss; " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}, L={float(L.detach().float().mean().cpu()) if torch.is_tensor(L) else float('nan'):.6g}") # 非有限Lossの理由と値を同じ行に出す
+                    writer.write( f"Skip Optimizing!!! reason=non_finite_total_loss; " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}, L={float(L_total.detach().float().mean().cpu()) if torch.is_tensor(L_total) else float('nan'):.6g}") # 非有限Lossの理由と値を同じ行に出す
                     writer.write( f"Skipped optimizer step due to non-finite total loss at " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}.")
                 elif amp_scaler_enabled: # AMP用の逆伝播・更新処理へ進む
                     """AMP更新/勾配"""
                     scale_before = float(scaler.get_scale()) # BackWard前のAMP loss caleを取得
                     amp_info["scale_before"] = scale_before # AMP Debug情報に更新前ぉssSacleを保存
-                    scaler.scale(L).backward() # LをAMP用にスケーリングしてから逆伝播
+                    scaler.scale(L_total).backward() # LをAMP用にスケーリングしてから逆伝播
                     scaler.unscale_(optimizer) # Optimizer内の勾配を元のスケールへ戻す
                     if den6_online_full_cloud:
-                        comp_debug.update(_restore_den6_policy_only_gradients(
+                        comp_debug.update(restore_joint_policy_gradients(
                             den6_policy_only_grad_snapshot, model
                         ))
                     operation_grad_balance_debug = _balance_actual_operation_head_gradients(
@@ -4261,10 +4278,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug.update(operation_grad_balance_debug)
                     if (
                         den6_online_full_cloud
-                        and _den6_online_grad_audit_enabled(args, global_train_step)
+                        and voxel_policy_gradient_audit_enabled(args, global_train_step)
                         and "den6_online_add_where_grad_norm" not in comp_debug
                     ):
-                        comp_debug.update(_den6_online_grad_norms(model))
+                        comp_debug.update(collect_voxel_policy_gradient_norms(model))
                     # Phase7-4:
                     # unscale後の実gradを対象にsanity checkする。
                     _phase7_log_grad_sanity(
@@ -4394,9 +4411,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     scaler = torch.cuda.amp.GradScaler(enabled=False)
                                     writer.write( "float16 AMP overflow persisted; disabled AMP and continue in float32.")
                 else:
-                    L.backward() # 通常の勾配を流す
+                    L_total.backward() # 通常の勾配を流す
                     if den6_online_full_cloud:
-                        comp_debug.update(_restore_den6_policy_only_gradients(
+                        comp_debug.update(restore_joint_policy_gradients(
                             den6_policy_only_grad_snapshot, model
                         ))
                     operation_grad_balance_debug = _balance_actual_operation_head_gradients(
@@ -4407,10 +4424,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug.update(operation_grad_balance_debug)
                     if (
                         den6_online_full_cloud
-                        and _den6_online_grad_audit_enabled(args, global_train_step)
+                        and voxel_policy_gradient_audit_enabled(args, global_train_step)
                         and "den6_online_add_where_grad_norm" not in comp_debug
                     ):
-                        comp_debug.update(_den6_online_grad_norms(model))
+                        comp_debug.update(collect_voxel_policy_gradient_norms(model))
                     # Phase7-4:
                     # backward直後の実gradを対象にsanity checkする。
                     _phase7_log_grad_sanity(
@@ -4833,13 +4850,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                     seq_summary["_amount_class_histogram_last"] = str(
                         compression_metric_row.get("amount_class_histogram", "")
                     )
-                maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator) # 圧縮改善が良いケース・悪いケースを条件に応じてCase Debag CSVへ保存
+                maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L_total, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator) # 圧縮改善が良いケース・悪いケースを条件に応じてCase Debag CSVへ保存
 
                 """損失ログの記録"""
-                surrogate_compression_metric = surrogate_compression_plot_metric(loss, L_com, L.device) # Surrogate予測の(Mine-GT)*100/GTを通常plotへ渡す
-                actual_compression_metric = actual_compression_plot_metric(loss, L.device) # 実codecで測った(Mine-GT)*100/GTを通常plotへ渡す
-                policy_actual_metric = policy_actual_compression_plot_metric(loss, L.device) # Network自身の最終出力actualを通常plotへ渡す
-                oracle_teacher_metric = oracle_teacher_compression_plot_metric(loss, L.device) # Oracle teacher actualを通常plotへ渡す
+                surrogate_compression_metric = surrogate_compression_plot_metric(loss, L_com, L_total.device) # Surrogate予測の(Mine-GT)*100/GTを通常plotへ渡す
+                actual_compression_metric = actual_compression_plot_metric(loss, L_total.device) # 実codecで測った(Mine-GT)*100/GTを通常plotへ渡す
+                policy_actual_metric = policy_actual_compression_plot_metric(loss, L_total.device) # Network自身の最終出力actualを通常plotへ渡す
+                oracle_teacher_metric = oracle_teacher_compression_plot_metric(loss, L_total.device) # Oracle teacher actualを通常plotへ渡す
                 if den6_online_full_cloud:
                     source_model = model.module if hasattr(model, "module") else model
                     source_state = getattr(source_model, "last_actuator_voxel_state", {})
@@ -4854,13 +4871,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                         policy_actual_metric = None
                     elif not bool(source_plan.get("network_only_performance", False)):
                         policy_actual_metric = None
-                actual_compression_ratio_metric = actual_compression_ratio_plot_metric(loss, L.device) # 実codecで測った100*Mine/GTを通常plotへ渡す
+                actual_compression_ratio_metric = actual_compression_ratio_plot_metric(loss, L_total.device) # 実codecで測った100*Mine/GTを通常plotへ渡す
                 surrogate_metrics = surrogate_plot_metrics(loss) # Surrogate教師学習の誤差系列を通常plotへ渡す
-                metric_values = [ L, L_geom, surrogate_compression_metric, actual_compression_metric, policy_actual_metric, oracle_teacher_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics, actual_compression_ratio_metric] # plot列順にStep損失をまとめる
+                metric_values = [ L_total, L_geom, surrogate_compression_metric, actual_compression_metric, policy_actual_metric, oracle_teacher_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics, actual_compression_ratio_metric] # plot列順にStep損失をまとめる
                 if episode_metric_sums is None:
-                    episode_metric_sums = new_metric_sums(L.device, plot.num_loss) # Episode内で初めのEpochなら損失累積器を作る
+                    episode_metric_sums = new_metric_sums(L_total.device, plot.num_loss) # Episode内で初めのEpochなら損失累積器を作る
                 step_metric_values = metric_values # Step/Episode/Checkpointで同じ列順のmetricを使う
-                add_metric_sums(episode_metric_sums, step_metric_values, L.device) # 現在Stepの損失一覧
+                add_metric_sums(episode_metric_sums, step_metric_values, L_total.device) # 現在Stepの損失一覧
                 accumulate_checkpoint_metrics( episode_checkpoint_sums, compression_metric_row, operation_metric_row, step_metric_values) # ChackPoint判定用メトリクス
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 点操作情報を計算
@@ -5619,7 +5636,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     "anchor_reason": anchor_reason,
                     "loss_scope": "full_cloud_output_vs_full_cloud_input",
                 }
-                log_for_better_step( for_better_path, args=args, model=model, loss_obj=loss, optimizer=optimizer, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, stage_factors=stage_factors, compression_row=compression_metric_row, operation_row=operation_metric_row, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, subtree_meta=full_cloud_meta_for_better, loss_values={ "L": L, "L_geom": L_geom, "L_com": L_com, "L_com_objective": L_com_objective, "L_attr": L_attr, "L_policy": L_policy, "L_actuator": L_actuator, "loss_bit": loss_bit, "loss_single": loss_single, "loss_nodes": loss_nodes}, step_completed=step_completed, total_loss_finite=total_loss_finite, amp_info=amp_info, timing={"step_seconds": en_step - st_step})
+                log_for_better_step( for_better_path, args=args, model=model, loss_obj=loss, optimizer=optimizer, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, stage_factors=stage_factors, compression_row=compression_metric_row, operation_row=operation_metric_row, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, subtree_meta=full_cloud_meta_for_better, loss_values={ "L": L_total, "L_geom": L_geom, "L_com": L_com, "L_com_objective": L_com_objective, "L_attr": L_attr, "L_policy": L_policy, "L_actuator": L_actuator, "loss_bit": loss_bit, "loss_single": loss_single, "loss_nodes": loss_nodes}, step_completed=step_completed, total_loss_finite=total_loss_finite, amp_info=amp_info, timing={"step_seconds": en_step - st_step})
                 # このStepのbackward・計測・記録がすべて終わった後だけ参照を切る。
                 # 計算内容は変えず、前Stepのfull-cloud Tensorと次Stepのforwardが
                 # 同時にGPU上へ存在することを防ぐ。
@@ -5638,7 +5655,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     out_label = None
                     structure_debug = None
                     comp_debug = None
-                    L = None
+                    L_total = None
                     L_geom = None
                     L_com = None
                     L_com_objective = None
@@ -6430,9 +6447,9 @@ def train(model, args, loss, writer, plot, notifier=None):
             guard_event["global_step"] = global_train_step
             guard_event["current_lr_main"] = optimizer_lrs_safe(optimizer)
             guard_event["current_lr_surrogate"] = optimizer_lrs_safe(getattr(loss, "surrogate_optimizer", None))
-            guard_event["L_total"] =    (L) if "L" in locals() else None
+            guard_event["L_total"] =    (L_total) if "L_total" in locals() else None
             guard_event["L_com"] = finite_float_or_none(L_com) if "L_com" in locals() else None
-            # guard_event["L_total"] = scalar_value(L) if "L" in locals() else None
+            # guard_event["L_total"] = scalar_value(L) if "L_total" in locals() else None
             # guard_event["L_com"] = scalar_value(L_com) if "L_com" in locals() else None
             log_for_better_event( for_better_path, "actual_compression_guard", episode=episode, stage=current_stage, **guard_event)
         convergence_event = convergence_monitor.update(
@@ -6630,9 +6647,18 @@ def main():
             notifier.training_error(exc, log_path=getattr(writer, "file_path", None))
         raise
     finally:
-        shutdown_ana_den6_online_prefetch(wait=False)
+        shutdown_voxel_candidate_prefetch(wait=False)
         writer.close()
 
 
 if __name__ == "__main__":
     main()
+
+# Compatibility for external experiment wrappers (main entry uses descriptive names).
+_den6_online_grad_audit_enabled = voxel_policy_gradient_audit_enabled
+_den6_online_grad_norms = collect_voxel_policy_gradient_norms
+_den6_online_decision_parameters = joint_policy_parameters
+_den6_retained_decision_tensors = retained_joint_decision_tensors
+_capture_den6_policy_only_gradients = capture_joint_policy_gradients
+_probe_den6_policy_source_gradients = probe_voxel_policy_source_gradients
+_restore_den6_policy_only_gradients = restore_joint_policy_gradients

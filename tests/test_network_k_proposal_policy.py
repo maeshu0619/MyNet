@@ -277,8 +277,8 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
 
     def test_forbidden_runtime_functions_are_not_reached(self):
         error = RuntimeError("forbidden path reached")
-        with mock.patch.object(network_module, "attach_ana_den6_online_guidance", side_effect=error), \
-             mock.patch.object(network_module, "attach_ana_den6_reference_anchor", side_effect=error), \
+        with mock.patch.object(network_module, "attach_voxel_candidate_guidance", side_effect=error), \
+             mock.patch.object(network_module, "attach_reference_voxel_plan", side_effect=error), \
              mock.patch.object(network_module, "build_heuristic_guidance", side_effect=error):
             result = self._forward()
         self.assertEqual(result["proposal_count"], 8)

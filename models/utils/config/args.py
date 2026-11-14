@@ -32,8 +32,8 @@ test_route = False
 model_name = "best_loss_joint"
 
 # dataname = "8i"
-dataname = "MVUB"
-# dataname = "UVG"
+# dataname = "MVUB"
+dataname = "UVG"
 
 dataset_name = "longdress"
 # dataset_name = "loot"

@@ -415,7 +415,7 @@ def clip_model_gradients(model, max_norm):
     base = model.module if hasattr(model, 'module') else model
     if (autonomous_search_enabled(getattr(base, 'args', None)) and max_norm > 0.
             and bool(getattr(base.args, 'repair_balance_operation_head_grads', True))):
-        from .autonomous_joint_learning import clip_joint_gradients
+        from .joint_voxel_policy import clip_joint_gradients
         return clip_joint_gradients(model, max_norm)
     parameters = [
         parameter

@@ -57,8 +57,8 @@ class NetworkOnlyCodecPolicyTest(unittest.TestCase):
 
     def test_forbidden_functions_can_be_monkeypatched_to_raise(self):
         error = RuntimeError("forbidden legacy path reached")
-        with mock.patch.object(network_module, "attach_ana_den6_online_guidance", side_effect=error), \
-             mock.patch.object(network_module, "attach_ana_den6_reference_anchor", side_effect=error), \
+        with mock.patch.object(network_module, "attach_voxel_candidate_guidance", side_effect=error), \
+             mock.patch.object(network_module, "attach_reference_voxel_plan", side_effect=error), \
              mock.patch.object(network_module, "build_heuristic_guidance", side_effect=error):
             output = self._forward()
         self.assertEqual(tuple(output["local_cost_maps"].shape), (1, 3, 7, 127))

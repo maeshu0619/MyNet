@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
-import math
 from models.utils.pointcloud.utils_repkpu import get_knn_pts, index_points
-from torch.nn.functional import gumbel_softmax
 
 # RepKPUから流用
 

@@ -13,7 +13,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from .ana_den6_online import (
+from .voxel_candidate_guidance import (
     FAST_UNORDERED_SOURCE, _FAST_NEIGHBOR_OFFSETS, _fast_spatial_source_indices,
 )
 

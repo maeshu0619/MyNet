@@ -155,7 +155,7 @@ class SparseActualCreditTest(unittest.TestCase):
             module.args=self.args(codec)
             module.args.heuristic_guidance_online_simultaneous_operation_exploration=True
             module._den6_factorized_group_counts={'WhereAll':4435,'Amount':1816,'Gate':990,'Fine':2309}
-            module._den6_group_actual_authority=lambda name: 0. if name=='Fine' else 1.
+            module._measured_group_policy_authority=lambda name: 0. if name=='Fine' else 1.
             selected=[]
             for step in range(0,8,2):
                 module.args._global_train_step=step

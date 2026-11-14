@@ -187,7 +187,7 @@ def validation_promotion(candidate, reference):
 def validation_fingerprint(args, loss, frame):
     """Fingerprint the input, native codec and geometry definition."""
     path = Path(frame).resolve()
-    from ..pointcloud.ana_den6_online import _sha256_file
+    from ..pointcloud.voxel_candidate_guidance import _sha256_file
     geometry_options = {name: value for name, value in vars(args).items()
                         if name.startswith(('geometry_', 'geom_')) or name in (
                             'loss_type', 'discrete_loss_mode', 'minimal_loss_objective')}

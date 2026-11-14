@@ -1161,7 +1161,7 @@ class SurrogateCompressionLossMixin:
                 stats_gen = self.consume_cpu_actual_encode_prefetch(args, actual_xyz)
                 if stats_gen is None:
                     if den6_online_train:
-                        self._guard_den6_online_edited_actual_encode(args)
+                        self._guard_joint_plan_actual_encode(args)
                     stats_gen = self._encode_actual_batch(
                         args, actual_xyz, final_w=actual_final_w
                     )

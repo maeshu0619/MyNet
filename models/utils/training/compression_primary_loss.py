@@ -1,3 +1,13 @@
+"""表示値と連続Backward用の圧縮優先目的関数。
+
+主式: L_total = L_compression_weighted + aux_balance_scale * L_auxiliary。
+L_compression_weighted = sf_com * L_com_primary。
+L_com_primaryの構成とw_comの適用はselect_compression_primary_main等も参照する。
+Geometryのforward重み(cp_lambda_geom)とBackward倍率は独立である。
+Actual方策loss、勾配置換、optimizer更新はtrain.py側で行うため、
+このscalarだけをシステム全体の更新則だと解釈しない。
+"""
+
 import math
 
 import torch
@@ -264,6 +274,11 @@ def build_compression_primary_loss(
     global_train_step,
     stage_factors,
 ):
+    """主目的・調整済み補助目的・監査値を同時に構成する。
+
+    戻り値: (L_total, weighted_compression_loss, debug)。
+    数式の演算順序とdetach境界は、checkpoint互換の既存式を維持する。
+    """
     # actual codec値は微分不能なので、actual_total_bit_percent_fresh等はlossに入れない。
     # compression_primaryの学習信号はsurrogate/proxy/soft auxのtensorだけから作る。
     # debugやCSVの.item()済み値はcheckpoint/log/teacher用であり、backward対象にしない。
@@ -377,8 +392,8 @@ def build_compression_primary_loss(
     sf_geom = float(stage_factors.get("geom", 1.0)) if use_stage else 1.0
     sf_repair = float(stage_factors.get("repair", 1.0)) if use_stage else 1.0
 
-    main_block = sf_com * L_com_primary
-    geom_block_raw = sf_geom * float(getattr(args, "cp_lambda_geom", 1.0)) * P_geom
+    L_compression_weighted = sf_com * L_com_primary
+    L_geometry_weighted_forward = sf_geom * float(getattr(args, "cp_lambda_geom", 1.0)) * P_geom
     # Keep the declared RD objective (and every logged forward value) intact,
     # while calibrating its backward magnitude independently.  The latest
     # real-step probes calibrate this after the support balance.  Keeping it
@@ -387,9 +402,9 @@ def build_compression_primary_loss(
     geom_backward_scale = max(float(getattr(
         args, "cp_geometry_backward_scale", 1.0
     )), 0.0)
-    geom_block = (
-        geom_block_raw.detach()
-        + float(geom_backward_scale) * (geom_block_raw - geom_block_raw.detach())
+    L_geometry_backward_scaled = (
+        L_geometry_weighted_forward.detach()
+        + float(geom_backward_scale) * (L_geometry_weighted_forward - L_geometry_weighted_forward.detach())
     )
     single_block = sf_com * single_weight_effective * P_single
     node_block = sf_com * node_weight_effective * P_nodes
@@ -407,8 +422,8 @@ def build_compression_primary_loss(
         if L_full_cloud_actual_correction is not None
         else zero
     )
-    aux_block = (
-        geom_block
+    L_auxiliary = (
+        L_geometry_backward_scaled
         + single_block
         + node_block
         + sparsepcgc_block
@@ -420,8 +435,8 @@ def build_compression_primary_loss(
     )
     aux_balance = _compression_primary_support_balance(
         args,
-        main_block,
-        aux_block,
+        L_compression_weighted,
+        L_auxiliary,
         enabled=uses_actual_total_bit_objective(args),
         target_ratio_name="compression_primary_aux_target_ratio",
         min_scale_name="compression_primary_aux_balance_min_scale",
@@ -430,8 +445,8 @@ def build_compression_primary_loss(
     )
     aux_balance_scale = float(aux_balance["scale"])
     aux_balance_reason = str(aux_balance["reason"])
-    aux_block_scaled = aux_balance_scale * aux_block
-    L = main_block + aux_block_scaled
+    L_auxiliary_balanced = aux_balance_scale * L_auxiliary
+    L_total = L_compression_weighted + L_auxiliary_balanced
     main_grad_scale = 1.0 / max(float(aux_balance_scale), 1e-12)
     geom_active = case_float(as_scalar_loss_tensor(L_geom), 0.0) > float(
         getattr(args, "cp_tau_geom", 0.0)
@@ -461,9 +476,9 @@ def build_compression_primary_loss(
         "cp_geom_tau": float(getattr(args, "cp_tau_geom", 0.0)),
         "cp_geom_lambda": float(getattr(args, "cp_lambda_geom", 1.0)),
         "cp_geom_backward_scale": float(geom_backward_scale),
-        "cp_geom_block_raw": case_float(geom_block_raw, float("nan")),
+        "cp_geom_block_raw": case_float(L_geometry_weighted_forward, float("nan")),
         "cp_geom_block_scaled": case_float(
-            aux_balance_scale * geom_block, float("nan")
+            aux_balance_scale * L_geometry_backward_scaled, float("nan")
         ),
         "cp_geom_scalar_grad_scale": float(geom_scalar_grad_scale),
         "cp_P_single": case_float(P_single, float("nan")),
@@ -471,9 +486,9 @@ def build_compression_primary_loss(
         "cp_P_sparsepcgc": case_float(P_sparsepcgc, float("nan")),
         "cp_P_actuator": case_float(P_actuator, float("nan")),
         "cp_P_op": case_float(P_op, float("nan")),
-        "cp_main_block": case_float(main_block, float("nan")),
-        "cp_aux_block_raw": case_float(aux_block, float("nan")),
-        "cp_aux_block_scaled": case_float(aux_block_scaled, float("nan")),
+        "cp_main_block": case_float(L_compression_weighted, float("nan")),
+        "cp_aux_block_raw": case_float(L_auxiliary, float("nan")),
+        "cp_aux_block_scaled": case_float(L_auxiliary_balanced, float("nan")),
         "cp_aux_target_ratio": (
             float(aux_balance["target_ratio"])
             if aux_balance.get("target_ratio", None) is not None
@@ -530,9 +545,9 @@ def build_compression_primary_loss(
         "compression_main_grad_scale_reason": str(aux_balance_reason),
         "compression_aux_in_objective": True,
         "compression_main_loss": case_float(L_com_main, float("nan")),
-        "compression_aux_loss": case_float(aux_block_scaled, float("nan")),
-        "compression_objective": case_float(L, float("nan")),
-        "cp_total": case_float(L, float("nan")),
+        "compression_aux_loss": case_float(L_auxiliary_balanced, float("nan")),
+        "compression_objective": case_float(L_total, float("nan")),
+        "cp_total": case_float(L_total, float("nan")),
         "cp_main_requires_grad": term_requires_grad(L_com_main),
         "cp_geom_requires_grad": term_requires_grad(L_geom),
         "cp_single_requires_grad": term_requires_grad(L_single),
@@ -559,7 +574,7 @@ def build_compression_primary_loss(
             else True
         ),
     }
-    return L, sf_com * L_com_primary, debug
+    return L_total, sf_com * L_com_primary, debug
 
 
 def log_compression_primary_terms(writer, step, num_steps, cp_debug):

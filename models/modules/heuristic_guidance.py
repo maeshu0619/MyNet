@@ -349,7 +349,7 @@ def _normalize_coords_b3n(value: Any, like: torch.Tensor) -> torch.Tensor | None
     return coords
 
 
-def _den6_fallback_fixed_features(
+def _build_reference_voxel_features(
     structure: Mapping[str, Any], args: Any, like: torch.Tensor
 ) -> tuple[torch.Tensor, Dict[str, Dict[str, torch.Tensor]]]:
     """den5 fallbackと同じ座標順・6近傍順をGT固定特徴として計算する。
@@ -518,7 +518,7 @@ def _attach_candidate_local_proxy(
     return guidance
 
 
-def _exact_den6_guidance(
+def _build_reference_candidate_guidance(
     structure: Mapping[str, Any],
     args: Any,
     like: torch.Tensor,
@@ -1022,7 +1022,7 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         if not enabled or not isinstance(exact, Mapping) or not exact.get('autonomous_search'):
             raise RuntimeError('autonomous policy requires its own current legal pool')
         # Reuse coordinate mapping, not dataset profiles or cached rankings.
-        return _exact_den6_guidance(structure, args, like, exact)
+        return _build_reference_candidate_guidance(structure, args, like, exact)
 
     profile = resolve_profile(args)
     if not enabled:
@@ -1109,7 +1109,7 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         # CUDA guidance.  Clear it before constructing the replacement so peak
         # memory never contains both full-cloud mappings at once.
         cache.clear()
-        guidance = _exact_den6_guidance(structure, args, like, exact)
+        guidance = _build_reference_candidate_guidance(structure, args, like, exact)
         cache[cache_key] = guidance
         cache.move_to_end(cache_key)
         max_entries = max(int(getattr(args, "heuristic_guidance_tensor_cache_entries", 8)), 1)
@@ -1131,7 +1131,7 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
     context_risk = 0.55 * context + 0.25 * shape + 0.20 * sparse
     hotspot = direct * (0.50 + lowprob) * (0.50 + context) * (0.75 + single)
     geometry = 0.35 * shape + 0.25 * quant + 0.20 * outlier + 0.20 * sparse
-    fallback_order, fallback_directions = _den6_fallback_fixed_features(
+    fallback_order, fallback_directions = _build_reference_voxel_features(
         structure, args, like
     )
     fixed_symbol_features = structure.get("ana_den6_fixed_feature_guidance")
@@ -1257,3 +1257,7 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
             "sparsepcgc_gt_symbol_score_plus_den5_lexicographic_and_first_empty_6n"
         )
     return result
+
+# Historical callable names retained for existing imports/checkpoints.
+_den6_fallback_fixed_features = _build_reference_voxel_features
+_exact_den6_guidance = _build_reference_candidate_guidance

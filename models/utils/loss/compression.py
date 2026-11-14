@@ -15,7 +15,7 @@ from models.utils.compression.octree_stats import hard_octree_occupancy_stats
 
 class CompressionLossMixin:
     @staticmethod
-    def _is_den6_online_training_step(args):
+    def _is_online_voxel_policy_step(args):
         """Loss is not an nn.Module, so training state must come from train.py."""
         return bool(
             str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
@@ -23,9 +23,9 @@ class CompressionLossMixin:
             and getattr(args, "_den6_online_training_step_active", False)
         )
 
-    def _guard_den6_online_edited_actual_encode(self, args):
+    def _guard_joint_plan_actual_encode(self, args):
         """ana_den6 onlineで同一Stepの編集後actual encodeを1回へ制限する。"""
-        if not self._is_den6_online_training_step(args):
+        if not self._is_online_voxel_policy_step(args):
             return False
         global_step = int(getattr(args, "_global_train_step", 0))
         guard = getattr(self, "_den6_online_actual_step_guard", None)
@@ -58,7 +58,7 @@ class CompressionLossMixin:
                 raise RuntimeError("previous CPU actual encode prefetch is still running")
             self._cpu_actual_encode_prefetch = None
 
-        self._guard_den6_online_edited_actual_encode(args)
+        self._guard_joint_plan_actual_encode(args)
         # Perform the CUDA transfer on the training thread before overlap.
         # The CPU tensor is exactly the float32 tensor previously produced in
         # _encode_actual_batch, not a quantized or approximate representation.
@@ -1094,7 +1094,7 @@ class CompressionLossMixin:
 
     def _encode_actual_many(self, args, xyz_list, attach_aux_indices=None):
         if (
-            self._is_den6_online_training_step(args)
+            self._is_online_voxel_policy_step(args)
             and not bool(getattr(args, "network_k_all_actual_enabled", False))
         ):
             raise RuntimeError(
@@ -1707,7 +1707,7 @@ class CompressionLossMixin:
             except Exception:
                 pass
         cached_gt = self._get_cached_actual_gt(cache_key)
-        den6_online_train = self._is_den6_online_training_step(args)
+        den6_online_train = self._is_online_voxel_policy_step(args)
         baseline_actual_encode_count = 0
         if cached_gt is None:
             baseline_actual_encode_count = 1
@@ -1749,7 +1749,7 @@ class CompressionLossMixin:
         else:
             # ana_den6 onlineは1Stepにつき編集後actual encodeを厳密に1回だけ許可する。
             # baselineはframe単位cacheであり、この回数には含めない。
-            self._guard_den6_online_edited_actual_encode(args)
+            self._guard_joint_plan_actual_encode(args)
             edited_actual_encode_count = 1
 
             # actual codec評価は評価指標なので、train用の量子化ノイズを入れないclean編集点群を使う。
@@ -2622,3 +2622,7 @@ class CompressionLossMixin:
             full_octree_context=full_octree_context,
             octree_input_mode=octree_input_mode,
         )
+
+    # Historical callable names retained for existing imports/checkpoints.
+    _is_den6_online_training_step = _is_online_voxel_policy_step
+    _guard_den6_online_edited_actual_encode = _guard_joint_plan_actual_encode

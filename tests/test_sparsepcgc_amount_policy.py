@@ -34,7 +34,7 @@ class SparseAmountPolicyTest(unittest.TestCase):
         args.unit_mix_start=0.;args.unit_mix_end=0.
         args.sparsepcgc_algorithmic_amount_bins='0.0015,0.002,0.0025,0.00275,0.003'
         model=StructureRepairActuator(2,hidden_dim=4,args=args)
-        model._select_den6_factorized_exploration_group=lambda audit:'Amount'
+        model._select_policy_credit_group=lambda audit:'Amount'
         n=5000;coords=torch.stack((torch.arange(n),torch.zeros(n,dtype=torch.long),torch.zeros(n,dtype=torch.long))).unsqueeze(0)
         pools={op:[] for op in ['Add','Prune','Adjust']};mapping={}
         for op,offset in [('Add',0),('Prune',100),('Adjust',200)]:

@@ -1,3 +1,22 @@
+"""点群前処理Networkの組立てと、特徴から共同Voxel編集までの接続。
+
+test_route=True の主経路:
+    canonical occupied voxels
+    -> 固定PointTransformer + 学習Feature Adapter
+    -> VoxelStructureFeatureExtractor（40chの固定観測）
+    -> 原因集約8ch + 方策特徴7ch + priority1ch
+    -> VoxelEditController（56ch入力、Amount/Whereの共同選択）
+    -> 編集済み整数Voxel集合 -> 元座標系の点群
+
+目的関数の合成・backward・optimizer.stepは train.py に置く。
+Actual Codecはモデル内で微分しない。共同方策の目的関数は
+utils/training/joint_voxel_policy.py、表示用の圧縮優先目的は
+utils/training/compression_primary_loss.py を参照する。
+
+encoder / structure_analyzer / actuator等の登録名はcheckpoint契約である。
+読みやすい公開propertyは同じmoduleへの参照であり、二重登録しない。
+"""
+
 import hashlib
 import json
 from pathlib import Path
@@ -19,20 +38,20 @@ from .utils.pointcloud.sparsepcgc_voxel import (
     unique_voxel_coords_batched,
     restore_points_from_voxel_coords,
 )
-from .utils.pointcloud.ana_den6_reference import attach_ana_den6_reference_anchor
-from .utils.pointcloud.ana_den6_online import (
-    _sha256_file as _ana_den6_sha256_file,
-    attach_ana_den6_online_guidance,
+from .utils.pointcloud.reference_voxel_plan import attach_reference_voxel_plan
+from .utils.pointcloud.voxel_candidate_guidance import (
+    _sha256_file as _input_file_sha256,
+    attach_voxel_candidate_guidance,
 )
 from .modules.heuristic_guidance import build_heuristic_guidance, release_exact_guidance_cache
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
-from .modules.octree_structure import OctreeStructureAnalysis
+from .modules.voxel_structure_features import VoxelStructureFeatureExtractor
 from .modules.geometry_octree_structure import GeometryOctreeStructureAnalysis
 from .utils.pointcloud.geometry_octree import is_geometry_octree, build_geometry_point_features, align_geometry_context, geometry_step, geometry_cache_key
 from .utils.pointcloud.geometry_octree_proposals import attach_geometry_octree_guidance
 from .modules.proposal_selector import AlgorithmicProposalSelector, FullCloudAmountSelector
-from .modules.structure_actuator import StructureRepairActuator
+from .modules.voxel_edit_controller import VoxelEditController
 from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
 from .modules.network_only_codec_policy import NetworkOnlyCodecPolicy
 from .modules.network_k_proposal_policy import NetworkKProposalPolicy
@@ -44,16 +63,27 @@ from .utils.cache.frozen_student_feature_cache import FrozenStudentFeatureCache
 
 
 class Network(nn.Module):
+    """固定観測と学習可能な編集方策を組み合わせる前処理器。
+
+    direct_octree_structure_targets=Trueでは原因・構造方策MLPを使用せず、
+    入力由来の固定特徴を使う。クラスが存在することと学習することは別。
+    Shadow Emulatorは実行planと別に学習する（forward後半を参照）。
     """
-    ◆全体フロー
-    ・入力点群
-    ・PointTransformer：局所・大域特徴抽出
-    ・OctreeStructureAnalisis：Octree構造特徴を計算
-    ・CostAttributionModule：圧縮非効率の原因を推定
-    ・CauseDiagnosisAggregation：原因スコアをSubtree/Repai Unit単位に集約
-    ・StructureRepairPolicy：修復方策を選択
-    ・StructureRepairActuator：点操作を実行
-    """
+
+    @property
+    def geometry_encoder(self):
+        """固定幾何Encoder。保存キーは従来の ``encoder``。"""
+        return self.encoder
+
+    @property
+    def voxel_structure_extractor(self):
+        """占有構造特徴の抽出器。保存キーは ``structure_analyzer``。"""
+        return self.structure_analyzer
+
+    @property
+    def voxel_edit_controller(self):
+        """共同Voxel編集の制御器。保存キーは ``actuator``。"""
+        return self.actuator
 
     def __init__(self, args, writer):
         """基本情報セットアップ"""
@@ -115,14 +145,14 @@ class Network(nn.Module):
             torch.full((), float("nan"), dtype=torch.float32),
         )
 
-        """モジュールセットアップ"""
+        # 1. 入力観測: 幾何EncoderとCodecに応じた占有構造の抽出器。
         self.encoder = PointTransformer(self.args) # 特徴抽出器
         if is_geometry_octree(self.args):
             self.structure_analyzer = GeometryOctreeStructureAnalysis(self.args, self.writer)
         else:
-            self.structure_analyzer = OctreeStructureAnalysis(self.args, self.writer) # Octree構造解析モジュールの作成
+            self.structure_analyzer = VoxelStructureFeatureExtractor(self.args, self.writer) # Octree構造解析モジュールの作成
 
-        """次元数セットアップ"""
+        # 2. 特徴統合: structure40 + causes8 + policy7 + priority1 = 56ch。
         fused_dim = int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))) # Encoderが出す統合特徴の次元数
         structure_dim = int(self.structure_analyzer.feature_dim) # Octree構造解析モジュールが出す構造特徴の次元数
         hidden_dim = int(getattr(self.args, "structure_hidden_dim", 96)) # 構造診断・方策選択モジュール内部の隠れ層次元
@@ -192,7 +222,7 @@ class Network(nn.Module):
             structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES)
             + self.cause_aggregator.priority_dim
         )
-        self.actuator = StructureRepairActuator( # 実際に点群に操作するモジュールの作成
+        self.actuator = VoxelEditController( # 実際に点群に操作するモジュールの作成
             in_channels=actuator_feature_dim,
             hidden_dim=int(getattr(self.args, "repair_actuator_hidden_dim", 64)),
             args=self.args,
@@ -358,7 +388,7 @@ class Network(nn.Module):
     def train(self, mode: bool = True): # Encoderを訓練対象から外すためにPyTorchのtrain()を上書き
         super().train(mode)
         if bool(getattr(self.args, "encoder_0grad", True)):
-            self.encoder.eval()
+            self.geometry_encoder.eval()
         return self
 
     """キャッシュ関係の互換関数"""
@@ -439,7 +469,7 @@ class Network(nn.Module):
         self.last_single_plan_student_terms = None
         self.last_k_all_actual_debug = {}
         release_exact_guidance_cache(self.args)
-        for module in (self.actuator, self.cost_attributor, self.policy_module):
+        for module in (self.voxel_edit_controller, self.cost_attributor, self.policy_module):
             if hasattr(module, "debug_tensors"):
                 module.debug_tensors = {}
         try:
@@ -631,7 +661,7 @@ class Network(nn.Module):
             try:
                 input_path = Path(input_file).expanduser().resolve()
                 if input_path.is_file():
-                    input_sha256 = _ana_den6_sha256_file(input_path)
+                    input_sha256 = _input_file_sha256(input_path)
             except (OSError, ValueError):
                 input_sha256 = ""
         return "|".join((
@@ -653,7 +683,7 @@ class Network(nn.Module):
         if cached:
             return str(cached)
         digest = hashlib.sha256(b"mynet_point_transformer_node_features_v2")
-        for name, value in sorted(self.encoder.state_dict().items()):
+        for name, value in sorted(self.geometry_encoder.state_dict().items()):
             tensor = value.detach().cpu().contiguous()
             digest.update(str(name).encode("utf-8"))
             digest.update(str(tensor.dtype).encode("ascii"))
@@ -752,7 +782,7 @@ class Network(nn.Module):
         if not all(limits):
             return None
         versions = tuple((name, tensor.data_ptr(), tensor._version)
-                         for name, tensor in self.encoder.state_dict().items())
+                         for name, tensor in self.geometry_encoder.state_dict().items())
         cache = getattr(self, '_autonomous_frozen_feature_ram', None)
         if cache is None or limits != getattr(self, '_autonomous_frozen_ram_limits', None):
             from .utils.cache.lossless_tensor_ram import LosslessTensorRAM
@@ -994,7 +1024,7 @@ class Network(nn.Module):
                 encoder_feat = sparse_tensor["feat"].unsqueeze(0)
                 grad_enabled = not frozen_encoder
                 with torch.set_grad_enabled(grad_enabled):
-                    _, coarse_fused = self.encoder(encoder_xyz, feat=encoder_feat)
+                    _, coarse_fused = self.geometry_encoder(encoder_xyz, feat=encoder_feat)
                 if frozen_encoder:
                     coarse_fused = coarse_fused.detach()
                 full_to_coarse_idx = sparse_tensor["full_to_coarse_idx"].to(
@@ -1056,10 +1086,10 @@ class Network(nn.Module):
             return reward.new_zeros(())
         from .utils.training.sparsepcgc_autonomous_policy import autonomous_search_enabled
         if autonomous_search_enabled(self.args):
-            from .utils.training.autonomous_joint_learning import joint_actual_policy_loss
+            from .utils.training.joint_voxel_policy import compute_joint_voxel_policy_loss
             current_compression_value = float(reward.detach().float().mean().cpu())
             current_geometry_value = float(geometry.detach().float().mean().cpu()) if torch.is_tensor(geometry) else 0.
-            return joint_actual_policy_loss(self, reward, geometry)
+            return compute_joint_voxel_policy_loss(self, reward, geometry)
         objective = torch.nan_to_num(reward.float().mean(), nan=0.0, posinf=1e3, neginf=-1e3)
         selection_mode = str(getattr(
             self.args,
@@ -1438,12 +1468,12 @@ class Network(nn.Module):
             policy_loss = policy_loss + noop_actual_weighted
             if hasattr(self, "actuator"):
                 previous_noop_evidence = min(max(float(getattr(
-                    self.actuator, "_den6_noop_actual_evidence", 0.0
+                    self.voxel_edit_controller, "_den6_noop_actual_evidence", 0.0
                 )), 0.0), 1.0)
                 evidence_alpha = 1.0 / float(max(int(getattr(
                     self.args, "heuristic_guidance_online_actual_actor_replay_entries", 512
                 )), 1))
-                self.actuator._den6_noop_actual_evidence = (
+                self.voxel_edit_controller._den6_noop_actual_evidence = (
                     (1.0 - evidence_alpha) * previous_noop_evidence + evidence_alpha
                 )
         plan_critic_loss_raw = objective.new_zeros(())
@@ -1497,7 +1527,7 @@ class Network(nn.Module):
                         for row in rows
                     ], dtype=torch.float32
                 )
-                replay_output = self.actuator.den6_plan_critic(replay_features)
+                replay_output = self.voxel_edit_controller.den6_plan_critic(replay_features)
                 replay_mean = replay_output[:, 0]
                 replay_log_variance = replay_output[:, 1].clamp(-8.0, 8.0)
                 replay_error = replay_mean - replay_targets
@@ -1789,7 +1819,7 @@ class Network(nn.Module):
                     old_plan_feature = old_plan_feature.to(
                         device=plan_feature.device, dtype=plan_feature.dtype
                     )
-                    old_plan_value = self.actuator.den6_plan_critic(
+                    old_plan_value = self.voxel_edit_controller.den6_plan_critic(
                         old_plan_feature.reshape(1, -1)
                     ).reshape(-1)[0]
                     critic_advantage = old_plan_value - plan_critic_value.reshape(())
@@ -2163,14 +2193,14 @@ class Network(nn.Module):
             and current_features.ndim == 2
             and int(current_features.shape[0]) > 0
         ):
-            current_actor_scores = self.actuator.den6_candidate_actor(
+            current_actor_scores = self.voxel_edit_controller.den6_candidate_actor(
                 current_features
             ).reshape(-1)
-            current_proposal_scores = self.actuator.den6_candidate_proposal(
+            current_proposal_scores = self.voxel_edit_controller.den6_candidate_proposal(
                 current_features
             ).reshape(-1)
             current_critic_output = (
-                self.actuator.den6_candidate_critic(
+                self.voxel_edit_controller.den6_candidate_critic(
                     current_critic_features.detach()
                 )
                 if torch.is_tensor(current_critic_features)
@@ -2235,7 +2265,7 @@ class Network(nn.Module):
                     device=current_features.device,
                     dtype=current_features.dtype,
                 )
-                old_actor_scores = self.actuator.den6_candidate_actor(
+                old_actor_scores = self.voxel_edit_controller.den6_candidate_actor(
                     old_features
                 ).reshape(-1)
                 current_is_better = 1.0 if delta > 0.0 else -1.0
@@ -2249,7 +2279,7 @@ class Network(nn.Module):
                 actor_preference_accuracies.append(float(
                     (float(current_is_better) * actor_difference.detach() > 0.0).cpu()
                 ))
-                old_proposal_scores = self.actuator.den6_candidate_proposal(
+                old_proposal_scores = self.voxel_edit_controller.den6_candidate_proposal(
                     old_features
                 ).reshape(-1)
                 proposal_difference = (
@@ -2271,7 +2301,7 @@ class Network(nn.Module):
                         device=current_features.device,
                         dtype=current_features.dtype,
                     )
-                    old_critic_output = self.actuator.den6_candidate_critic(
+                    old_critic_output = self.voxel_edit_controller.den6_candidate_critic(
                         old_critic_features.detach()
                     )
                     old_critic_scores = old_critic_output[:, 0].reshape(-1)
@@ -4757,11 +4787,11 @@ class Network(nn.Module):
 
         if bool(getattr(self.args, "encoder_0grad", True)):
             with torch.no_grad():
-                local_sparse, fused_sparse = self.encoder(encoder_input, feat=encoder_feat)
+                local_sparse, fused_sparse = self.geometry_encoder(encoder_input, feat=encoder_feat)
             local_sparse = local_sparse.detach()
             fused_sparse = fused_sparse.detach()
         else:
-            local_sparse, fused_sparse = self.encoder(encoder_input, feat=encoder_feat)
+            local_sparse, fused_sparse = self.geometry_encoder(encoder_input, feat=encoder_feat)
 
         local_feat = local_sparse
         fused_feat = fused_sparse
@@ -5231,7 +5261,18 @@ class Network(nn.Module):
         full_octree_context=None,
         octree_input_mode="auto",
     ):
-        """セットアップ"""
+        """xyz [B,3,N]から編集点群と学習用の状態を返す。
+
+        読む順序:
+        1) 入力・canonical context・合法候補を準備する。
+        2) 構造観測、固定Encoder特徴、原因・方策特徴を作る。
+        3) 56chへ統合し、Adapter残差を加える。
+        4) controllerでAmount/Whereを選び、共同編集を適用する。
+        5) Actual用Voxel状態、soft補助量、内部lossを呼出元へ返す。
+
+        full-cloud / subtree / 他Codecの分岐は互換のため残す。
+        この関数はoptimizerを更新しない。
+        """
         if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3: # 入力点群の形状チェック
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
@@ -5326,7 +5367,7 @@ class Network(nn.Module):
                 if not isinstance(full_octree_context, dict):
                     raise RuntimeError("ana_den6_onlineにはfull-cloud canonical contextが必要である")
                 if not network_only_guidance_forward:
-                    guidance_builder = attach_geometry_octree_guidance if is_geometry_octree(self.args) else attach_ana_den6_online_guidance
+                    guidance_builder = attach_geometry_octree_guidance if is_geometry_octree(self.args) else attach_voxel_candidate_guidance
                     full_octree_context = guidance_builder(
                         full_octree_context,
                         self.args,
@@ -5339,7 +5380,7 @@ class Network(nn.Module):
                     raise RuntimeError(
                         f"{guidance_mode}にはfull-cloud canonical contextが必要である"
                     )
-                full_octree_context = attach_ana_den6_reference_anchor(
+                full_octree_context = attach_reference_voxel_plan(
                     full_octree_context,
                     self.args,
                     device=pts_xyz.device,
@@ -5727,7 +5768,7 @@ class Network(nn.Module):
                     runtime_diag_start = time.time()
 
                 """Octree構造解析器"""
-                structure_b = self.structure_analyzer(
+                structure_b = self.voxel_structure_extractor(
                     analysis_xyz_b,
                     coord_scale=coord_scale_b,
                     subtree_tree=canonical_subtree_tree if b == 0 else None,
@@ -5976,7 +6017,7 @@ class Network(nn.Module):
             if timing_enabled:
                 self._sync_if_cuda_tensor(pts_xyz)
                 runtime_diag_start = time.time()
-            structure = self.structure_analyzer(
+            structure = self.voxel_structure_extractor(
                 analysis_xyz,
                 coord_scale=coord_scale,
                 subtree_tree=canonical_subtree_tree,
@@ -6481,10 +6522,10 @@ class Network(nn.Module):
         if phased_search_enabled(self.args):
             # A read-only reference, including restored runtime memory. This
             # does not duplicate plans or add persistent model parameters.
-            self.actuator._autonomous_joint_memory = getattr(
+            self.voxel_edit_controller._autonomous_joint_memory = getattr(
                 self, '_den6_online_efficiency_baseline', None)
         with saved_tensor_context:
-            pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
+            pts_out, final_w, edit_loss, actuator_stats = self.voxel_edit_controller( # 実際に点操作を行う
                 pts_xyz=pts_xyz,
                 structure=structure,
                 cause_scores=subtree_scores_full,
@@ -7492,7 +7533,7 @@ class Network(nn.Module):
                     "global_offset": str((subtree_tree or full_octree_context or {}).get("global_offset", "")),
                     "local_offset": "encoder_or_point_feature_local_xyz",
                     "global_depth": int((subtree_tree or full_octree_context or {}).get("global_depth", 0) or 0),
-                    "local_depth": int(getattr(self.structure_analyzer, "max_depth", 0)),
+                    "local_depth": int(getattr(self.voxel_structure_extractor, "max_depth", 0)),
                     "parent_occupancy_code": int((full_octree_context or {}).get("parent_occupancy_code", 0) or 0),
                     "sibling_count": int(len((full_octree_context or {}).get("sibling_paths", []))),
                     "enable_sparsepcgc_exact_occupancy_teacher": bool(getattr(self.args, "enable_sparsepcgc_exact_occupancy_teacher", False)),
@@ -7793,7 +7834,7 @@ class Network(nn.Module):
             })
 
         if timing_enabled:
-            actuator_runtime = getattr(self.actuator, "last_runtime_timing", {}) or {}
+            actuator_runtime = getattr(self.voxel_edit_controller, "last_runtime_timing", {}) or {}
             self.last_runtime_timing = {
                 "encode": round(runtime_encode_end - runtime_t0, 6),
                 "structure": round(runtime_structure_end - runtime_structure_start, 6),
@@ -7846,3 +7887,7 @@ class Network(nn.Module):
         if return_patch_meta:
             return (*output, self._patch_meta(pts_xyz, repair_gate, out_label))
         return output
+
+# Legacy import names; mode strings and saved payloads retain the old spelling.
+attach_ana_den6_online_guidance = attach_voxel_candidate_guidance
+attach_ana_den6_reference_anchor = attach_reference_voxel_plan

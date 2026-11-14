@@ -59,7 +59,7 @@ def measured_plan_replay(debug, previous, compression, geometry, args):
             selected[prefix] = True
             suffix = torch.nonzero(~selected & torch.isfinite(scores), as_tuple=False).reshape(-1)
             order = torch.cat((prefix, suffix))
-            from .autonomous_joint_learning import where_prefix_log_prob
+            from .joint_voxel_policy import where_prefix_log_prob
             where_terms.append(-where_prefix_log_prob(scores,order,len(ids),1.,True)/len(ids))
         if valid:
             amount = torch.stack(amount_terms).mean()

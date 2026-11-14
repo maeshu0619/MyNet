@@ -1,10 +1,10 @@
 """Conventional octree analysis, sharing only codec-independent descriptors."""
 import torch
-from .octree_structure import OctreeStructureAnalysis
+from .voxel_structure_features import VoxelStructureFeatureExtractor
 from ..utils.pointcloud.geometry_octree import build_geometry_octree_context, codec_key, geometry_step
 
 
-class GeometryOctreeStructureAnalysis(OctreeStructureAnalysis):
+class GeometryOctreeStructureAnalysis(VoxelStructureFeatureExtractor):
     """Same 40-channel interface for the existing diagnosis/Actor/Amount heads.
 
     Occupancy masks, sibling counts, multilevel topology and local geometry are

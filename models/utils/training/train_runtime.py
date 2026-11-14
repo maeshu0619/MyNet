@@ -57,9 +57,9 @@ from models.utils.pointcloud.sparsepcgc_voxel import (
     restore_points_from_voxel_coords,
 )
 from models.utils.pointcloud.quant_noise import add_uniform_quantization_noise, resolve_uniform_noise_delta
-from models.utils.pointcloud.ana_den6_online import (
-    prefetch_ana_den6_online_guidance,
-    shutdown_ana_den6_online_prefetch,
+from models.utils.pointcloud.voxel_candidate_guidance import (
+    prefetch_voxel_candidate_guidance,
+    shutdown_voxel_candidate_prefetch,
 )
 from models.utils.pointcloud.voxel_collision import (
     compute_voxel_collision_stats_batch,
@@ -4914,14 +4914,14 @@ def _phase7_named_grad_norms(model):
     return out
 
 
-def _den6_online_grad_audit_enabled(args, global_step):
+def voxel_policy_gradient_audit_enabled(args, global_step):
     if not bool(getattr(args, "heuristic_guidance_online_grad_audit", False)):
         return False
     interval = int(getattr(args, "heuristic_guidance_online_grad_audit_interval", 1))
     return interval > 0 and int(global_step) % interval == 0
 
 
-def _den6_online_grad_norms(model):
+def collect_voxel_policy_gradient_norms(model):
     """Return the three learned decision gradients with one device sync.
 
     This deliberately inspects only the heads used for online Where, Amount,
@@ -5123,7 +5123,7 @@ def _format_soft_proxy_debug(args):
     return ", ".join(parts)
 
 
-def _den6_online_decision_parameters(model):
+def joint_policy_parameters(model):
     """Return the exact-online heads whose hard decisions need score-function grads."""
     base_model = model.module if hasattr(model, "module") else model
     actuator = getattr(base_model, "actuator", None)
@@ -5170,7 +5170,7 @@ def _den6_online_decision_parameters(model):
     return params
 
 
-def _den6_retained_decision_tensors(model):
+def retained_joint_decision_tensors(model):
     base_model = model.module if hasattr(model, "module") else model
     actuator = getattr(base_model, "actuator", None)
     rows = getattr(actuator, "_den6_online_operation_decision_tensors", {})
@@ -5178,18 +5178,18 @@ def _den6_retained_decision_tensors(model):
             if torch.is_tensor(tensor) and tensor.requires_grad] if isinstance(rows, dict) else []
 
 
-def _capture_den6_policy_only_gradients(policy_loss, model):
+def capture_joint_policy_gradients(policy_loss, model):
     """Capture only Actual score-function gradients before the joint backward."""
     if not torch.is_tensor(policy_loss) or not policy_loss.requires_grad:
         return []
-    params = _den6_online_decision_parameters(model)
+    params = joint_policy_parameters(model)
     if not params:
         return []
     # The Where path uses torch.utils.checkpoint.  autograd.grad(inputs=...)
     # is incompatible with the re-entrant checkpoint used by this project,
     # so perform a normal retained backward, snapshot the decision heads, and
     # clear all temporary grads before the joint objective backward.
-    decisions = _den6_retained_decision_tensors(model)
+    decisions = retained_joint_decision_tensors(model)
     # zero_grad() clears Parameters only, not retained non-leaf decision
     # tensors.  Source probes must not inflate the reported decision gradient.
     for tensor in decisions:
@@ -5214,7 +5214,7 @@ def _capture_den6_policy_only_gradients(policy_loss, model):
     return snapshot
 
 
-def _probe_den6_policy_source_gradients(model, source_losses):
+def probe_voxel_policy_source_gradients(model, source_losses):
     """Measure Actor/Proposal gradient norms per source without an update.
 
     A retained backward is used for each diagnostic source, followed by
@@ -5273,7 +5273,7 @@ def _probe_den6_policy_source_gradients(model, source_losses):
     return result
 
 
-def _restore_den6_policy_only_gradients(snapshot, model=None):
+def restore_joint_policy_gradients(snapshot, model=None):
     """Remove unrelated STE gradients from hard decision heads after backward."""
     restored = 0
     cleared = 0
@@ -7060,6 +7060,16 @@ def audit_state_list(audit_state, key):
         return value.detach().float().reshape(-1).cpu().tolist()
     return list(value) if isinstance(value, (list, tuple)) else []
 
+
+
+# Legacy diagnostic names: keep old experiment instrumentation importable.
+_den6_online_grad_audit_enabled = voxel_policy_gradient_audit_enabled
+_den6_online_grad_norms = collect_voxel_policy_gradient_norms
+_den6_online_decision_parameters = joint_policy_parameters
+_den6_retained_decision_tensors = retained_joint_decision_tensors
+_capture_den6_policy_only_gradients = capture_joint_policy_gradients
+_probe_den6_policy_source_gradients = probe_voxel_policy_source_gradients
+_restore_den6_policy_only_gradients = restore_joint_policy_gradients
 
 # private helperもtrain.pyの互換import対象に含める。
 __all__ = [name for name in globals() if not name.startswith('__')]

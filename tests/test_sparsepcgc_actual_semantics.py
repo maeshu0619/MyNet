@@ -671,7 +671,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         sentinel = ("network-only-early-return",)
         context = {"global_voxel_coords": torch.zeros((1, 3, 4), dtype=torch.long)}
         with patch(
-            "models.network.attach_ana_den6_online_guidance",
+            "models.network.attach_voxel_candidate_guidance",
             side_effect=AssertionError("eval must not call den6"),
         ), patch.object(
             Network, "_maybe_fast_full_cloud_oracle_forward", return_value=sentinel,
@@ -704,7 +704,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         attached = dict(context)
         attached["ana_den6_ranked_candidate_guidance"] = {"source": "fixture"}
         with patch(
-            "models.network.attach_ana_den6_online_guidance",
+            "models.network.attach_voxel_candidate_guidance",
             return_value=attached,
         ) as attach, patch.object(
             Network, "_maybe_fast_full_cloud_oracle_forward", return_value=sentinel,
